@@ -25,7 +25,7 @@ mod imp {
     /// app's drawing surface. The surface is an OpenGL view, so anything added inside it
     /// would cover the drawing: the glass goes into its parent, below it.
     pub fn glass_behind(handle: raw_window_handle::RawWindowHandle) -> bool {
-        use objc2::{AnyThread, MainThreadOnly, rc::Retained, runtime::AnyClass};
+        use objc2::{MainThreadOnly, rc::Retained, runtime::AnyClass};
         use objc2_app_kit::{
             NSAutoresizingMaskOptions, NSGlassEffectView, NSGlassEffectViewStyle, NSView, NSVisualEffectBlendingMode,
             NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowOrderingMode,
@@ -58,7 +58,7 @@ mod imp {
             NSApplication::sharedApplication(mtm).hide(None);
         }
     }
-    // ---- Bringing an app forward, as legacy's HostAppActivator does ----
+    // ---- Bringing an app forward ----
 
     use std::ffi::c_void;
 

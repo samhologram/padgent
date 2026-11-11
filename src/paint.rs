@@ -3,7 +3,7 @@
 use crate::colour::Rgb;
 use crate::model::{Activity, Group, HubFace, KeyFace, SessionFace};
 use eframe::egui::{
-    self, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2,
+    self, Align2, Color32, FontId, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2,
 };
 use eframe::epaint::{CornerRadius, Shadow};
 use std::f32::consts::{PI, TAU};
@@ -153,10 +153,6 @@ pub struct KeyCx {
     pub waiting: Color32,
 }
 
-fn ease_out(x: f32) -> f32 {
-    1.0 - (1.0 - x.clamp(0.0, 1.0)).powi(3)
-}
-
 pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
     let k = r.width();
     let rad = k * 0.2;
@@ -185,7 +181,6 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
         let sh = Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(70) };
         p.add(sh.as_shape(r, CornerRadius::same(rad.min(255.0) as u8)));
         gradient_rounded(p, r, rad, Color32::from_rgba_unmultiplied(26, 27, 36, 235), Color32::from_rgba_unmultiplied(12, 13, 18, 245));
-        let _ = (tint, strength);
     } else {
         glass(p, r, rad, tint, strength, !matches!(face, KeyFace::Released));
     }
@@ -228,7 +223,7 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
     }
 }
 
-/// legacy's light field (see field.rs) drawn behind a frosted glass key.
+/// The light field (see field.rs) drawn behind a frosted glass key.
 fn paint_field(p: &Painter, r: Rect, fp: &crate::field::Field, orb: Color32, glowc: Color32, t: f32) {
     let k = r.width();
     let at = |x: f32, y: f32| pos2(r.left() + x * k, r.bottom() - (y - 0.1) * k);
@@ -292,6 +287,11 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     paint_field(p, r, &fp, orb, glowc, phase);
     gradient_rounded(p, r, k * 0.2, white(0.10), white(0.025));
     glass(p, r, k * 0.2, glowc, 0.55, false);
+    if f.unread > 0 {
+        let amber = Color32::from_rgb(255, 185, 35);
+        p.rect_filled(r, CornerRadius::same((k * 0.2) as u8), with_alpha(amber, 0.22));
+        p.rect_stroke(r, CornerRadius::same((k * 0.2) as u8), Stroke::new((k * 0.035).max(3.0), amber), StrokeKind::Inside);
+    }
 
     let c = pos2(r.left() + fp.cx * k, r.bottom() - (fp.cy - 0.1) * k);
     let core = (fp.cs * k).max(k * 0.08);
@@ -335,11 +335,17 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
             _ => {}
         }
     }
+    if f.unread > 0 {
+        let count = if f.unread > 99 { "99+".to_owned() } else { f.unread.to_string() };
+        let badge = Rect::from_min_size(pos2(r.left() + k * 0.08, r.top() + k * 0.055), vec2(k * 0.52, k * 0.14));
+        p.rect_filled(badge, CornerRadius::same((k * 0.055) as u8), Color32::from_rgb(255, 185, 35));
+        p.text(badge.center(), Align2::CENTER_CENTER, format!("UNREAD {count}"), FontId::proportional(k * 0.078), Color32::from_rgb(35, 22, 0));
+    }
     if f.subagents > 0 {
         p.text(pos2(r.right() - k * 0.09, r.top() + k * 0.12), Align2::RIGHT_CENTER, format!("×{}", f.subagents), FontId::proportional(k * 0.075), white(0.75));
     }
 
-    // Agent badge and name, then the state in legacy's words with its age, then what it's
+    // Agent badge and name, then the state and its age, then what it's
     // doing (live), its unread count or its last turn, and the last message.
     let x = r.left() + k * 0.08;
     let w = k * 0.84;
@@ -397,7 +403,7 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     }
 }
 
-/// State word on a tile: legacy's SessionActivity.label (0x1003dceb4).
+/// State word on a tile.
 fn state_word(a: Activity) -> &'static str {
     if a == Activity::Empty { "Idle" } else { a.label() }
 }
@@ -486,8 +492,4 @@ pub fn ambient_background(p: &Painter, r: Rect, t: f64, opaque: bool, reduced: b
         );
         glow(p, c, r.width().max(r.height()) * 0.45, c32(col), 0.22);
     }
-}
-
-pub fn vec_round(v: Vec2) -> Vec2 {
-    vec2(v.x.round(), v.y.round())
 }

@@ -22,11 +22,6 @@ impl Rgb {
         let m = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
         Rgb(m(self.0, other.0), m(self.1, other.1), m(self.2, other.2))
     }
-
-    pub fn scale(self, k: f32) -> Rgb {
-        let s = |a: u8| (a as f32 * k).clamp(0.0, 255.0) as u8;
-        Rgb(s(self.0), s(self.1), s(self.2))
-    }
 }
 
 fn oklab_to_linear(l: f32, a: f32, b: f32) -> [f32; 3] {
@@ -128,9 +123,6 @@ pub fn to_oklch(c: Rgb) -> (f32, f32, f32) {
 pub const REFERENCE_HUE: f32 = 79.85;
 /// Hue of the reference waiting orb #d9693e.
 pub const REFERENCE_WAITING_HUE: f32 = 40.8;
-/// Hue of the reference error orb #9e2a22 (OKLCH L 0.467, C 0.154): error always stays red.
-pub const ERROR_HUE: f32 = 28.5;
-
 /// Reference ramps, dark to light (static arrays read by OrbPalette.reference, 0x100431480,
 /// at 0x100b933f8..0x100b93670). Stop 2 is the lit orb, stop 3 its glow.
 pub fn reference_ramp(state: &str) -> [u32; 5] {

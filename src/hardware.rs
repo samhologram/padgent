@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tiny_skia::{Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode, Stroke, Transform};
 
 /// FrameLoop.reschedule (0x10015d4dc): keep the tick interval unless it changes by more than this.
-/// legacy's FontSet (0x100544c7c): key title 15 pt (weight 600), state line 13 pt mono (500),
+/// Keypad typography: key title 15 pt (weight 600), state line 13 pt mono (500),
 /// body text 12 pt mono (400).
 const TITLE_PT: f32 = 15.0;
 const STATE_PT: f32 = 13.0;
@@ -213,7 +213,7 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec, waiting: Rgb, brightne
 }
 
 fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &FontVec, waiting: Rgb) {
-    // Same light field as the on-screen key (field.rs, after legacy's legacyParams).
+    // Same light field as the on-screen key (field.rs).
     let k = KEY_SIZE as f32;
     let g = f.activity.group();
     let age = (t - f.since).max(0.0) as f32;
@@ -290,7 +290,7 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
             _ => {}
         }
     }
-    // Badge and name under the light, then the state in legacy's words, then the live text,
+    // Badge and name under the light, then the state, then the live text,
     // unread count or last turn.
     let white = Rgb(255, 255, 255);
     let ty = k * 0.61;
@@ -299,7 +299,7 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
     draw_text(pm, font, 8.0, 13.0 - text_width(font, 8.0, &f.badge) / 2.0, ty - 2.0, &f.badge, ink, 0.95);
     let title = fit(font, TITLE_PT, &f.title, k - 32.0);
     draw_text(pm, font, TITLE_PT, 25.0, ty, &title, white, 0.95);
-    // legacy's SessionActivity.label (0x1003dceb4).
+    // Session activity label.
     let state = if f.activity == Activity::Empty { "Idle" } else { f.activity.label() };
     let sc = match g {
         Group::Waiting => waiting_tint(f.orb),

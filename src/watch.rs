@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Opens a followed app on one conversation: raise the window with that title, or press the
-/// sidebar entry with that title (the way legacy opens an exact task "through Accessibility").
+/// sidebar entry with that title through Accessibility.
 pub fn focus_conversation(bundle: &str, title: &str, electron: bool) -> bool {
     #[cfg(target_os = "macos")]
     {

@@ -10,7 +10,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---- keypad geometry (KeypadGeometry, 0x10042b24c..) ----
 pub const KEY_COUNT: usize = 9;
-pub const COLUMNS: usize = 3;
 pub const KEY_SIZE: u32 = 118;
 pub const ORIGIN_X: u32 = 23;
 pub const ORIGIN_Y: u32 = 6;
@@ -75,7 +74,7 @@ pub fn age_text(since: f64, now: f64) -> String {
     }
 }
 
-/// Compact age like legacy's tile corner: "33m", "1h", "2d" (nothing under a minute).
+/// Compact age for a tile corner: "33m", "1h", "2d" (nothing under a minute).
 pub fn age_compact(since: f64, now: f64) -> String {
     let m = ((now - since).max(0.0) / 60.0) as i64;
     match m {
@@ -86,7 +85,7 @@ pub fn age_compact(since: f64, now: f64) -> String {
     }
 }
 
-/// "33 min ago", "1 h ago", "2 d ago" (legacy's "last turn …" line).
+/// "33 min ago", "1 h ago", "2 d ago".
 pub fn age_long(since: f64, now: f64) -> String {
     let m = ((now - since).max(0.0) / 60.0) as i64;
     match m {
@@ -155,7 +154,7 @@ impl Activity {
         }
     }
 
-    /// legacy's SessionActivity.label (0x1003dceb4, jump table 0x1009e56d0).
+    /// Text shown for each session activity.
     pub fn label(self) -> &'static str {
         use Activity::*;
         match self {
@@ -240,8 +239,8 @@ impl ToolKind {
 
 // ---------------------------------------------------------------- agents
 
-pub const AGENT_FORMAT: &str = "legacy-rs.agent";
-pub const AGENTS_FORMAT: &str = "legacy-rs.agents";
+pub const AGENT_FORMAT: &str = "agentpad.agent";
+pub const AGENTS_FORMAT: &str = "agentpad.agents";
 
 fn default_format() -> String {
     AGENT_FORMAT.into()
@@ -566,7 +565,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            format: "legacy-rs.settings".into(),
+            format: "agentpad.settings".into(),
             version: 1,
             hook_port: 47800,
             launch_at_login: false,
@@ -606,20 +605,18 @@ impl Default for Settings {
 
 pub fn data_dir() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("AgentPad");
-    // Keep settings and imported agents from before the rename.
-    let old = base.join("legacy RS");
-    if !dir.exists() && old.exists() {
-        let _ = std::fs::rename(&old, &dir);
-    }
-    dir
+    base.join("AgentPad")
 }
 
 impl Settings {
     pub fn load() -> Settings {
         std::fs::read_to_string(data_dir().join("settings.json"))
             .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
+            .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+            .map(|mut settings| {
+                settings.format = "agentpad.settings".into();
+                settings
+            })
             .unwrap_or_default()
     }
 
@@ -635,12 +632,36 @@ impl Settings {
     }
 }
 
+// Stored definitions may have an earlier marker; external imports still require the current one.
+fn parse_stored_agents(text: &str) -> Result<Vec<AgentDef>, String> {
+    fn normalize_agent(value: &mut Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("format".into(), Value::String(AGENT_FORMAT.into()));
+        }
+    }
+
+    let mut value: Value = serde_json::from_str(text).map_err(|e| format!("This file isn't valid JSON ({e})."))?;
+    if let Some(agents) = value.as_array_mut() {
+        for agent in agents { normalize_agent(agent); }
+    } else if let Some(object) = value.as_object_mut() {
+        if object.get("agents").is_some_and(Value::is_array) {
+            object.insert("format".into(), Value::String(AGENTS_FORMAT.into()));
+            if let Some(agents) = object.get_mut("agents").and_then(Value::as_array_mut) {
+                for agent in agents { normalize_agent(agent); }
+            }
+        } else {
+            normalize_agent(&mut value);
+        }
+    }
+    parse_agent_file(&value.to_string())
+}
+
 pub fn load_custom_agents() -> Vec<AgentDef> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(data_dir().join("agents")) {
         for e in rd.flatten() {
             if let Ok(t) = std::fs::read_to_string(e.path()) {
-                if let Ok(list) = parse_agent_file(&t) {
+                if let Ok(list) = parse_stored_agents(&t) {
                     for a in list {
                         if let Ok((a, _)) = validate_agent(a) {
                             out.push(a);
@@ -757,7 +778,7 @@ pub struct SessionFace {
     pub focus_header: bool,
     pub dots: bool,
     pub unread: u32,
-    /// The last message whatever its age (shown dim on the tile, as legacy does).
+    /// The last message whatever its age (shown dim on the tile).
     pub last_message: String,
     /// When the session last did something (for "last turn 33 min ago").
     pub last_turn: f64,
@@ -775,7 +796,7 @@ pub struct HubFace {
     pub dots: Vec<Rgb>,
     pub waiting_colour: Rgb,
     pub dimmed: bool,
-    /// Sessions per agent: (name, colour, count), as legacy's hub lists them.
+    /// Sessions per agent: (name, colour, count).
     pub agents: Vec<(String, Rgb, usize)>,
 }
 
@@ -1194,10 +1215,6 @@ impl Core {
         colour::rotate(orb, self.settings.waiting_hue - colour::REFERENCE_WAITING_HUE)
     }
 
-    pub fn error_colour() -> Rgb {
-        colour::oklch(0.467, 0.154, colour::ERROR_HUE)
-    }
-
     pub fn hue_of(&self, agent: &str) -> f32 {
         self.settings
             .agent_hues
@@ -1397,10 +1414,6 @@ impl Core {
         }
     }
 
-    pub fn is_key_down(&self, i: usize) -> bool {
-        self.key_down.get(i).map(|d| d.is_some()).unwrap_or(false)
-    }
-
     pub fn hold_progress(&self, i: usize) -> f32 {
         match self.key_down.get(i).copied().flatten() {
             Some(d) if !self.hold_fired[i] => ((now() - d) / FOCUS_HOLD_S).clamp(0.0, 1.0) as f32,
@@ -1513,7 +1526,7 @@ impl Core {
                 tty: String::new(),
                 term: String::new(),
                 pid: 0,
-                unread: 0,
+                unread: if *title == "data-pipeline" { 2 } else { 0 },
                 cleared_at: None,
                 pending_text: None,
             });
@@ -1566,6 +1579,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agentpad_agent_export_import_round_trip_preserves_definition() {
+        let mut agent = agent_for_app("Example Editor", "com.example.editor");
+        agent.description = "An imported editor integration".into();
+        agent.open_url = "example://session/{session}".into();
+        agent.style = "dots".into();
+        agent.events.insert("PromptStart".into(), "thinking".into());
+        agent.models.insert("code".into(), "example-model".into());
+
+        let exported = serde_json::to_string_pretty(&agent).unwrap();
+        let imported = parse_agent_file(&exported).unwrap();
+        assert_eq!(imported, vec![agent]);
+        assert_eq!(imported[0].format, "agentpad.agent");
+    }
+
+    #[test]
+    fn agentpad_bundle_export_import_round_trip_preserves_agents() {
+        let mut first = agent_for_app("First Editor", "com.example.first");
+        first.events.insert("PromptStart".into(), "thinking".into());
+        let second = agent_for_app("Second Editor", "com.example.second");
+        let bundle = serde_json::json!({
+            "format": AGENTS_FORMAT,
+            "version": 1,
+            "agents": [first, second],
+        });
+
+        let imported = parse_agent_file(&bundle.to_string()).unwrap();
+        assert_eq!(imported.len(), 2);
+        assert_eq!(imported[0].id, "com.example.first");
+        assert_eq!(imported[0].events.get("PromptStart").map(String::as_str), Some("thinking"));
+        assert_eq!(imported[1].id, "com.example.second");
+        assert!(imported.iter().all(|agent| agent.format == AGENT_FORMAT));
+    }
+
+    #[test]
+    fn stored_agent_objects_arrays_and_bundles_normalize_their_markers() {
+        let agent = agent_for_app("Saved Editor", "com.example.saved");
+        let mut object = serde_json::to_value(&agent).unwrap();
+        object["format"] = serde_json::json!("previous.vendor.agent");
+
+        let from_object = parse_stored_agents(&object.to_string()).unwrap();
+        assert_eq!(from_object[0].format, AGENT_FORMAT);
+
+        let from_array = parse_stored_agents(&serde_json::json!([object.clone()]).to_string()).unwrap();
+        assert_eq!(from_array[0].format, AGENT_FORMAT);
+
+        let bundle = serde_json::json!({
+            "format": "previous.vendor.agents",
+            "version": 1,
+            "agents": [object],
+        });
+        let from_bundle = parse_stored_agents(&bundle.to_string()).unwrap();
+        assert_eq!(from_bundle[0].format, AGENT_FORMAT);
+        assert_eq!(from_bundle[0].id, agent.id);
+    }
+
+    #[test]
+    fn external_import_rejects_a_non_agentpad_marker() {
+        let mut object = serde_json::to_value(agent_for_app("Saved Editor", "com.example.saved")).unwrap();
+        object["format"] = serde_json::json!("previous.vendor.agent");
+        assert!(parse_agent_file(&object.to_string()).is_err());
+    }
+
+    #[test]
+    fn settings_round_trip_uses_agentpad_marker_and_preserves_values() {
+        let mut settings = Settings::default();
+        settings.brightness = 0.42;
+        settings.menu_indicator = MenuIndicator::Dot;
+        settings.disabled_agents.push("com.example.editor".into());
+
+        let exported = serde_json::to_string(&settings).unwrap();
+        let value: Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(value["format"], "agentpad.settings");
+        let imported: Settings = serde_json::from_str(&exported).unwrap();
+        assert_eq!(imported.format, "agentpad.settings");
+        assert_eq!(imported.brightness, 0.42);
+        assert_eq!(imported.menu_indicator, MenuIndicator::Dot);
+        assert_eq!(imported.disabled_agents, vec!["com.example.editor"]);
+    }
+
+    #[test]
     fn new_text_waits_for_the_dwell() {
         let mut c = Core::new(Settings::default());
         c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"streaming","text":"first"}) });
@@ -1578,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn age_clock_like_legacy() {
+    fn age_clock_compact() {
         assert_eq!(age_text(0.0, 59.0), "");
         assert_eq!(age_text(0.0, 5.0 * 60.0), "5m ago");
         assert_eq!(age_text(0.0, 61.0 * 60.0), "1h ago");

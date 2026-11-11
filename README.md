@@ -49,7 +49,7 @@ States: `starting`, `idle`, `thinking`, `tool`, `streaming`, `waitingPermission`
 
 ```json
 {
-  "format": "legacy-rs.agent", "version": 1,
+  "format": "agentpad.agent", "version": 1,
   "id": "com.example.myagent", "name": "My Agent", "badge": "MA",
   "hue": 200, "style": "orb",
   "app_name": "My Agent", "watch_app": "com.example.myagent.desktop",
@@ -59,10 +59,10 @@ States: `starting`, `idle`, `thinking`, `tool`, `streaming`, `waitingPermission`
 
 ## Notes
 
-`MECHANICS.md` documents the behaviour this app reproduces (timings, colours, keypad
+`MECHANICS.md` documents the app’s behaviour (timings, colours, keypad
 protocol). The physical keypad driver is experimental.
 
-AgentPad is not affiliated with Logitech, Anthropic, OpenAI or legacy. Logitech, MX and
+AgentPad is not affiliated with Logitech, Anthropic or OpenAI. Logitech, MX and
 Options+ are trademarks of Logitech; Claude is a trademark of Anthropic; Codex and ChatGPT are
 trademarks of OpenAI.
 

@@ -1,4 +1,4 @@
-//! legacy RS — an open-source, Rust rebuild of legacy's keypad, menu bar and agent settings.
+//! AgentPad — an open-source keypad and menu bar for agent sessions.
 
 mod colour;
 mod field;
@@ -14,7 +14,7 @@ mod tray;
 mod watch;
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Key, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2, pos2,
+    self, Align2, Color32, CornerRadius, FontId, Key, Rect, RichText, Sense, Stroke, Ui, UiBuilder, pos2,
     vec2,
 };
 use model::{
@@ -351,9 +351,9 @@ impl App {
         y += 26.0;
         for (page, name, glyph) in PAGES {
             let r = Rect::from_min_size(pos2(rect.left() + 10.0, y), vec2(rect.width() - 20.0, 34.0));
-            let resp = ui.interact(r, egui::Id::new(("nav", name)), Sense::click());
+            let resp = ui.interact(r, egui::Id::unique(("nav", name)), Sense::click());
             let sel = self.page == page;
-            let t = ui.ctx().animate_bool_with_time(egui::Id::new(("navsel", name)), sel, 0.18);
+            let t = ui.ctx().animate_bool_with_time(egui::Id::unique(("navsel", name)), sel, 0.18);
             if t > 0.01 {
                 p.rect_filled(r, CornerRadius::same(10), with_alpha(Color32::from_rgb(10, 132, 255), 0.85 * t));
             } else if resp.hovered() {
@@ -470,11 +470,11 @@ impl App {
                 target = pos2(x, y);
             }
             let base = Rect::from_min_size(target, vec2(key_size, key_size));
-            let resp = ui.interact(base, egui::Id::new(("key", i)), Sense::click_and_drag());
+            let resp = ui.interact(base, egui::Id::unique(("key", i)), Sense::click_and_drag());
             let pressed = resp.is_pointer_button_down_on();
             down_now[i] = pressed;
             let scale = ctx.animate_value_with_time(
-                egui::Id::new(("ks", i)),
+                egui::Id::unique(("ks", i)),
                 if pressed { 0.94 } else if resp.hovered() { 1.03 } else { 1.0 },
                 0.14,
             );
@@ -518,7 +518,7 @@ impl App {
         let next_r = Rect::from_min_size(pos2(dev.center().x + 12.0, by), vec2(bw, page_h));
         let mut page_now = [false; 2];
         for (i, r) in [prev_r, next_r].iter().enumerate() {
-            let resp = ui.interact(*r, egui::Id::new(("page", i)), Sense::click_and_drag());
+            let resp = ui.interact(*r, egui::Id::unique(("page", i)), Sense::click_and_drag());
             let key = if i == 0 { Key::ArrowLeft } else { Key::ArrowRight };
             page_now[i] = resp.is_pointer_button_down_on() || (!typing && ctx.input(|inp| inp.key_down(key)));
             paint::page_button(&p, *r, if i == 0 { "‹" } else { "›" }, page_held[i], resp.hovered());
@@ -578,7 +578,7 @@ impl App {
                 break;
             }
             let row = Rect::from_min_size(pos2(r.left() + 8.0, y), vec2(r.width() - 16.0, row_h - 4.0));
-            let resp = ui.interact(row, egui::Id::new(("prow", s.key())), Sense::click());
+            let resp = ui.interact(row, egui::Id::unique(("prow", s.key())), Sense::click());
             if resp.hovered() {
                 p.rect_filled(row, CornerRadius::same(12), white(0.07));
             }
@@ -936,8 +936,8 @@ impl App {
     /// Apps followed through Accessibility, with buttons to add more and to allow access.
     fn follow_apps_card(&mut self, ui: &mut Ui, agents: &[AgentDef]) -> bool {
         let mut changed = false;
-        let (watched, overrides) = match self.core.lock() {
-            Ok(c) => (c.watched_apps(), c.settings.watch_apps.clone()),
+        let watched = match self.core.lock() {
+            Ok(c) => c.watched_apps(),
             Err(_) => return false,
         };
         let running: Vec<(String, String)> = watch::running_apps();
@@ -1027,7 +1027,6 @@ impl App {
                     }
                 }
             });
-            let _ = &overrides;
         });
         changed
     }
@@ -1172,7 +1171,7 @@ impl App {
                     Hardware::Problem(e) => e.clone(),
                 };
                 hint(ui, &status);
-                hint(ui, "Uses the keypad's own protocol as the original does: exclusive access (Options+ pauses), the page buttons, key presses and key pictures. macOS may ask to allow Input Monitoring.");
+                hint(ui, "Uses the keypad's protocol: exclusive access (Options+ pauses), the page buttons, key presses and key pictures. macOS may ask to allow Input Monitoring.");
             });
         }
         if toggle {
@@ -1181,7 +1180,7 @@ impl App {
         card(ui, "Settings file", |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Export settings…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().set_file_name("legacy-settings.json").save_file() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name("agentpad-settings.json").save_file() {
                         let ok = std::fs::write(&path, serde_json::to_string_pretty(&c.settings).unwrap_or_default()).is_ok();
                         c.notify(if ok { "Settings exported." } else { "Export failed. Nothing was saved." });
                     }
@@ -1189,7 +1188,7 @@ impl App {
                 if ui.button("Import settings…").clicked() {
                     if let Some(path) = rfd::FileDialog::new().add_filter("Settings", &["json"]).pick_file() {
                         match std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok()) {
-                            Some(s) if s.format == "legacy-rs.settings" && s.version <= 1 => {
+                            Some(s) if s.format == "agentpad.settings" && s.version <= 1 => {
                                 c.settings = s;
                                 c.notify("Settings imported.");
                             }
@@ -1208,7 +1207,7 @@ impl App {
     fn about_page(&mut self, ui: &mut Ui) {
         ui.heading("About");
         card(ui, "AgentPad", |ui| {
-            hint(ui, "An open-source Rust app inspired by legacy: its keypad, menu bar and agent settings. Light: it redraws only while something moves, and drops to 10 fps when everything is idle.");
+            hint(ui, "An open-source Rust app for agent sessions on a keypad and in the menu bar. It is lightweight: it redraws only while something moves, and drops to 10 fps when everything is idle.");
             hint(ui, "Not affiliated with Logitech, Anthropic or OpenAI. Logitech, MX and Options+ are trademarks of Logitech. Claude is a trademark of Anthropic. Codex and ChatGPT are trademarks of OpenAI.");
             let c = self.core.lock();
             if let Ok(c) = c {
@@ -1359,6 +1358,5 @@ fn main() -> eframe::Result {
     }
     options.viewport = viewport;
     let shot = screenshot.clone();
-    let _ = (Pos2::ZERO, Vec2::ZERO, StrokeKind::Inside);
     eframe::run_native("AgentPad", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot)))))
 }

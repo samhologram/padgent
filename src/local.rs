@@ -1,4 +1,4 @@
-//! Sessions read from the agents' own local records, the way legacy follows them:
+//! Sessions read from the agents' own local records:
 //! Claude Code's live session files (`~/.claude/sessions/<pid>.json`: status busy/idle and
 //! the conversation's name) and Codex's thread databases (`~/.codex/state_N.sqlite` and
 //! `thread_history_N.sqlite`: user threads, their latest turn, final message and unread
@@ -134,7 +134,7 @@ fn tool_detail(name: &str, input: &Value) -> String {
     if d.is_empty() { name.to_string() } else { format!("{name} {d}") }
 }
 
-/// A reply that ends by asking the person something (heuristic, like legacy's
+/// A reply that ends by asking the person something (heuristic, based on the
 /// allowHeuristicWaits for Codex).
 fn asks(text: &str) -> bool {
     let t = text.trim_end();
@@ -265,7 +265,6 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
             // Last thing reported per session, so only changes are applied.
             let mut last: HashMap<String, String> = HashMap::new();
             let mut transcripts: HashMap<String, PathBuf> = HashMap::new();
-            let mut tick: u64 = 0;
             loop {
                 let (claude_on, codex_on, recency) = match core.lock() {
                     Ok(c) => (c.agent_enabled("claude-code"), c.agent_enabled("codex"), c.settings.recency_minutes as i64),
@@ -403,10 +402,8 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     }
                     wake();
                 }
-                tick += 1;
                 // Every second while something works, every three seconds otherwise.
                 std::thread::sleep(Duration::from_millis(if busy_any { 1000 } else { 3000 }));
-                let _ = tick;
             }
         })
         .ok();

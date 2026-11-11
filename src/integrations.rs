@@ -6,8 +6,8 @@ use serde_json::{Map, Value, json};
 use std::path::PathBuf;
 use std::process::Command;
 
-/// Opens the exact conversation and puts its app in front, the way legacy does: activate the
-/// app (HostAppActivator.bringForward), then select the conversation (Accessibility) or the
+/// Opens the exact conversation and puts its app in front: activate the
+/// app, then select the conversation (Accessibility) or the
 /// terminal tab (Apple Events). Call on the main thread.
 pub fn open_exact(agent: Option<&AgentDef>, s: &crate::model::Session) {
     crate::mac::log(&format!(
@@ -267,11 +267,11 @@ fn write_json(path: &PathBuf, v: &Value) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let bak = path.with_extension("json.legacy-rs-bak");
+    let bak = path.with_extension("json.agentpad-bak");
     if path.exists() && !bak.exists() {
         let _ = std::fs::copy(path, &bak);
     }
-    let tmp = path.with_extension("json.legacy-rs-tmp");
+    let tmp = path.with_extension("json.agentpad-tmp");
     std::fs::write(&tmp, serde_json::to_string_pretty(v).unwrap_or_default()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }

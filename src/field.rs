@@ -1,10 +1,5 @@
-//! The light behind each session key, after legacy's `legacyParams` (0x10052f400): a light
-//! field made of a core, a halo, two rings, two moving lights, a ripple and grain, in key
-//! units with y measured up from the bottom (the light sits near the top, text underneath).
-//!
-//! Fixed values per state were read by tracing each case of the state switch to its exit block
-//! (0x100531ab4); values that change with the clock are rebuilt from the constants each case
-//! uses (periods 6 s idle, 3.2 s thinking, 1.6 s approval, 2.4 s compacting, 1.4 s start/burst).
+//! Animated light field behind each session key: core, halo, rings, moving lights, ripple
+//! and grain. Coordinates use key units with y measured up from the bottom.
 
 use crate::model::{Activity, ToolKind};
 use std::f32::consts::TAU;
@@ -216,7 +211,7 @@ pub fn params(activity: Activity, tool: Option<ToolKind>, t: f32, age: f32, redu
     f
 }
 
-/// 1-D value noise with a quintic fade (6t⁵−15t⁴+10t³), as legacy's idle drift uses.
+/// 1-D value noise with a quintic fade (6t⁵−15t⁴+10t³) for idle drift.
 fn smooth_noise(x: f32) -> f32 {
     let i = x.floor();
     let f = x - i;
@@ -226,9 +221,7 @@ fn smooth_noise(x: f32) -> f32 {
     a + (b - a) * u
 }
 
-/// How much bigger AgentPad draws the light than legacy's sizes (the person asked for at least
-/// 50% bigger animations). Sizes, ring radii and the moving lights' distance from the core grow;
-/// intensities and timing stay legacy's.
+/// Scale for light sizes and their distance from the core.
 pub const ANIM_SCALE: f32 = 1.5;
 
 impl Field {
