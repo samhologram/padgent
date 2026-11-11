@@ -85,7 +85,12 @@ impl Tray {
             .with_menu(Box::new(Menu::new()))
             .build()
             .ok()?;
+        icon.set_show_menu_on_left_click(false);
         Some(Tray { icon, signature: None, rows: Vec::new(), rebuilt: std::time::Instant::now(), last_indicator: None })
+    }
+
+    pub fn rect(&self) -> Option<tray_icon::Rect> {
+        self.icon.rect()
     }
 
     pub fn update(&mut self, core: &Core) {

@@ -16,6 +16,8 @@ pub const ORIGIN_Y: u32 = 6;
 pub const PITCH: u32 = 158;
 pub const HUB_KEY: usize = 8;
 pub const SESSION_KEYS_PER_PAGE: usize = 8;
+/// Idle sessions older than this stay available, but start no earlier than page two.
+pub const IDLE_SECOND_PAGE_AFTER_S: f64 = 30.0 * 60.0;
 pub const FOCUS_HOLD_S: f64 = 0.6;
 pub const HAND_BACK_HOLD_S: f64 = 1.5;
 /// Holding a session key this long clears its tile until the session has something new
@@ -965,6 +967,7 @@ impl Core {
             });
 
         let idx = self.sessions.iter().position(|s| s.agent == agent_id && s.id == sid);
+        let new_session = idx.is_none();
         let idx = match idx {
             Some(i) => i,
             None => {
@@ -998,6 +1001,16 @@ impl Core {
         };
         let s = &mut self.sessions[idx];
         let old = s.activity;
+        // Read-receipt changes do not turn an already idle completed Codex thread into
+        // a newly completed turn. Its local record can repeat the same final message.
+        let activity = if old == Activity::Idle && activity == Activity::Done && event.is_none()
+            && b.get("_unread").is_some() && text.as_deref() == Some(s.text.as_str())
+            && b.get("_text_at").and_then(Value::as_f64).is_some_and(|at| at > 0.0 && at <= s.text_at)
+        { old } else { activity };
+        // An old local record keeps its real age when first discovered after app launch.
+        let first_idle_time = if new_session && activity.group() == Group::Idle {
+            b.get("_text_at").and_then(Value::as_f64).filter(|at| *at > 0.0 && *at <= t)
+        } else { None };
         if let Some(v) = str_at(b, &["_app"]) {
             s.app_bundle = v.to_string();
         }
@@ -1049,7 +1062,7 @@ impl Core {
             s.subagent_at = t;
         }
         if old != activity {
-            s.since = t;
+            s.since = first_idle_time.unwrap_or(t);
         }
         let og = old.group();
         let ng = activity.group();
@@ -1179,16 +1192,34 @@ impl Core {
         v
     }
 
+    /// All keypad slots, including empty slots reserved on the first page. Keep this as the
+    /// single mapping for drawing, key presses and the hub's waiting-session shortcut.
+    fn keypad_slots(&self) -> Vec<Option<&Session>> {
+        self.keypad_slots_at(now())
+    }
+
+    fn keypad_slots_at(&self, t: f64) -> Vec<Option<&Session>> {
+        let (recent, old_idle): (Vec<_>, Vec<_>) = self.visible().into_iter().partition(|s| {
+            s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
+        });
+        let mut slots: Vec<Option<&Session>> = recent.into_iter().map(Some).collect();
+        if !old_idle.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE {
+            slots.resize(SESSION_KEYS_PER_PAGE, None);
+        }
+        slots.extend(old_idle.into_iter().map(Some));
+        slots
+    }
+
     pub fn pages(&self) -> usize {
-        self.visible().len().div_ceil(SESSION_KEYS_PER_PAGE).max(1)
+        self.keypad_slots().len().div_ceil(SESSION_KEYS_PER_PAGE).max(1)
     }
 
     fn session_at(&self, key: usize) -> Option<&Session> {
-        if key >= SESSION_KEYS_PER_PAGE {
-            return None;
-        }
-        let page = self.page.min(self.pages() - 1);
-        self.visible().get(page * SESSION_KEYS_PER_PAGE + key).copied()
+        if key >= SESSION_KEYS_PER_PAGE { return None; }
+        let slots = self.keypad_slots();
+        let pages = slots.len().div_ceil(SESSION_KEYS_PER_PAGE).max(1);
+        let page = self.page.min(pages - 1);
+        slots.get(page * SESSION_KEYS_PER_PAGE + key).copied().flatten()
     }
 
     pub fn waiting_count(&self) -> usize {
@@ -1324,8 +1355,8 @@ impl Core {
         }
         let vis = self.visible();
         let page = self.page.min(self.pages() - 1);
-        for (i, s) in vis.iter().skip(page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).enumerate() {
-            out[i] = KeyFace::Session(face_of(s, false));
+        for (i, slot) in self.keypad_slots().iter().skip(page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).enumerate() {
+            if let Some(s) = slot { out[i] = KeyFace::Session(face_of(s, false)); }
         }
         let count = |g: Group| vis.iter().filter(|s| s.activity.group() == g).count();
         out[HUB_KEY] = KeyFace::Hub(HubFace {
@@ -1365,6 +1396,15 @@ impl Core {
         }
     }
 
+    /// Discard a pointer press when its window disappears, without invoking its action.
+    pub fn cancel_key(&mut self, i: usize) {
+        if i < KEY_COUNT {
+            self.key_down[i] = None;
+            self.hold_fired[i] = false;
+            self.clear_fired[i] = false;
+        }
+    }
+
     pub fn key_up(&mut self, i: usize) {
         if i >= KEY_COUNT {
             return;
@@ -1389,8 +1429,8 @@ impl Core {
         }
         if i == HUB_KEY {
             // Jump to the first page with a waiting session.
-            let vis = self.visible();
-            if let Some(pos) = vis.iter().position(|s| s.activity.group() == Group::Waiting) {
+            let slots = self.keypad_slots();
+            if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| s.activity.group() == Group::Waiting)) {
                 self.page = pos / SESSION_KEYS_PER_PAGE;
             } else {
                 self.actions.push(Action::ShowWindow);
@@ -1578,6 +1618,14 @@ pub fn wrap_chunks(text: &str, keys: usize, per_key: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn add_test_session(core: &mut Core, id: &str, state: &str) {
+        core.apply(Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: serde_json::json!({"session": id, "state": state, "title": id}),
+        });
+    }
+
     #[test]
     fn agentpad_agent_export_import_round_trip_preserves_definition() {
         let mut agent = agent_for_app("Example Editor", "com.example.editor");
@@ -1656,6 +1704,156 @@ mod tests {
         assert_eq!(imported.brightness, 0.42);
         assert_eq!(imported.menu_indicator, MenuIndicator::Dot);
         assert_eq!(imported.disabled_agents, vec!["com.example.editor"]);
+    }
+
+    #[test]
+    fn cancelling_pointer_press_clears_hold_and_suppresses_click_action() {
+        let mut settings = Settings::default();
+        settings.empty_key_url = "https://example.com/empty".into();
+        let mut core = Core::new(settings);
+        core.in_control = true;
+
+        core.key_down(0);
+        core.cancel_key(0);
+        assert_eq!(core.hold_progress(0), 0.0);
+        core.key_up(0);
+        assert!(core.actions.is_empty());
+
+        // A later normal press still dispatches through the same Core input path.
+        core.key_down(0);
+        core.key_up(0);
+        assert!(matches!(core.actions.as_slice(), [Action::OpenUrl(url)] if url == "https://example.com/empty"));
+    }
+
+    #[test]
+    fn old_idle_sessions_leave_reserved_page_one_slots_and_remain_on_page_two() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        settings.reorder_on = ReorderOn::Turns;
+        let mut core = Core::new(settings);
+        core.in_control = true;
+        add_test_session(&mut core, "old-idle", "idle");
+        add_test_session(&mut core, "recent-idle", "idle");
+        add_test_session(&mut core, "active", "thinking");
+
+        let t = now();
+        for s in &mut core.sessions {
+            match s.id.as_str() {
+                "old-idle" => { s.since = t - IDLE_SECOND_PAGE_AFTER_S - 60.0; s.updated = t - 60.0; s.turn_started = s.since; }
+                "recent-idle" => { s.since = t - 5.0 * 60.0; s.updated = s.since; s.turn_started = s.since; }
+                "active" => { s.since = t - 90.0 * 60.0; s.updated = s.since; s.turn_started = s.since; }
+                _ => unreachable!(),
+            }
+        }
+        core.resort();
+
+        let slots = core.keypad_slots_at(t);
+        assert_eq!(slots.len(), SESSION_KEYS_PER_PAGE + 1);
+        assert_eq!(slots[0].unwrap().id, "active");
+        assert_eq!(slots[1].unwrap().id, "recent-idle");
+        assert!(slots[2..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none));
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
+        assert_eq!(core.pages(), 2);
+
+        core.page = 0;
+        assert_eq!(core.session_at(0).unwrap().id, "active");
+        assert!(core.session_at(2).is_none());
+        core.page = 1;
+        assert_eq!(core.session_at(0).unwrap().id, "old-idle");
+        core.key_down(0);
+        core.key_up(0);
+        assert!(matches!(core.actions.as_slice(), [Action::Open { agent, session }] if agent == "codex" && session == "old-idle"));
+    }
+
+    #[test]
+    fn idle_recency_boundary_is_inclusive_and_waiting_sessions_stay_on_page_one() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        let mut core = Core::new(settings);
+        core.in_control = true;
+        add_test_session(&mut core, "exact", "idle");
+        add_test_session(&mut core, "over", "idle");
+        add_test_session(&mut core, "waiting", "waiting_question");
+
+        let t = now();
+        for s in &mut core.sessions {
+            match s.id.as_str() {
+                "exact" => { s.since = t - IDLE_SECOND_PAGE_AFTER_S; s.updated = t - 10.0; s.turn_started = s.since; }
+                "over" => { s.since = t - IDLE_SECOND_PAGE_AFTER_S - 0.01; s.updated = t - 10.0; s.turn_started = s.since; }
+                "waiting" => { s.since = t - 2.0 * 60.0 * 60.0; s.updated = s.since; s.turn_started = s.since; }
+                _ => unreachable!(),
+            }
+        }
+        core.resort();
+
+        let slots = core.keypad_slots_at(t);
+        assert_eq!(slots[0].unwrap().id, "waiting");
+        assert_eq!(slots[1].unwrap().id, "exact");
+        assert!(slots[2..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none));
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "over");
+        assert_eq!(core.waiting_count(), 1);
+        assert!(matches!(&core.faces()[HUB_KEY], KeyFace::Hub(hub) if hub.waiting == 1));
+    }
+
+    #[test]
+    fn old_local_idle_age_survives_first_discovery_and_unread_refresh() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        let mut core = Core::new(settings);
+        let message_at = now() - 60.0 * 60.0;
+        core.apply(Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: serde_json::json!({
+                "session": "local-old", "state": "idle", "title": "Local", "text": "last answer",
+                "_text_at": message_at, "_unread": 1
+            }),
+        });
+        assert_eq!(core.sessions[0].since, message_at);
+
+        core.apply(Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: serde_json::json!({
+                "session": "local-old", "state": "done", "title": "Local", "text": "last answer",
+                "_text_at": message_at, "_unread": 2
+            }),
+        });
+        assert_eq!(core.sessions[0].activity, Activity::Idle);
+        assert_eq!(core.sessions[0].since, message_at);
+        assert_eq!(core.sessions[0].unread, 2);
+
+        let slots = core.keypad_slots_at(now());
+        assert!(slots[..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none));
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "local-old");
+    }
+
+    #[test]
+    fn old_idle_pagination_is_consistent_across_reorder_modes() {
+        for mode in [ReorderOn::Turns, ReorderOn::All] {
+            let mut settings = Settings::default();
+            settings.recency_minutes = 240;
+            settings.reorder_on = mode;
+            let mut core = Core::new(settings);
+            add_test_session(&mut core, "old", "idle");
+            add_test_session(&mut core, "recent", "idle");
+            let t = now();
+            for s in &mut core.sessions {
+                if s.id == "old" {
+                    s.since = t - IDLE_SECOND_PAGE_AFTER_S - 5.0;
+                    s.updated = t - 30.0;
+                    s.turn_started = s.since;
+                } else {
+                    s.since = t - 30.0;
+                    s.updated = s.since;
+                    s.turn_started = s.since;
+                }
+            }
+            core.resort();
+            let slots = core.keypad_slots_at(t);
+            assert_eq!(slots[0].unwrap().id, "recent", "mode: {mode:?}");
+            assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old", "mode: {mode:?}");
+        }
     }
 
     #[test]

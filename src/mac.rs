@@ -53,11 +53,32 @@ mod imp {
         true
     }
 
-    pub fn hide_app() {
-        if let Some(mtm) = MainThreadMarker::new() {
-            NSApplication::sharedApplication(mtm).hide(None);
+    /// Position a logical-size popup below the status item on the screen under the pointer.
+    pub fn tray_popup_position(rect: tray_icon::Rect, width: f32, height: f32) -> (f32, f32) {
+        use objc2_app_kit::{NSEvent, NSScreen};
+        let Some(mtm) = MainThreadMarker::new() else { return (0.0, 24.0) };
+        let screens = NSScreen::screens(mtm);
+        let Some(primary) = screens.firstObject() else { return (0.0, 24.0) };
+        let primary_top = primary.frame().origin.y + primary.frame().size.height;
+        let mouse = NSEvent::mouseLocation();
+        for screen in screens.iter() {
+            let frame = screen.frame();
+            if mouse.x >= frame.origin.x && mouse.x < frame.origin.x + frame.size.width
+                && mouse.y >= frame.origin.y && mouse.y < frame.origin.y + frame.size.height {
+                let scale = screen.backingScaleFactor();
+                let visible = screen.visibleFrame();
+                let min_x = visible.origin.x as f32;
+                let max_x = (visible.origin.x + visible.size.width) as f32 - width;
+                let min_y = (primary_top - visible.origin.y - visible.size.height) as f32;
+                let max_y = (primary_top - visible.origin.y) as f32 - height;
+                let x = ((rect.position.x + f64::from(rect.size.width) / 2.0) / scale) as f32 - width / 2.0;
+                let y = ((rect.position.y + f64::from(rect.size.height)) / scale) as f32;
+                return (x.clamp(min_x, max_x.max(min_x)), y.clamp(min_y, max_y.max(min_y)));
+            }
         }
+        (0.0, 24.0)
     }
+
     // ---- Bringing an app forward ----
 
     use std::ffi::c_void;
@@ -203,7 +224,10 @@ mod imp {
         None
     }
     pub fn show_app() {}
-    pub fn hide_app() {}
+    pub fn tray_popup_position(rect: tray_icon::Rect, width: f32, _height: f32) -> (f32, f32) {
+        (rect.position.x as f32 + rect.size.width as f32 / 2.0 - width / 2.0,
+            rect.position.y as f32 + rect.size.height as f32)
+    }
 }
 
 pub use imp::*;

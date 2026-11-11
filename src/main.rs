@@ -59,6 +59,12 @@ struct App {
     page: Page,
     tray: Option<tray::Tray>,
     menu_events: Arc<Mutex<Vec<String>>>,
+    tray_clicks: Arc<Mutex<Vec<tray_icon::Rect>>>,
+    popup_open: bool,
+    popup_position: egui::Pos2,
+    popup_focused: bool,
+    popup_keys: [bool; KEY_COUNT],
+    popup_pages: [bool; 2],
     screenshot: Option<String>,
     frames: u32,
     shot_done: Arc<AtomicBool>,
@@ -178,6 +184,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
         let menu_events = Arc::new(Mutex::new(Vec::new()));
+        let tray_clicks = Arc::new(Mutex::new(Vec::new()));
         let mut tray = None;
         if !demo {
             {
@@ -199,6 +206,14 @@ impl App {
             watch::start(core.clone(), wake.clone());
             local::start(core.clone(), wake.clone());
             tray = tray::Tray::new();
+            let clicks = tray_clicks.clone();
+            let wake_tray = wake.clone();
+            tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+                if let tray_icon::TrayIconEvent::Click { rect, button: tray_icon::MouseButton::Left, button_state: tray_icon::MouseButtonState::Up, .. } = event {
+                    if let Ok(mut pending) = clicks.lock() { pending.push(rect); }
+                    wake_tray();
+                }
+            }));
             // Repair a stale Accessibility entry left by an earlier build, once per signature.
             let rc = core.clone();
             std::thread::spawn(move || {
@@ -267,6 +282,12 @@ impl App {
             page: start_page,
             tray,
             menu_events,
+            tray_clicks,
+            popup_open: false,
+            popup_position: pos2(0.0, 24.0),
+            popup_focused: false,
+            popup_keys: [false; KEY_COUNT],
+            popup_pages: [false; 2],
             screenshot,
             frames: 0,
             shot_done: Arc::new(AtomicBool::new(false)),
@@ -296,6 +317,7 @@ impl App {
                 Action::OpenUrl(u) => integrations::open_url(&u),
                 Action::ShowWindow => {
                     mac::show_app();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
@@ -305,10 +327,12 @@ impl App {
             match id.as_str() {
                 "show" => {
                     self.page = Page::Keypad;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 "settings" => {
                     self.page = Page::Agents;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 "toggle" => {
@@ -338,6 +362,101 @@ impl App {
             Some(s) => integrations::open_exact(def, &s),
             None => integrations::open_session(def, session),
         }
+    }
+
+    fn open_popup(&mut self, rect: tray_icon::Rect) {
+        self.popup_open = true;
+        let (x, y) = mac::tray_popup_position(rect, 400.0, 480.0);
+        self.popup_position = pos2(x, y);
+        self.popup_focused = false;
+        mac::log("tray keypad opened");
+        mac::show_app();
+    }
+
+    fn popup(&mut self, ctx: &egui::Context) {
+        let builder = egui::ViewportBuilder::default().with_title("AgentPad keypad")
+            .with_inner_size([400.0, 480.0]).with_position(self.popup_position)
+            .with_resizable(false).with_decorations(false).with_always_on_top();
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("tray-keypad"), builder, |ui, _| {
+            let child_ctx = ui.ctx().clone();
+            let focused = child_ctx.input(|i| i.viewport().focused.unwrap_or(false));
+            if focused && !self.popup_focused {
+                self.popup_focused = true;
+                mac::log("tray keypad focused");
+            }
+            if child_ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested())
+                || (self.popup_focused && !focused) {
+                self.popup_open = false;
+                mac::log("tray keypad dismissed");
+            }
+            if !self.popup_open { return; }
+            let p = ui.painter().clone();
+            let full = ui.max_rect();
+            p.rect_filled(full, CornerRadius::same(14), Color32::from_rgb(29, 31, 39));
+            let (faces, waiting, brightness, reduced, glyphs, dimmed, held) = {
+                let Ok(mut c) = self.core.lock() else { return };
+                c.tick();
+                if c.settings.demo_mode { c.demo_tick(); }
+                (c.faces(), c32(c.waiting_colour()), c.settings.brightness, c.settings.motion == Motion::Reduced,
+                    c.settings.key_glyphs, c.dimmed(), [c.page_held(false), c.page_held(true)])
+            };
+            let t = model::now();
+            let dev = Rect::from_min_size(full.min + vec2(12.0, 12.0), vec2(376.0, 414.0));
+            paint::paint_device(&p, dev);
+            let grid_min = dev.min + vec2(16.0, 16.0);
+            let scale = 344.0 / 434.0;
+            let size = model::KEY_SIZE as f32 * scale;
+            let pitch = model::PITCH as f32 * scale;
+            let mut down = [false; KEY_COUNT];
+            for (i, face) in faces.iter().enumerate() {
+                let base = Rect::from_min_size(grid_min + vec2((i % 3) as f32 * pitch, (i / 3) as f32 * pitch), vec2(size, size));
+                let resp = ui.interact(base, egui::Id::unique(("tray-key", i)), Sense::click_and_drag());
+                down[i] = resp.is_pointer_button_down_on();
+                let size_factor = child_ctx.animate_value_with_time(egui::Id::unique(("tray-scale", i)),
+                    if down[i] { 0.94 } else if resp.hovered() { 1.03 } else { 1.0 }, 0.14);
+                let hold = self.core.lock().map(|c| c.hold_progress(i)).unwrap_or(0.0);
+                paint::paint_key(&p, Rect::from_center_size(base.center(), base.size() * size_factor), face, &paint::KeyCx {
+                    t, hover: resp.hovered(), pressed: down[i], hold, reduced_motion: reduced,
+                    brightness: if dimmed { brightness * 0.6 } else { brightness }, glyphs, waiting,
+                });
+            }
+            let mut page_down = [false; 2];
+            for i in 0..2 {
+                let r = Rect::from_min_size(pos2(dev.left() + 78.0 + i as f32 * 128.0, dev.bottom() - 42.0), vec2(92.0, 30.0));
+                let resp = ui.interact(r, egui::Id::unique(("tray-page", i)), Sense::click_and_drag());
+                page_down[i] = resp.is_pointer_button_down_on();
+                paint::page_button(&p, r, if i == 0 { "‹" } else { "›" }, held[i], resp.hovered());
+            }
+            if let Ok(mut c) = self.core.lock() {
+                for i in 0..KEY_COUNT {
+                    if down[i] && !self.popup_keys[i] { c.key_down(i); }
+                    if !down[i] && self.popup_keys[i] { c.key_up(i); }
+                }
+                for i in 0..2 { if page_down[i] != self.popup_pages[i] { c.page_button(i == 1, page_down[i]); } }
+            }
+            self.popup_keys = down;
+            self.popup_pages = page_down;
+            let r = Rect::from_min_size(full.min + vec2(12.0, 436.0), vec2(376.0, 30.0));
+            if ui.put(r, egui::Button::new("Open AgentPad & Settings…")).clicked() {
+                self.popup_open = false;
+                mac::log("tray keypad dismissed for full app");
+                self.page = Page::Keypad;
+                mac::show_app();
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
+            child_ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        });
+        if !self.popup_open { self.cancel_popup_inputs(); }
+    }
+
+    fn cancel_popup_inputs(&mut self) {
+        if let Ok(mut c) = self.core.lock() {
+            for i in 0..KEY_COUNT { if self.popup_keys[i] { c.cancel_key(i); } }
+            for i in 0..2 { if self.popup_pages[i] { c.page_button(i == 1, false); } }
+        }
+        self.popup_keys = [false; KEY_COUNT];
+        self.popup_pages = [false; 2];
     }
 
     fn sidebar(&mut self, ui: &mut Ui, rect: Rect) {
@@ -1136,6 +1255,7 @@ impl App {
         let hw = c.hardware.clone();
         let in_control = c.in_control;
         let mut toggle = false;
+        let mut preview = false;
         {
             let s = &mut c.settings;
             card(ui, "Menu bar", |ui| {
@@ -1146,6 +1266,7 @@ impl App {
                     ui.selectable_value(&mut s.menu_indicator, MenuIndicator::DotAndCount, "Dot and count");
                 });
                 hint(ui, "Dot shows a terracotta dot on the menu bar icon. Dot and count adds the number of waiting sessions next to it. The menu previews every session with its state and last message.");
+                if ui.button("Preview menu-bar keypad").clicked() { preview = true; }
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch AgentPad at login").changed() {
                     if integrations::set_launch_at_login(login).is_ok() {
@@ -1202,6 +1323,13 @@ impl App {
             c.revision += 1;
             self.settings_rev += 1;
         }
+        drop(c);
+        if preview {
+            if let Some(rect) = self.tray.as_ref().and_then(|tray| tray.rect()) {
+                self.open_popup(rect);
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn about_page(&mut self, ui: &mut Ui) {
@@ -1224,9 +1352,19 @@ impl eframe::App for App {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.run_actions(ctx);
+        let clicks = self.tray_clicks.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+        for rect in clicks {
+            if self.popup_open {
+                self.popup_open = false;
+                mac::log("tray keypad closed");
+            } else {
+                self.open_popup(rect);
+            }
+        }
+        if self.popup_open { self.popup(ctx); } else { self.cancel_popup_inputs(); }
         if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            mac::hide_app();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         if let (Some(tray), Ok(c)) = (&mut self.tray, self.core.lock()) {
             tray.update(&c);

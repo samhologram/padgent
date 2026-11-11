@@ -10,10 +10,12 @@ and on screen as a Liquid Glass keypad. Written in Rust.
 - **Keypad:** eight session keys and a hub key that counts what's waiting; previous/next page
   buttons; hold a key 0.6 s for its focus view; hold both page buttons 1.5 s to hand the keypad
   back to Logi Options+. Each key's light follows the session's state (thinking, tool, writing,
-  waiting for approval or an answer, done, error, compacting).
+  waiting for approval or an answer, done, error, compacting). Sessions idle for more than
+  30 minutes move to page 2 or later, leaving page 1 for active and recent sessions.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
   session runs in (Terminal, iTerm2).
-- **Menu bar:** waiting dot and count, and a live preview of every session with its last message.
+- **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
+  previews, settings, hand-over and quit. The icon shows a waiting dot and count.
 - **Settings:** colours, motion, key order, recent sessions, hand-over, launch at login, model
   roles for Claude Code (Haiku for the swarm, Sonnet for code, Opus for orchestration).
 

@@ -15,7 +15,7 @@ hidapi = "2.6.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 libc = "0.2.191"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSScreen", "NSEvent", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSGeometry", "NSURL"] }
 raw-window-handle = "0.6"
 rfd = "0.18.0"
