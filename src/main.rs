@@ -385,7 +385,6 @@ impl App {
             };
             let t = model::now();
             let dev = Rect::from_min_size(full.min + vec2(12.0, 12.0), vec2(376.0, 414.0));
-            paint::paint_device(&p, dev);
             let grid_min = dev.min + vec2(16.0, 16.0);
             let scale = 344.0 / 434.0;
             let size = model::KEY_SIZE as f32 * scale;
