@@ -31,6 +31,9 @@ const FEAT_BRIGHTNESS: u16 = 0x8040;
 const FEAT_KEEP_ALIVE: u16 = 0x0008;
 const KEEP_ALIVE_PARAMS: [u8; 2] = [0x0B, 0xB8];
 const PACKET: usize = 4095;
+// Limit physical display traffic independently of the window animation rate.
+const DISPLAY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_INPUT_REPORTS_PER_POLL: usize = 64;
 const MAX_SINGLE_JPEG: usize = 4075;
 // KeypadDevice.Timing from KeypadDeviceFactory.makeWithDiagnostics (0x1004ac734).
 const KEEP_ALIVE_INTERVAL_S: f64 = 1.0;
@@ -437,8 +440,9 @@ struct Device {
     saved_brightness: Option<[u8; 2]>,
     pressed: Vec<usize>,
     pages: [bool; 2],
-    sent: Vec<Option<KeyFace>>,
+    sent: Vec<Option<Vec<u8>>>,
     last_frame: Instant,
+    last_display_update: Instant,
 }
 
 fn hidpp(dev: &hidapi::HidDevice, feature: u8, function: u8, params: &[u8]) -> Option<[u8; 20]> {
@@ -454,7 +458,7 @@ fn hidpp_timeout(dev: &hidapi::HidDevice, feature: u8, function: u8, params: &[u
     for (i, b) in params.iter().take(16).enumerate() {
         req[4 + i] = *b;
     }
-    dev.write(&req).ok()?;
+    write_report(dev, &req).ok()?;
     let deadline = Instant::now() + Duration::from_secs_f64(timeout);
     let mut buf = [0u8; 64];
     while Instant::now() < deadline {
@@ -530,6 +534,7 @@ fn take_over(api: &hidapi::HidApi, path: &std::ffi::CStr, brightness: f32) -> Re
         pages: [false; 2],
         sent: vec![None; KEY_COUNT],
         last_frame: Instant::now() - Duration::from_secs(5),
+        last_display_update: Instant::now() - DISPLAY_FRAME_INTERVAL,
     })
 }
 
@@ -549,7 +554,8 @@ fn release(d: Device) {
 fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
     let mut buf = [0u8; 64];
     let mut any = false;
-    while let Ok(n) = d.dev.read_timeout(&mut buf, 0) {
+    for _ in 0..MAX_INPUT_REPORTS_PER_POLL {
+        let Ok(n) = d.dev.read_timeout(&mut buf, 0) else { break };
         if n < 4 || buf[1] != 0xFF {
             if n == 0 { break; } else { continue; }
         }
@@ -596,44 +602,64 @@ fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
     any
 }
 
-/// Sends the keys that changed or animate; between key images it reads the keypad so a press
-/// is seen at once even while a full frame is going out. Returns whether a key was pressed.
+fn checked_write_result(result: Result<usize, String>, expected: usize) -> Result<(), String> {
+    let written = result?;
+    if written != expected {
+        return Err(format!("short HID write ({written} of {expected} bytes)"));
+    }
+    Ok(())
+}
+
+fn write_report(dev: &hidapi::HidDevice, report: &[u8]) -> Result<(), String> {
+    checked_write_result(dev.write(report).map_err(|e| e.to_string()), report.len())
+}
+
+fn service_keep_alive(d: &mut Device) -> Result<(), String> {
+    if d.keep_alive != 0 && d.last_keep_alive.elapsed().as_secs_f64() >= KEEP_ALIVE_INTERVAL_S {
+        let mut r = [0u8; 20];
+        r[0] = 0x11;
+        r[1] = 0xFF;
+        r[2] = d.keep_alive;
+        r[3] = (1 << 4) | 0x0E;
+        r[4..6].copy_from_slice(&KEEP_ALIVE_PARAMS);
+        write_report(&d.dev, &r).map_err(|e| format!("Keypad keep-alive failed: {e}"))?;
+        d.last_keep_alive = Instant::now();
+    }
+    Ok(())
+}
+
+fn image_needs_send(previous: Option<&[u8]>, current: &[u8], refresh: bool) -> bool {
+    refresh || previous != Some(current)
+}
+
+/// Send only changed rendered images. Poll input and service the heartbeat between keys.
 fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec, waiting: Rgb, brightness: f32) -> Result<bool, String> {
     let mut pressed = false;
-    // KEEP_ALIVE every second; without it the panel reverts to the Logi image after 3 s
-    // without frames, so then the hub key is re-sent instead.
-    if d.keep_alive != 0 && d.last_keep_alive.elapsed().as_secs_f64() >= KEEP_ALIVE_INTERVAL_S {
-        d.last_keep_alive = Instant::now();
-        let _ = d.dev.write(&{
-            let mut r = [0u8; 20];
-            r[0] = 0x11;
-            r[1] = 0xFF;
-            r[2] = d.keep_alive;
-            r[3] = (1 << 4) | 0x0E;
-            r[4] = KEEP_ALIVE_PARAMS[0];
-            r[5] = KEEP_ALIVE_PARAMS[1];
-            r
-        });
+    service_keep_alive(d)?;
+    if d.last_display_update.elapsed() < DISPLAY_FRAME_INTERVAL {
+        return Ok(false);
     }
-    let keep_alive = d.keep_alive == 0 && d.last_frame.elapsed().as_secs_f64() > KEEP_ALIVE_INTERVAL_S;
+    let refresh = d.keep_alive == 0 && d.last_frame.elapsed().as_secs_f64() > KEEP_ALIVE_INTERVAL_S;
     for (i, f) in faces.iter().enumerate() {
-        let animated = matches!(f, KeyFace::Session(s) if s.activity.animated()) || matches!(f, KeyFace::Hub(h) if h.waiting > 0);
-        let changed = d.sent[i].as_ref() != Some(f);
-        if !(changed || animated || (keep_alive && i == crate::model::HUB_KEY)) {
-            continue;
-        }
+        service_keep_alive(d)?;
         let pm = render_key(f, t, font, waiting, brightness);
         let jpg = jpeg(&pm);
-        for p in packets(&jpg, i, false) {
-            d.dev.write(&p).map_err(|e| format!("Keypad stopped accepting images: {e}"))?;
+        if jpg.is_empty() {
+            return Err(format!("Could not encode keypad image for key {i}"));
         }
-        d.sent[i] = Some(f.clone());
-        d.last_frame = Instant::now();
+        if image_needs_send(d.sent[i].as_deref(), &jpg, refresh && i == crate::model::HUB_KEY) {
+            for p in packets(&jpg, i, false) {
+                write_report(&d.dev, &p).map_err(|e| format!("Keypad stopped accepting images: {e}"))?;
+            }
+            d.sent[i] = Some(jpg);
+            d.last_frame = Instant::now();
+        }
         if poll_input(d, core) {
             run_key_actions(core);
             pressed = true;
         }
     }
+    d.last_display_update = Instant::now();
     Ok(pressed)
 }
 
@@ -682,6 +708,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
             let set = |c: &Arc<Mutex<Core>>, h: Hardware| {
                 if let Ok(mut c) = c.lock() {
                     if c.hardware != h {
+                        crate::mac::log(&format!("keypad hardware: {:?} -> {:?}", c.hardware, h));
                         c.hardware = h;
                         c.revision += 1;
                     }
@@ -839,6 +866,28 @@ mod tests {
     fn retry_schedule_doubles_to_sixty() {
         let v: Vec<f64> = (1..=MAX_AUTO_RETRIES).map(retry_delay).collect();
         assert_eq!(v, vec![2.0, 4.0, 8.0, 16.0, 32.0, 60.0]);
+    }
+
+    #[test]
+    fn checked_write_accepts_only_a_complete_report() {
+        assert_eq!(checked_write_result(Ok(20), 20), Ok(()));
+        let err = checked_write_result(Ok(19), 20).unwrap_err();
+        assert!(err.contains("19 of 20"));
+        assert_eq!(checked_write_result(Err("disconnected".into()), 20), Err("disconnected".into()));
+    }
+
+    #[test]
+    fn image_send_is_skipped_for_identical_bytes_unless_refresh_is_due() {
+        let jpg = [0xFF, 0xD8, 0x01, 0x02];
+        assert!(image_needs_send(None, &jpg, false));
+        assert!(!image_needs_send(Some(&jpg), &jpg, false));
+        assert!(image_needs_send(Some(&jpg), &[0xFF, 0xD8, 0x03], false));
+        assert!(image_needs_send(Some(&jpg), &jpg, true));
+    }
+
+    #[test]
+    fn physical_frame_cap_is_ten_hertz() {
+        assert_eq!(DISPLAY_FRAME_INTERVAL, Duration::from_millis(100));
     }
 
     #[test]
