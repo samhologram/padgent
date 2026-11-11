@@ -16,7 +16,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   desktop apps. Add any other agent by importing an `.orbagent.json` file, or follow any desktop
   app's conversations through macOS Accessibility (no logins in Padgent).
 - **Keypad:** eight session keys and a hub key that counts what's waiting; previous/next page
-  buttons; hold a key 0.6 s to move its conversation to the end until work resumes; hold both page buttons 1.5 s to hand the keypad
+  buttons; hold a key 0.6 s to archive its conversation until work resumes; hold both page buttons 1.5 s to hand the keypad
   back to Logi Options+. Each key's light follows the session's state (thinking, tool, writing,
   waiting for approval or an answer, done, error, compacting). Sessions idle for more than
   30 minutes move to page 2 or later, leaving page 1 for active and recent sessions.

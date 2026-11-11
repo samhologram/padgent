@@ -18,7 +18,7 @@ pub const HUB_KEY: usize = 8;
 pub const SESSION_KEYS_PER_PAGE: usize = 8;
 /// Idle sessions older than this stay available, but start no earlier than page two.
 pub const IDLE_SECOND_PAGE_AFTER_S: f64 = 30.0 * 60.0;
-/// Hold a session key to move it to the end until work resumes.
+/// Hold a session key to hide it until work resumes.
 pub const ARCHIVE_HOLD_S: f64 = 0.6;
 pub const HAND_BACK_HOLD_S: f64 = 1.5;
 // Session timings (SessionTracker.Environment.live 0x10075703c → SessionTimings, applied by
@@ -710,7 +710,7 @@ pub struct Session {
     pub pid: i32,
     /// Replies not yet read in the agent's own app (Codex read receipts).
     pub unread: u32,
-    /// Placed after normal sessions until a new turn or resumed work.
+    /// Locally hidden until a new turn or resumed work.
     pub archived: bool,
     /// Text waiting for the current one's 1.5 s dwell to pass.
     pub pending_text: Option<String>,
@@ -1159,7 +1159,7 @@ impl Core {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == key) {
                         s.archived = true;
                         self.touch();
-                        self.notify("Moved to the end until the conversation resumes work.");
+                        self.notify("Archived until the conversation resumes work.");
                     }
                 }
             }
@@ -1212,18 +1212,10 @@ impl Core {
             s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
         });
         let mut slots: Vec<Option<&Session>> = recent.into_iter().map(Some).collect();
-        // Archived sessions remain reachable after all normal sessions, including those
-        // outside the recency window. Never fill the first page's reserved holes with them.
-        let mut archived: Vec<&Session> = self.order.iter()
-            .filter_map(|key| self.sessions.iter().find(|s| &s.key() == key))
-            .filter(|s| s.archived && self.agent_enabled(&s.agent))
-            .collect();
-        archived.extend(self.sessions.iter().filter(|s| s.archived && self.agent_enabled(&s.agent) && !self.order.contains(&s.key())));
-        if (!old_idle.is_empty() || !archived.is_empty()) && slots.len() < SESSION_KEYS_PER_PAGE {
+        if !old_idle.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE {
             slots.resize(SESSION_KEYS_PER_PAGE, None);
         }
         slots.extend(old_idle.into_iter().map(Some));
-        slots.extend(archived.into_iter().map(Some));
         slots
     }
 
@@ -1454,7 +1446,7 @@ impl Core {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == *key) {
                     s.archived = true;
                     self.touch();
-                    self.notify("Moved to the end until the conversation resumes work.");
+                    self.notify("Archived until the conversation resumes work.");
                 }
             }
         }
@@ -1750,6 +1742,7 @@ mod tests {
         // Reordering moves the waiting session into the first position before key-up.
         let first = core.sessions.iter_mut().find(|s| s.id == "first").unwrap();
         first.activity = Activity::Idle;
+        first.archived = true;
         let second = core.sessions.iter_mut().find(|s| s.id == "second").unwrap();
         second.activity = Activity::WaitingQuestion;
         core.resort();
@@ -1773,6 +1766,7 @@ mod tests {
         assert_eq!(core.sessions[0].title, "Renamed");
         assert_eq!(core.sessions[0].unread, 3);
         assert!(core.visible().is_empty());
+        assert!(core.keypad_slots_at(now()).iter().all(|slot| slot.is_none()));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
@@ -1811,7 +1805,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_follow_old_idle_tiles_and_return_to_normal_order_on_resume() {
+    fn archived_sessions_disappear_from_all_pages_and_return_to_normal_order_on_resume() {
         let mut settings = Settings::default();
         settings.recency_minutes = 240;
         let mut core = Core::new(settings);
@@ -1827,14 +1821,13 @@ mod tests {
         assert_eq!(slots[0].unwrap().id, "active");
         assert!(slots[1..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none), "archives must not consume reserved page-one holes");
         assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "archived-waiting");
+        assert!(slots.iter().flatten().all(|session| session.id != "archived-waiting"), "archived sessions must be absent from every keypad page");
+        assert_eq!(core.pages(), 2);
         assert_eq!(core.waiting_count(), 0, "archived waiting sessions are absent from normal counts");
 
         core.page = 1;
-        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
-        core.key_down(1);
-        core.key_up(1);
-        assert!(matches!(core.actions.as_slice(), [Action::Open { agent, session }] if agent == "codex" && session == "archived-waiting"));
+        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:old-idle"));
+        assert!(matches!(&core.faces()[1], KeyFace::Empty));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
