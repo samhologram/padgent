@@ -1,0 +1,26 @@
+[package]
+name = "agentpad"
+version = "0.1.0"
+edition = "2024"
+description = "Native macOS menu-bar app showing AI agent sessions on the Logitech MX Creative Keypad"
+license = "MIT"
+repository = "https://github.com/samhologram/agentpad"
+
+[dependencies]
+ab_glyph = "0.2"
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+epaint_default_fonts = "0.37"
+hidapi = "2.6.7"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSGeometry"] }
+raw-window-handle = "0.6"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+tray-icon = "0.26.1"
+window-vibrancy = "0.8.1"
+winit = { version = "0.30", default-features = false }

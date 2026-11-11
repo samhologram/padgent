@@ -1,0 +1,517 @@
+{
+ "version": 1,
+ "values": [
+  {
+   "name": "key count",
+   "group": "keypad",
+   "value": 9,
+   "source": "function 0x10042b258"
+  },
+  {
+   "name": "columns",
+   "group": "keypad",
+   "value": 3,
+   "source": "function 0x10042b26c"
+  },
+  {
+   "name": "rows",
+   "group": "keypad",
+   "value": 3,
+   "source": "function 0x10042b280"
+  },
+  {
+   "name": "key size",
+   "group": "keypad",
+   "value": 118,
+   "unit": "px",
+   "source": "function 0x10042b294"
+  },
+  {
+   "name": "grid origin x",
+   "group": "keypad",
+   "value": 23,
+   "unit": "px",
+   "source": "function 0x10042b2a8"
+  },
+  {
+   "name": "grid origin y",
+   "group": "keypad",
+   "value": 6,
+   "unit": "px",
+   "source": "function 0x10042b2bc"
+  },
+  {
+   "name": "key pitch",
+   "group": "keypad",
+   "value": 158,
+   "unit": "px",
+   "source": "function 0x10042b2d0"
+  },
+  {
+   "name": "hub key index",
+   "group": "keypad",
+   "value": 8,
+   "source": "function 0x10042b320"
+  },
+  {
+   "name": "session keys per page",
+   "group": "keypad",
+   "value": 8,
+   "source": "function 0x10042b334"
+  },
+  {
+   "name": "max single packet jpeg",
+   "group": "keypad",
+   "value": 4075,
+   "unit": "bytes",
+   "source": "function 0x10042b30c"
+  },
+  {
+   "name": "hook port",
+   "group": "settings",
+   "value": 47800,
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "take over on launch",
+   "group": "settings",
+   "value": true,
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "launch at login",
+   "group": "settings",
+   "value": false,
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "hide on click elsewhere",
+   "group": "settings",
+   "value": true,
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "target fps",
+   "group": "settings",
+   "value": 30,
+   "unit": "fps",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "dimmed fps",
+   "group": "settings",
+   "value": 10,
+   "unit": "fps",
+   "source": "string 'redraws at 10 fps'"
+  },
+  {
+   "name": "brightness",
+   "group": "settings",
+   "value": 0.8,
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "text speed",
+   "group": "settings",
+   "value": 18,
+   "unit": "chars/s",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "idle dim",
+   "group": "settings",
+   "value": 10,
+   "unit": "min",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "recency",
+   "group": "settings",
+   "value": 120,
+   "unit": "min",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "reorder on",
+   "group": "settings",
+   "value": "turns",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "locked mode",
+   "group": "settings",
+   "value": "all",
+   "source": "function 0x100474970"
+  },
+  {
+   "name": "colour keys by",
+   "group": "settings",
+   "value": "agent",
+   "source": "function 0x100476f44"
+  },
+  {
+   "name": "keypad theme",
+   "group": "settings",
+   "value": "frosted",
+   "source": "function 0x1004749dc"
+  },
+  {
+   "name": "codex hue",
+   "group": "colours",
+   "value": 270,
+   "unit": "deg",
+   "source": "function 0x100437c28"
+  },
+  {
+   "name": "zcode hue",
+   "group": "colours",
+   "value": 165,
+   "unit": "deg",
+   "source": "function 0x100437c28"
+  },
+  {
+   "name": "antigravity hue",
+   "group": "colours",
+   "value": 225,
+   "unit": "deg",
+   "source": "function 0x100437c28"
+  },
+  {
+   "name": "kimi code hue",
+   "group": "colours",
+   "value": 324,
+   "unit": "deg",
+   "source": "function 0x100437c28"
+  },
+  {
+   "name": "claude code hue",
+   "group": "colours",
+   "value": 79.85,
+   "unit": "deg",
+   "source": "function 0x100437c28 / reference ramp 0x100b934b0"
+  },
+  {
+   "name": "attention band low",
+   "group": "colours",
+   "value": 18.9,
+   "unit": "deg",
+   "source": "function 0x100430688"
+  },
+  {
+   "name": "attention band high",
+   "group": "colours",
+   "value": 55,
+   "unit": "deg",
+   "source": "function 0x100430688"
+  },
+  {
+   "name": "calm arc low",
+   "group": "colours",
+   "value": 80,
+   "unit": "deg",
+   "source": "function 0x1004306b4"
+  },
+  {
+   "name": "calm arc high",
+   "group": "colours",
+   "value": 280,
+   "unit": "deg",
+   "source": "function 0x1004306b4"
+  },
+  {
+   "name": "state distance",
+   "group": "colours",
+   "value": 10,
+   "unit": "deltaE",
+   "source": "function 0x1004306d8"
+  },
+  {
+   "name": "focus hold",
+   "group": "controls",
+   "value": 0.6,
+   "unit": "s",
+   "source": "string 'Hold a session key for 0.6 s'"
+  },
+  {
+   "name": "hand back hold",
+   "group": "controls",
+   "value": 1.5,
+   "unit": "s",
+   "source": "string 'hold both page buttons for 1.5 s'"
+  },
+  {
+   "name": "previous page control id",
+   "group": "controls",
+   "value": "0x01A1",
+   "source": "function 0x1004aff60"
+  },
+  {
+   "name": "next page control id",
+   "group": "controls",
+   "value": "0x01A2",
+   "source": "function 0x1004aff60"
+  },
+  {
+   "name": "vendor usage page",
+   "group": "hardware",
+   "value": "0xFF43",
+   "source": "function 0x10049cf34"
+  },
+  {
+   "name": "vendor usage",
+   "group": "hardware",
+   "value": "0x1A10",
+   "source": "function 0x10049cf34"
+  },
+  {
+   "name": "image report size",
+   "group": "hardware",
+   "value": 4095,
+   "unit": "bytes",
+   "source": "function 0x1004af5c0"
+  },
+  {
+   "name": "panel revert without frames",
+   "group": "hardware",
+   "value": 3,
+   "unit": "s",
+   "source": "string 'KEEP_ALIVE missing'"
+  },
+  {
+   "name": "waiting colour hue",
+   "group": "colours",
+   "value": 40.8,
+   "unit": "deg",
+   "source": "reference ramp 0x100b93570 (OrbPalette.reference 0x100431480)"
+  },
+  {
+   "name": "takeover retries",
+   "group": "hardware",
+   "value": 6,
+   "source": "function 0x1004ac734 (maxAutoRetries)"
+  },
+  {
+   "name": "retry base delay",
+   "group": "hardware",
+   "value": 2.0,
+   "unit": "s",
+   "source": "function 0x1004ac734 / 0x1004a63dc"
+  },
+  {
+   "name": "retry max delay",
+   "group": "hardware",
+   "value": 60.0,
+   "unit": "s",
+   "source": "function 0x1004ac734 / 0x1004a63dc"
+  },
+  {
+   "name": "keep alive interval",
+   "group": "hardware",
+   "value": 1.0,
+   "unit": "s",
+   "source": "function 0x1004ac734 / 0x1004a50f4"
+  },
+  {
+   "name": "keep alive feature",
+   "group": "hardware",
+   "value": "0x0008",
+   "source": "function 0x1004a4ca4"
+  },
+  {
+   "name": "keep alive timeout param",
+   "group": "hardware",
+   "value": 3000,
+   "unit": "ms",
+   "source": "function 0x1004a4f20 (array 0x100b970d8)"
+  },
+  {
+   "name": "request timeout",
+   "group": "hardware",
+   "value": 1.0,
+   "unit": "s",
+   "source": "function 0x1004ac734"
+  },
+  {
+   "name": "release request timeout",
+   "group": "hardware",
+   "value": 0.2,
+   "unit": "s",
+   "source": "function 0x1004ac734"
+  },
+  {
+   "name": "connection quiet",
+   "group": "hardware",
+   "value": 2.0,
+   "unit": "s",
+   "source": "function 0x1004ac734"
+  },
+  {
+   "name": "connection settle",
+   "group": "hardware",
+   "value": 10.0,
+   "unit": "s",
+   "source": "function 0x1004ac734"
+  },
+  {
+   "name": "image recovery delays",
+   "group": "hardware",
+   "value": "2, 5, 15, 30 s",
+   "source": "function 0x1004a63dc (array 0x100b97108)"
+  },
+  {
+   "name": "streaming window",
+   "group": "sessions",
+   "value": 1.5,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "done fades to idle",
+   "group": "sessions",
+   "value": 180.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "starting window",
+   "group": "sessions",
+   "value": 60.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "stale busy after",
+   "group": "sessions",
+   "value": 900.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "stale idle after",
+   "group": "sessions",
+   "value": 7200.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "remove after",
+   "group": "sessions",
+   "value": 43200.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "subagent forget after",
+   "group": "sessions",
+   "value": 1800.0,
+   "unit": "s",
+   "source": "function 0x10075703c"
+  },
+  {
+   "name": "subagent done decay",
+   "group": "sessions",
+   "value": 30.0,
+   "unit": "s",
+   "source": "function 0x1004644d4"
+  },
+  {
+   "name": "mark contrast",
+   "group": "colours",
+   "value": 4.5,
+   "unit": "ratio",
+   "source": "function 0x100438d50"
+  },
+  {
+   "name": "drive physical keypad on launch",
+   "group": "settings",
+   "value": true,
+   "source": "function 0x100476f44 (autoTakeOverOnLaunch)"
+  },
+  {
+   "name": "key travel time",
+   "group": "keypad",
+   "value": 0.8,
+   "unit": "s",
+   "source": "function 0x1005058e4"
+  },
+  {
+   "name": "key travel easing",
+   "group": "keypad",
+   "value": "ease-in-out cubic",
+   "source": "function 0x1005058e4"
+  },
+  {
+   "name": "reference hue",
+   "group": "colours",
+   "value": 79.85,
+   "unit": "deg",
+   "source": "function 0x100431480 (ramp #d9a441)"
+  },
+  {
+   "name": "error hue",
+   "group": "colours",
+   "value": 28.5,
+   "unit": "deg",
+   "source": "reference ramp 0x100b93630"
+  },
+  {
+   "name": "accessibility reset command",
+   "group": "permissions",
+   "value": "tccutil reset Accessibility",
+   "source": "function 0x100003784"
+  },
+  {
+   "name": "accessibility resets per signature",
+   "group": "permissions",
+   "value": 1,
+   "source": "function 0x1000b9350"
+  },
+  {
+   "name": "light core height",
+   "group": "keypad",
+   "value": 0.84,
+   "unit": "key",
+   "source": "function 0x100531ab4"
+  },
+  {
+   "name": "thinking pulse period",
+   "group": "keypad",
+   "value": 3.2,
+   "unit": "s",
+   "source": "function 0x10052f400 (thinking case)"
+  },
+  {
+   "name": "approval beacon period",
+   "group": "keypad",
+   "value": 1.6,
+   "unit": "s",
+   "source": "function 0x10052f400 (permission case)"
+  },
+  {
+   "name": "compacting ring period",
+   "group": "keypad",
+   "value": 2.4,
+   "unit": "s",
+   "source": "function 0x10052f400 (compacting case)"
+  },
+  {
+   "name": "offline ring radius",
+   "group": "keypad",
+   "value": 0.13,
+   "unit": "key",
+   "source": "function 0x10052f400 (offline case)"
+  },
+  {
+   "name": "streaming core intensity",
+   "group": "keypad",
+   "value": 0.9,
+   "source": "function 0x10052f400 (streaming case)"
+  },
+  {
+   "name": "error floor",
+   "group": "keypad",
+   "value": 0.18,
+   "source": "function 0x10052f400 (error case)"
+  }
+ ]
+}
