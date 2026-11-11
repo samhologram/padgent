@@ -198,7 +198,7 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
         }
         KeyFace::Quota(q) => {
             let label = format!("{} · {}", q.provider, q.window);
-            text_block(p, r.min + vec2(k * 0.08, k * 0.08), k * 0.84, &label, k * 0.105, white(0.75), 1, true);
+            text_block(p, pos2(r.center().x, r.top() + k * 0.08), k * 0.84, &label, k * 0.105, white(0.75), 1, true);
             let remaining = crate::quota::displayed_remaining(q, crate::model::now() as i64);
             let hue = if q.provider.eq_ignore_ascii_case("Claude") { 95.0 } else { 270.0 };
             let accent = c32(crate::colour::oklch(0.76, 0.15, hue));
@@ -216,7 +216,7 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
             } else {
                 p.text(r.min + vec2(k * 0.5, k * 0.36), Align2::CENTER_CENTER, "Unknown", FontId::proportional(k * 0.17), white(0.8));
             }
-            text_block(p, r.min + vec2(k * 0.07, k * 0.84), k * 0.86, &crate::quota::detail(q), k * 0.085, white(0.6), 1, true);
+            text_block(p, pos2(r.center().x, r.top() + k * 0.84), k * 0.86, &crate::quota::detail(q), k * 0.085, white(0.6), 1, true);
         }
         KeyFace::QuotaHub => { p.text(r.center(), Align2::CENTER_CENTER, "Quotas", FontId::proportional(k * 0.16), white(0.9)); }
         KeyFace::Session(f) => paint_session(p, r, f, cx),
