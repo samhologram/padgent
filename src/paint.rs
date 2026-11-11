@@ -169,18 +169,21 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
 
     let tint = match face {
         KeyFace::Session(f) => c32(f.glow),
-        KeyFace::FocusText { colour, .. } => c32(*colour),
         _ => white(0.5),
     };
     let strength = match face {
         KeyFace::Released | KeyFace::Empty => 0.55,
         _ => 1.0,
     };
-    if matches!(face, KeyFace::Session(_)) {
+    if let KeyFace::Session(f) = face {
         // Dark base under the light; the glass veil is drawn over the light in paint_session.
         let sh = Shadow { offset: [0, 10], blur: 28, spread: 0, color: Color32::from_black_alpha(70) };
         p.add(sh.as_shape(r, CornerRadius::same(rad.min(255.0) as u8)));
-        gradient_rounded(p, r, rad, Color32::from_rgba_unmultiplied(26, 27, 36, 235), Color32::from_rgba_unmultiplied(12, 13, 18, 245));
+        if f.unread > 0 {
+            p.rect_filled(r, CornerRadius::same(rad.min(255.0) as u8), Color32::from_rgb(98, 64, 8));
+        } else {
+            gradient_rounded(p, r, rad, Color32::from_rgba_unmultiplied(26, 27, 36, 235), Color32::from_rgba_unmultiplied(12, 13, 18, 245));
+        }
     } else {
         glass(p, r, rad, tint, strength, !matches!(face, KeyFace::Released));
     }
@@ -193,22 +196,34 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
         KeyFace::Empty => {
             p.circle_filled(r.center(), k * 0.025, white(0.12));
         }
-        KeyFace::Back => {
-            p.text(r.center(), Align2::CENTER_CENTER, "‹  Back", FontId::proportional(k * 0.14), white(0.85));
+        KeyFace::Quota(q) => {
+            let label = format!("{} · {}", q.provider, q.window);
+            text_block(p, r.min + vec2(k * 0.08, k * 0.08), k * 0.84, &label, k * 0.105, white(0.75), 1, true);
+            let remaining = crate::quota::displayed_remaining(q, crate::model::now() as i64);
+            let hue = if q.provider.eq_ignore_ascii_case("Claude") { 95.0 } else { 270.0 };
+            let accent = c32(crate::colour::oklch(0.76, 0.15, hue));
+            let bar = Rect::from_min_max(r.min + vec2(k * 0.13, k * 0.55), r.min + vec2(k * 0.87, k * 0.62));
+            p.rect_filled(bar, CornerRadius::same((k * 0.035).max(1.0) as u8), white(0.16));
+            if let Some(value) = remaining {
+                let percent = value.clamp(0.0, 100.0).round() as u32;
+                p.text(r.min + vec2(k * 0.5, k * 0.36), Align2::CENTER_CENTER, format!("{percent}% Free"), FontId::proportional(k * 0.17), white(0.96));
+                if value > 0.0 {
+                    let end = bar.left() + bar.width() * (value.clamp(0.0, 100.0) as f32 / 100.0);
+                    let filled = Rect::from_min_max(bar.min, pos2(end, bar.bottom()));
+                    p.rect_filled(filled, CornerRadius::same((k * 0.035).max(1.0) as u8), accent);
+                }
+                p.text(r.min + vec2(k * 0.5, k * 0.72), Align2::CENTER_CENTER, format!("{}% Used", 100 - percent), FontId::proportional(k * 0.105), white(0.7));
+            } else {
+                p.text(r.min + vec2(k * 0.5, k * 0.36), Align2::CENTER_CENTER, "Unknown", FontId::proportional(k * 0.17), white(0.8));
+            }
+            text_block(p, r.min + vec2(k * 0.07, k * 0.84), k * 0.86, &crate::quota::detail(q), k * 0.085, white(0.6), 1, true);
         }
-        KeyFace::FocusText { text, colour } => {
-            p.rect_filled(
-                Rect::from_min_size(r.min + vec2(k * 0.08, k * 0.14), vec2(3.0, k * 0.72)),
-                CornerRadius::same(2),
-                with_alpha(c32(*colour), 0.8),
-            );
-            text_block(p, r.min + vec2(k * 0.15, k * 0.12), k * 0.76, text, k * 0.105, white(0.9), 5, false);
-        }
+        KeyFace::QuotaHub => { p.text(r.center(), Align2::CENTER_CENTER, "Quotas", FontId::proportional(k * 0.16), white(0.9)); }
         KeyFace::Session(f) => paint_session(p, r, f, cx),
         KeyFace::Hub(h) => paint_hub(p, r, h, cx),
     }
 
-    // Long-press progress towards the focus view.
+    // Long-press progress towards archiving.
     if cx.hold > 0.02 {
         let c = r.center();
         arc(p, c, k * 0.46, -PI / 2.0, TAU * cx.hold, Stroke::new(2.5, white(0.75)));
@@ -287,12 +302,6 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     paint_field(p, r, &fp, orb, glowc, phase);
     gradient_rounded(p, r, k * 0.2, white(0.10), white(0.025));
     glass(p, r, k * 0.2, glowc, 0.55, false);
-    if f.unread > 0 {
-        let amber = Color32::from_rgb(255, 185, 35);
-        p.rect_filled(r, CornerRadius::same((k * 0.2) as u8), with_alpha(amber, 0.22));
-        p.rect_stroke(r, CornerRadius::same((k * 0.2) as u8), Stroke::new((k * 0.035).max(3.0), amber), StrokeKind::Inside);
-    }
-
     let c = pos2(r.left() + fp.cx * k, r.bottom() - (fp.cy - 0.1) * k);
     let core = (fp.cs * k).max(k * 0.08);
     let ink = with_alpha(c32(crate::colour::ink_on(f.orb)), 0.85);
@@ -375,9 +384,7 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
         p.text(pos2(r.right() - k * 0.08, sy), Align2::RIGHT_TOP, corner, FontId::proportional(k * 0.085), white(0.5));
     }
     let ly = sy + k * 0.125;
-    if f.focus_header {
-        text_block(p, pos2(x, ly), w, f.activity.label(), k * 0.088, white(0.6), 2, false);
-    } else if matches!(g, Group::Working | Group::Waiting) {
+    if matches!(g, Group::Working | Group::Waiting) {
         let live = if f.text.is_empty() {
             if g == Group::Working { "…".to_string() } else { f.activity.label().to_string() }
         } else {

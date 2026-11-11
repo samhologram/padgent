@@ -5,7 +5,7 @@
 
 use crate::colour::Rgb;
 use crate::model::{
-    Activity, Core, Group, Hardware, HubFace, KeyFace, SessionFace, KEY_COUNT, KEY_SIZE, ORIGIN_X, ORIGIN_Y, PITCH,
+    Activity, Core, Group, Hardware, HubFace, KeyFace, KeyPressTarget, SessionFace, KEY_COUNT, KEY_SIZE, ORIGIN_X, ORIGIN_Y, PITCH,
 };
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use std::sync::{Arc, Mutex};
@@ -31,8 +31,6 @@ const FEAT_BRIGHTNESS: u16 = 0x8040;
 const FEAT_KEEP_ALIVE: u16 = 0x0008;
 const KEEP_ALIVE_PARAMS: [u8; 2] = [0x0B, 0xB8];
 const PACKET: usize = 4095;
-// Limit physical display traffic independently of the window animation rate.
-const DISPLAY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INPUT_REPORTS_PER_POLL: usize = 64;
 const MAX_SINGLE_JPEG: usize = 4075;
 // KeypadDevice.Timing from KeypadDeviceFactory.makeWithDiagnostics (0x1004ac734).
@@ -46,6 +44,7 @@ const RETRY_MAX_DELAY_S: f64 = 60.0;
 const MAX_AUTO_RETRIES: usize = 6;
 /// Silent image-recovery retries (static array at 0x100b97108).
 const IMAGE_RECOVERY_DELAYS_S: [f64; 4] = [2.0, 5.0, 15.0, 30.0];
+const RECOVERY_STABLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// scheduleRetry closure (0x1004a63dc): min(base · 2^(attempt-1), max).
 fn retry_delay(attempt: usize) -> f64 {
@@ -198,16 +197,32 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
     let white = Rgb(255, 255, 255);
     match face {
         KeyFace::Released | KeyFace::Empty => {}
-        KeyFace::Back => {
-            let s = "‹ Back";
-            draw_text(&mut pm, font, 20.0, (k - text_width(font, 20.0, s)) / 2.0, k / 2.0 + 7.0, s, white, 0.85);
-        }
-        KeyFace::FocusText { text, colour } => {
-            fill_circle(&mut pm, 10.0, 12.0, 3.0, color(*colour, 0.9));
-            for (i, l) in wrap(font, 13.0, text, k - 18.0, 6).iter().enumerate() {
-                draw_text(&mut pm, font, 13.0, 9.0, 24.0 + i as f32 * 16.0, l, white, 0.9);
+        KeyFace::Quota(q) => {
+            let label = fit(font, 12.0, &format!("{} · {}", q.provider, q.window), k - 16.0);
+            draw_text(&mut pm, font, 12.0, (k - text_width(font, 12.0, &label)) / 2.0, k * 0.18, &label, white, 0.75);
+            let remaining = crate::quota::displayed_remaining(q, crate::model::now() as i64);
+            let hue = if q.provider.eq_ignore_ascii_case("Claude") { 95.0 } else { 270.0 };
+            let accent = crate::colour::oklch(0.76, 0.15, hue);
+            let (left, right, y) = (k * 0.16, k * 0.84, k * 0.585);
+            stroke_poly(&mut pm, &[(left, y), (right, y)], k * 0.07, color(white, 0.16));
+            if let Some(value) = remaining {
+                let percent = value.clamp(0.0, 100.0).round() as u32;
+                let title = format!("{percent}% Free");
+                draw_text(&mut pm, font, 20.0, (k - text_width(font, 20.0, &title)) / 2.0, k * 0.43, &title, white, 0.96);
+                if value > 0.0 {
+                    let end = left + (right - left) * (value.clamp(0.0, 100.0) as f32 / 100.0);
+                    stroke_poly(&mut pm, &[(left, y), (end, y)], k * 0.07, color(accent, 1.0));
+                }
+                let used = format!("{}% Used", 100 - percent);
+                draw_text(&mut pm, font, 12.0, (k - text_width(font, 12.0, &used)) / 2.0, k * 0.76, &used, white, 0.7);
+            } else {
+                let title = "Unknown";
+                draw_text(&mut pm, font, 20.0, (k - text_width(font, 20.0, title)) / 2.0, k * 0.43, title, white, 0.8);
             }
+            let detail = fit(font, 10.0, &crate::quota::detail(q), k - 16.0);
+            draw_text(&mut pm, font, 10.0, (k - text_width(font, 10.0, &detail)) / 2.0, k * 0.93, &detail, white, 0.6);
         }
+        KeyFace::QuotaHub => { let label = "Quotas"; draw_text(&mut pm, font, 18.0, (k - text_width(font, 18.0, label)) / 2.0, 64.0, label, white, 0.9); }
         KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
         KeyFace::Hub(h) => render_hub(&mut pm, h, phase, font),
     }
@@ -217,6 +232,9 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
 fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &FontVec) {
     // Same light field as the on-screen key (field.rs).
     let k = KEY_SIZE as f32;
+    if f.unread > 0 {
+        pm.fill(Color::from_rgba8(98, 64, 8, 255));
+    }
     let g = f.activity.group();
     let age = (t - f.since).max(0.0) as f32;
     let mut fp = crate::field::params(f.activity, f.tool, phase, age, false).scaled(crate::field::ANIM_SCALE);
@@ -290,6 +308,16 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
             Activity::WaitingQuestion => draw_text(pm, font, rr, cx - rr * 0.25, cy + rr * 0.35, "?", ink, 0.9),
             _ => {}
         }
+    }
+    if f.unread > 0 {
+        let count = if f.unread > 99 { "99+".to_owned() } else { f.unread.to_string() };
+        let label = format!("UNREAD {count}");
+        if let Some(rect) = tiny_skia::Rect::from_xywh(7.0, 6.0, 58.0, 15.0) {
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(255, 185, 35, 255));
+            pm.fill_path(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, Transform::identity(), None);
+        }
+        draw_text(pm, font, 9.0, 36.0 - text_width(font, 9.0, &label) / 2.0, 17.0, &label, Rgb(35, 22, 0), 1.0);
     }
     // Badge and name under the light, then the state, then the live text,
     // unread count or last turn.
@@ -439,9 +467,13 @@ struct Device {
     pressed: Vec<usize>,
     pages: [bool; 2],
     sent: Vec<Option<Vec<u8>>>,
+    last_faces: Vec<Option<KeyFace>>,
+    displayed_targets: [KeyPressTarget; KEY_COUNT],
     displayed_view: Option<DisplayView>,
     last_frame: Instant,
-    last_display_update: Instant,
+    next_key: usize,
+    image_retry_at: [Option<Instant>; KEY_COUNT],
+    image_retry_stage: [usize; KEY_COUNT],
 }
 
 fn hidpp(dev: &hidapi::HidDevice, feature: u8, function: u8, params: &[u8]) -> Option<[u8; 20]> {
@@ -532,9 +564,13 @@ fn take_over(api: &hidapi::HidApi, path: &std::ffi::CStr, brightness: f32) -> Re
         pressed: Vec::new(),
         pages: [false; 2],
         sent: vec![None; KEY_COUNT],
+        last_faces: vec![None; KEY_COUNT],
+        displayed_targets: std::array::from_fn(|_| KeyPressTarget::Disabled),
         displayed_view: None,
         last_frame: Instant::now() - Duration::from_secs(5),
-        last_display_update: Instant::now() - DISPLAY_FRAME_INTERVAL,
+        next_key: 0,
+        image_retry_at: [None; KEY_COUNT],
+        image_retry_stage: [0; KEY_COUNT],
     })
 }
 
@@ -550,56 +586,102 @@ fn release(d: Device) {
     drop(d); // closing the exclusive handle gives the keypad back to Options+
 }
 
+/// Parse an image acknowledgement using the last output packet's part byte.
+fn image_ack(report: &[u8], expected_part: u8) -> Option<Result<(), [u8; 2]>> {
+    if report.len() < 7 || report[..4] != [0x13, 0xFF, 0x02, 0x2B] || report[4] != expected_part {
+        return None;
+    }
+    let status = [report[5], report[6]];
+    Some(if status == [0x00, 0x01] { Ok(()) } else { Err(status) })
+}
+
+/// Dispatch a single input report. Image acknowledgements are handled separately.
+fn handle_input_report(d: &mut Device, core: &Arc<Mutex<Core>>, buf: &[u8]) -> bool {
+    let n = buf.len();
+    if n < 4 || buf[1] != 0xFF {
+        return false;
+    }
+    if buf[0] == 0x13 && buf[2] == 0x02 && buf[3] == 0x00 && n >= 6 && buf[5] == 0x01 {
+        let now_pressed: Vec<usize> = buf[6..n].iter().take_while(|b| **b != 0).filter(|b| **b <= 9).map(|b| (*b - 1) as usize).collect();
+        crate::mac::log(&format!("keypad keys {now_pressed:?}"));
+        if let Ok(mut c) = core.lock() {
+            for k in &now_pressed {
+                if !d.pressed.contains(k) {
+                    c.key_down_with_target(*k, d.displayed_targets[*k].clone());
+                }
+            }
+            for k in &d.pressed {
+                if !now_pressed.contains(k) {
+                    c.key_up(*k);
+                }
+            }
+        }
+        d.pressed = now_pressed;
+        return true;
+    } else if buf[0] == 0x11 && d.reprog != 0 && buf[2] == d.reprog && buf[3] == 0x00 {
+        let mut pages = [false; 2];
+        for pair in buf[4..n.min(20)].chunks(2) {
+            if pair.len() == 2 {
+                match u16::from_be_bytes([pair[0], pair[1]]) {
+                    CID_PREV => pages[0] = true,
+                    CID_NEXT => pages[1] = true,
+                    _ => {}
+                }
+            }
+        }
+        crate::mac::log(&format!("keypad page buttons {pages:?}"));
+        if let Ok(mut c) = core.lock() {
+            for i in 0..2 {
+                if pages[i] != d.pages[i] {
+                    c.page_button(i == 1, pages[i]);
+                }
+            }
+        }
+        d.pages = pages;
+        return true;
+    }
+    false
+}
+
 /// Reads key and page-button input (InputParser.parse, 0x1004aff60).
-fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
-    let mut buf = [0u8; 64];
+fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> Result<bool, String> {
+    let mut buf = [0u8; PACKET];
     let mut any = false;
     for _ in 0..MAX_INPUT_REPORTS_PER_POLL {
-        let Ok(n) = d.dev.read_timeout(&mut buf, 0) else { break };
-        if n < 4 || buf[1] != 0xFF {
-            if n == 0 { break; } else { continue; }
-        }
-        if buf[0] == 0x13 && buf[2] == 0x02 && buf[3] == 0x00 && n >= 6 && buf[5] == 0x01 {
-            let now_pressed: Vec<usize> = buf[6..n].iter().take_while(|b| **b != 0).filter(|b| **b <= 9).map(|b| (*b - 1) as usize).collect();
-            crate::mac::log(&format!("keypad keys {now_pressed:?}"));
-            if let Ok(mut c) = core.lock() {
-                for k in &now_pressed {
-                    if !d.pressed.contains(k) {
-                        c.key_down(*k);
-                    }
-                }
-                for k in &d.pressed {
-                    if !now_pressed.contains(k) {
-                        c.key_up(*k);
-                    }
-                }
-            }
-            d.pressed = now_pressed;
-            any = true;
-        } else if buf[0] == 0x11 && d.reprog != 0 && buf[2] == d.reprog && buf[3] == 0x00 {
-            let mut pages = [false; 2];
-            for pair in buf[4..n.min(20)].chunks(2) {
-                if pair.len() == 2 {
-                    match u16::from_be_bytes([pair[0], pair[1]]) {
-                        CID_PREV => pages[0] = true,
-                        CID_NEXT => pages[1] = true,
-                        _ => {}
-                    }
-                }
-            }
-            crate::mac::log(&format!("keypad page buttons {pages:?}"));
-            if let Ok(mut c) = core.lock() {
-                for i in 0..2 {
-                    if pages[i] != d.pages[i] {
-                        c.page_button(i == 1, pages[i]);
-                    }
-                }
-            }
-            d.pages = pages;
-            any = true;
-        }
+        let n = d.dev.read_timeout(&mut buf, 0).map_err(|e| format!("Keypad input failed: {e}"))?;
+        if n == 0 { break; }
+        any |= handle_input_report(d, core, &buf[..n]);
     }
-    any
+    Ok(any)
+}
+
+/// Wait for the device to accept the last part, dispatching input while it responds.
+fn wait_image_ack(d: &mut Device, core: &Arc<Mutex<Core>>, expected_part: u8, key: usize, jpeg_len: usize, packet_count: usize) -> Result<(bool, bool), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut buf = [0u8; PACKET];
+    let mut input = false;
+    loop {
+        service_keep_alive(d)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("Keypad image acknowledgement timed out for key {key} (part {expected_part:02x})"));
+        }
+        let timeout_ms = remaining.as_millis().min(50).max(1) as i32;
+        let n = d.dev.read_timeout(&mut buf, timeout_ms).map_err(|e| format!("Keypad input failed while waiting for image acknowledgement: {e}"))?;
+        if n == 0 { continue; }
+        let report = &buf[..n];
+        if let Some(ack) = image_ack(report, expected_part) {
+            if let Err(status) = ack {
+                let prefix = report.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ");
+                let x = ORIGIN_X + (key % 3) as u32 * PITCH;
+                let y = ORIGIN_Y + (key / 3) as u32 * PITCH;
+                crate::mac::log(&format!("keypad image rejection key {key}, origin {x},{y}, size {KEY_SIZE}x{KEY_SIZE}, jpeg {jpeg_len} bytes, packets {packet_count}, status {:02x} {:02x}, ack length {n}, prefix {prefix}", status[0], status[1]));
+                return Ok((input, false));
+            }
+            return Ok((input, true));
+        }
+        input |= handle_input_report(d, core, report);
+    }
 }
 
 fn checked_write_result(result: Result<usize, String>, expected: usize) -> Result<(), String> {
@@ -634,13 +716,14 @@ fn image_needs_send(previous: Option<&[u8]>, current: &[u8], refresh: bool) -> b
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayView {
+    quota_view: bool,
+    quota_page: usize,
     page: usize,
-    focus: Option<String>,
     in_control: bool,
 }
 
 fn display_view(core: &Core) -> DisplayView {
-    DisplayView { page: core.page.min(core.pages() - 1), focus: core.focus.clone(), in_control: core.in_control }
+    DisplayView { quota_view: core.quota_view, quota_page: core.quota_page, page: core.page.min(core.pages() - 1), in_control: core.in_control }
 }
 
 // A page transition must redraw every key, including empty slots.
@@ -653,42 +736,110 @@ fn prepare_display_view(previous: &mut Option<DisplayView>, current: &DisplayVie
     true
 }
 
-/// Send only changed rendered images. Poll input and service the heartbeat between keys.
-fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, view: &DisplayView, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec) -> Result<bool, String> {
-    let mut pressed = false;
-    service_keep_alive(d)?;
-    if d.last_display_update.elapsed() < DISPLAY_FRAME_INTERVAL {
-        return Ok(false);
+/// A new view must not inherit a rejected tile's retry deadline from the old view.
+fn prepare_device_display_view(
+    previous: &mut Option<DisplayView>,
+    current: &DisplayView,
+    sent: &mut [Option<Vec<u8>>],
+    last_faces: &mut [Option<KeyFace>],
+    retry_at: &mut [Option<Instant>],
+    retry_stage: &mut [usize],
+) -> bool {
+    if !prepare_display_view(previous, current, sent) {
+        return false;
     }
-    if prepare_display_view(&mut d.displayed_view, view, &mut d.sent) {
+    last_faces.fill(None);
+    retry_at.fill(None);
+    retry_stage.fill(0);
+    true
+}
+
+/// Preserve the original driver rule: render changed faces and animated states.
+fn face_needs_render(previous: Option<&KeyFace>, current: &KeyFace, refresh: bool) -> bool {
+    refresh || previous != Some(current)
+        || matches!(current, KeyFace::Session(session) if session.activity.animated())
+        || matches!(current, KeyFace::Hub(hub) if hub.waiting > 0)
+}
+
+/// The scheduler visits each key in circular order, including empty slots.
+fn scheduled_key(start: usize, offset: usize) -> usize {
+    (start + offset) % KEY_COUNT
+}
+
+/// Delay retries for a rejected image without reopening the HID device.
+fn image_rejection_delay(stage: usize) -> Duration {
+    Duration::from_secs_f64(IMAGE_RECOVERY_DELAYS_S[stage.min(IMAGE_RECOVERY_DELAYS_S.len() - 1)])
+}
+
+fn image_retry_due(retry_at: Option<Instant>, now: Instant) -> bool {
+    retry_at.is_none_or(|deadline| now >= deadline)
+}
+
+fn rejected_image_retry(stage: usize, now: Instant) -> (usize, Instant) {
+    (stage.saturating_add(1), now + image_rejection_delay(stage))
+}
+
+/// Send changed images in circular order, waiting for each acknowledgement.
+fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, view: &DisplayView, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec) -> Result<bool, String> {
+    service_keep_alive(d)?;
+    if prepare_device_display_view(&mut d.displayed_view, view, &mut d.sent, &mut d.last_faces, &mut d.image_retry_at, &mut d.image_retry_stage) {
         let empty = faces.iter().filter(|face| matches!(face, KeyFace::Empty)).count();
-        crate::mac::log(&format!("keypad refresh page {} focus {} empty {empty}", view.page + 1, view.focus.is_some()));
+        crate::mac::log(&format!("keypad refresh page {} empty {empty}", view.page + 1));
     }
     let refresh = d.keep_alive == 0 && d.last_frame.elapsed().as_secs_f64() > KEEP_ALIVE_INTERVAL_S;
-    for (i, f) in faces.iter().enumerate() {
+    let start_key = d.next_key;
+    let mut pressed = false;
+    for offset in 0..KEY_COUNT {
         service_keep_alive(d)?;
-        // Input or another window may have changed the view since this snapshot.
+        let i = scheduled_key(start_key, offset);
+        if !image_retry_due(d.image_retry_at[i], Instant::now()) {
+            continue;
+        }
         if core.lock().map(|c| display_view(&c) != *view).unwrap_or(true) {
             break;
         }
-        let pm = render_key(f, t, font);
+        let refresh_key = refresh && i == crate::model::HUB_KEY;
+        if !face_needs_render(d.last_faces[i].as_ref(), &faces[i], refresh_key) {
+            continue;
+        }
+        let pm = render_key(&faces[i], t, font);
         let jpg = jpeg(&pm);
         if jpg.is_empty() {
             return Err(format!("Could not encode keypad image for key {i}"));
         }
-        if image_needs_send(d.sent[i].as_deref(), &jpg, refresh && i == crate::model::HUB_KEY) {
-            for p in packets(&jpg, i, false) {
-                write_report(&d.dev, &p).map_err(|e| format!("Keypad stopped accepting images: {e}"))?;
-            }
-            d.sent[i] = Some(jpg);
-            d.last_frame = Instant::now();
+        if !image_needs_send(d.sent[i].as_deref(), &jpg, refresh_key) {
+            d.last_faces[i] = Some(faces[i].clone());
+            d.displayed_targets[i] = crate::model::target_for_face(&faces[i], view.quota_view);
+            continue;
         }
-        if poll_input(d, core) {
+        let image_packets = packets(&jpg, i, false);
+        let expected_part = image_packets.last().expect("image has a packet")[4] & !0x20;
+        d.next_key = scheduled_key(i, 1);
+        for p in &image_packets {
+            write_report(&d.dev, p).map_err(|e| format!("Keypad stopped accepting images: {e}"))?;
+        }
+        let (input, accepted) = wait_image_ack(d, core, expected_part, i, jpg.len(), image_packets.len())?;
+        if input {
+            run_key_actions(core);
+            pressed = true;
+        }
+        if accepted {
+            d.sent[i] = Some(jpg);
+            d.last_faces[i] = Some(faces[i].clone());
+            d.displayed_targets[i] = crate::model::target_for_face(&faces[i], view.quota_view);
+            d.image_retry_at[i] = None;
+            d.image_retry_stage[i] = 0;
+            d.last_frame = Instant::now();
+        } else {
+            let (stage, deadline) = rejected_image_retry(d.image_retry_stage[i], Instant::now());
+            d.image_retry_stage[i] = stage;
+            d.image_retry_at[i] = Some(deadline);
+        }
+        if poll_input(d, core)? {
             run_key_actions(core);
             pressed = true;
         }
     }
-    d.last_display_update = Instant::now();
     Ok(pressed)
 }
 
@@ -729,6 +880,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
             let mut path: Option<std::ffi::CString> = None;
             let mut retries = 0usize;
             let mut recovery_stage = 0usize;
+            let mut connected_at: Option<Instant> = None;
             let mut retry_at = Instant::now();
             // Wait for Options+ to finish initialising a newly plugged keypad before taking
             // over: quiet for 2 s, at most 10 s ("waiting for Options+ initialization").
@@ -754,6 +906,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     if let Some(d) = dev.take() {
                         release(d);
                     }
+                    connected_at = None;
                     api = None;
                     set(&core, Hardware::Off);
                     std::thread::sleep(Duration::from_millis(500));
@@ -790,6 +943,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     (Some(_), false) => {
                         // Switch to Options+ (menu, page-button chord, quit).
                         release(dev.take().unwrap());
+                        connected_at = None;
                         set(&core, Hardware::Connected);
                     }
                     (None, true) => {
@@ -804,7 +958,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                 match take_over(a, p, brightness) {
                                     Ok(d) => {
                                         retries = 0;
-                                        recovery_stage = 0;
+                                        connected_at = Some(Instant::now());
                                         dev = Some(d);
                                         set(&core, Hardware::Driving);
                                     }
@@ -824,25 +978,37 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         }
                     }
                     (Some(d), true) => {
-                        if poll_input(d, &core) {
-                            run_key_actions(&core);
-                            wake();
-                        }
-                        let snapshot = core.lock().ok().map(|mut c| {
-                            c.tick();
-                            (display_view(&c), c.faces())
-                        });
-                        if let Some((view, faces)) = snapshot {
-                            let sent = send_frame(d, &core, &view, &faces, crate::model::now(), &font);
-                            if let Ok(true) = sent {
-                                wake();
+                        let result = (|| -> Result<bool, String> {
+                            let mut changed = poll_input(d, &core)?;
+                            if changed {
+                                run_key_actions(&core);
                             }
-                            if let Err(e) = sent {
-                                // Image recovery: reopen silently after 2, 5, 15, then 30 s.
+                            let snapshot = core.lock().ok().map(|mut c| {
+                                c.tick();
+                                (display_view(&c), c.faces())
+                            });
+                            if let Some((view, faces)) = snapshot {
+                                changed |= send_frame(d, &core, &view, &faces, crate::model::now(), &font)?;
+                            }
+                            Ok(changed)
+                        })();
+                        match result {
+                            Ok(changed) => {
+                                if connected_at.is_some_and(|since| since.elapsed() >= RECOVERY_STABLE_INTERVAL) {
+                                    recovery_stage = 0;
+                                }
+                                if changed {
+                                    wake();
+                                }
+                            },
+                            Err(e) => {
+                                crate::mac::log(&format!("keypad transport error: {e}"));
+                                // Reopen after 2, 5, 15, then 30 s on input or output failure.
                                 dev = None;
+                                connected_at = None;
                                 path = None;
                                 let delay = IMAGE_RECOVERY_DELAYS_S[recovery_stage.min(IMAGE_RECOVERY_DELAYS_S.len() - 1)];
-                                recovery_stage += 1;
+                                recovery_stage = recovery_stage.saturating_add(1);
                                 retry_at = Instant::now() + Duration::from_secs_f64(delay);
                                 set(&core, Hardware::Problem(format!("{e} Trying again in {delay:.0} s.")));
                             }
@@ -898,11 +1064,130 @@ mod tests {
     }
 
     #[test]
+    fn image_scheduler_visits_each_key_once_then_wraps_fairly() {
+        let start = KEY_COUNT - 2;
+        let cycle: Vec<_> = (0..KEY_COUNT).map(|offset| scheduled_key(start, offset)).collect();
+        let mut expected: Vec<_> = (start..KEY_COUNT).collect();
+        expected.extend(0..start);
+        assert_eq!(cycle, expected);
+        let unique: std::collections::HashSet<_> = cycle.iter().copied().collect();
+        assert_eq!(unique.len(), KEY_COUNT);
+        assert_eq!(scheduled_key(start, KEY_COUNT), start);
+        assert_eq!(scheduled_key(scheduled_key(start, 1), 0), KEY_COUNT - 1);
+    }
+
+    #[test]
+    fn changed_face_gate_preserves_original_animation_and_state_transitions() {
+        let face_for = |state: &str| {
+            let mut core = crate::model::Core::new(crate::model::Settings::default());
+            core.in_control = true;
+            core.apply(crate::model::Incoming {
+                agent: "codex".into(), event: None,
+                body: serde_json::json!({"session": state, "state": state, "title": state}),
+            });
+            core.faces()[0].clone()
+        };
+
+        let idle = face_for("idle");
+        assert!(!face_needs_render(Some(&idle), &idle, false));
+        assert!(face_needs_render(Some(&idle), &KeyFace::Empty, false));
+        let mut changed_idle = idle.clone();
+        if let KeyFace::Session(face) = &mut changed_idle { face.title.push_str(" renamed"); }
+        assert!(face_needs_render(Some(&idle), &changed_idle, false));
+
+        for state in ["thinking", "waiting_question", "done"] {
+            let face = face_for(state);
+            assert!(face_needs_render(Some(&face), &face, false), "{state} should keep its existing animation");
+        }
+        assert!(!face_needs_render(Some(&idle), &idle, false));
+        assert!(face_needs_render(Some(&idle), &idle, true));
+
+        let mut waiting_core = crate::model::Core::new(crate::model::Settings::default());
+        waiting_core.in_control = true;
+        waiting_core.apply(crate::model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"waiting-hub", "state":"waiting_question"}),
+        });
+        let hub = waiting_core.faces()[crate::model::HUB_KEY].clone();
+        assert!(face_needs_render(Some(&hub), &hub, false));
+    }
+
+    #[test]
+    fn page_change_clears_old_page_retry_deadline_and_render_cache() {
+        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true };
+        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
+        let future = Instant::now() + Duration::from_secs(30);
+        let mut previous = Some(first);
+        let mut sent = vec![Some(vec![0xAA]); KEY_COUNT];
+        let mut last_faces = vec![Some(KeyFace::Empty); KEY_COUNT];
+        let mut retry_at = [Some(future); KEY_COUNT];
+        let mut retry_stage = [4; KEY_COUNT];
+
+        assert!(!image_retry_due(retry_at[0], Instant::now()));
+        assert!(prepare_device_display_view(&mut previous, &second, &mut sent, &mut last_faces, &mut retry_at, &mut retry_stage));
+        assert!(sent.iter().all(Option::is_none));
+        assert!(last_faces.iter().all(Option::is_none));
+        assert!(retry_at.iter().all(Option::is_none));
+        assert!(retry_stage.iter().all(|stage| *stage == 0));
+        assert!(image_retry_due(retry_at[0], Instant::now()), "a previous page's rejection must not block the new page");
+
+        retry_at[0] = Some(future);
+        retry_stage[0] = 2;
+        assert!(!prepare_device_display_view(&mut previous, &second, &mut sent, &mut last_faces, &mut retry_at, &mut retry_stage));
+        assert_eq!(retry_at[0], Some(future));
+        assert_eq!(retry_stage[0], 2);
+    }
+
+    #[test]
+    fn rejected_image_retries_back_off_per_attempt_and_respect_the_deadline() {
+        let start = Instant::now();
+        let mut retry_stage = 0;
+        let mut at = start;
+        for (delay, expected_stage) in [(2, 1), (5, 2), (15, 3), (30, 4), (30, 5)] {
+            let (next_stage, deadline) = rejected_image_retry(retry_stage, at);
+            assert_eq!(next_stage, expected_stage);
+            assert_eq!(deadline.duration_since(at), Duration::from_secs(delay));
+            assert!(!image_retry_due(Some(deadline), deadline - Duration::from_nanos(1)));
+            assert!(image_retry_due(Some(deadline), deadline));
+            assert!(image_retry_due(None, at));
+            retry_stage = next_stage;
+            at = deadline;
+        }
+    }
+
+    #[test]
     fn checked_write_accepts_only_a_complete_report() {
         assert_eq!(checked_write_result(Ok(20), 20), Ok(()));
         let err = checked_write_result(Ok(19), 20).unwrap_err();
         assert!(err.contains("19 of 20"));
         assert_eq!(checked_write_result(Err("disconnected".into()), 20), Err("disconnected".into()));
+    }
+
+    #[test]
+    fn image_ack_accepts_only_success_for_the_expected_packet_part() {
+        let success = [0x13, 0xFF, 0x02, 0x2B, 0xC1, 0x00, 0x01];
+        assert_eq!(image_ack(&success, 0xC1), Some(Ok(())));
+        assert_eq!(image_ack(&success, 0xC2), None);
+
+        let truncated = [0x13, 0xFF, 0x02, 0x2B, 0xC1, 0x00];
+        assert_eq!(image_ack(&truncated, 0xC1), None);
+    }
+
+    #[test]
+    fn image_ack_rejects_non_success_status_and_wrong_headers() {
+        let rejected = [0x13, 0xFF, 0x02, 0x2B, 0xC1, 0x00, 0x00];
+        assert_eq!(image_ack(&rejected, 0xC1), Some(Err([0x00, 0x00])));
+        let device_error = [0x13, 0xFF, 0x02, 0x2B, 0xC1, 0x01, 0x01];
+        assert_eq!(image_ack(&device_error, 0xC1), Some(Err([0x01, 0x01])));
+
+        for report in [
+            [0x12, 0xFF, 0x02, 0x2B, 0xC1, 0x00, 0x01],
+            [0x13, 0x00, 0x02, 0x2B, 0xC1, 0x00, 0x01],
+            [0x13, 0xFF, 0x03, 0x2B, 0xC1, 0x00, 0x01],
+            [0x13, 0xFF, 0x02, 0x2A, 0xC1, 0x00, 0x01],
+        ] {
+            assert_eq!(image_ack(&report, 0xC1), None, "unexpected acknowledgement {report:?}");
+        }
     }
 
     #[test]
@@ -915,15 +1200,10 @@ mod tests {
     }
 
     #[test]
-    fn physical_frame_cap_is_ten_hertz() {
-        assert_eq!(DISPLAY_FRAME_INTERVAL, Duration::from_millis(100));
-    }
-
-    #[test]
     fn page_transition_invalidates_occupied_cache_so_empty_slot_image_is_sent() {
-        let mut previous = Some(DisplayView { page: 0, focus: None, in_control: true });
+        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true });
         let mut sent = vec![Some(vec![0x11, 0x22]); KEY_COUNT];
-        let next = DisplayView { page: 1, focus: None, in_control: true };
+        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
 
         assert!(prepare_display_view(&mut previous, &next, &mut sent));
         assert!(sent.iter().all(Option::is_none));
@@ -933,10 +1213,10 @@ mod tests {
 
     #[test]
     fn page_transition_forces_resend_even_when_rendered_bytes_are_equal() {
-        let mut previous = Some(DisplayView { page: 0, focus: None, in_control: true });
+        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true });
         let same_hub_jpeg = vec![0xFF, 0xD8, 0x42, 0xFF, 0xD9];
         let mut sent = vec![Some(same_hub_jpeg.clone()); KEY_COUNT];
-        let next = DisplayView { page: 1, focus: None, in_control: true };
+        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
 
         assert!(prepare_display_view(&mut previous, &next, &mut sent));
         assert!(image_needs_send(sent[crate::model::HUB_KEY].as_deref(), &same_hub_jpeg, false));
@@ -945,9 +1225,9 @@ mod tests {
 
     #[test]
     fn aborted_page_transition_cannot_leave_partial_cache_as_current() {
-        let first = DisplayView { page: 0, focus: None, in_control: true };
-        let second = DisplayView { page: 1, focus: None, in_control: true };
-        let third = DisplayView { page: 2, focus: Some("codex:focus".into()), in_control: true };
+        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true };
+        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
+        let third = DisplayView { quota_view: false, quota_page: 0, page: 2, in_control: true };
         let mut previous = Some(first);
         let mut sent = vec![Some(vec![0x10]); KEY_COUNT];
 
@@ -979,6 +1259,77 @@ mod tests {
             let j = jpeg(&pm);
             assert!(!j.is_empty() && j.len() <= MAX_SINGLE_JPEG, "jpeg {} bytes", j.len());
         }
+    }
+
+    #[test]
+    fn unread_tile_differs_from_read_tile_and_keeps_animated_light() {
+        let font = load_font();
+        let mut core = crate::model::Core::new(crate::model::Settings::default());
+        core.in_control = true;
+        core.apply(crate::model::Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: serde_json::json!({"session":"unread-animation", "state":"thinking", "_unread":2}),
+        });
+        let face = match &core.faces()[0] {
+            KeyFace::Session(face) => face.clone(),
+            other => panic!("expected session face, got {other:?}"),
+        };
+        assert_eq!(face.unread, 2);
+        let mut read_face = face.clone();
+        read_face.unread = 0;
+
+        let unread_at = render_key(&KeyFace::Session(face.clone()), 1.1, &font);
+        let read_at = render_key(&KeyFace::Session(read_face), 1.1, &font);
+        assert_ne!(unread_at.data(), read_at.data(), "unread state must be visible in the device render");
+        let unread_later = render_key(&KeyFace::Session(face), 1.7, &font);
+        assert_ne!(unread_at.data(), unread_later.data(), "the unread background must not freeze the animated light");
+    }
+
+    #[test]
+    fn unchanged_idle_faces_are_cached_but_original_activity_animations_continue() {
+        let face_for = |state: &str| {
+            let mut core = crate::model::Core::new(crate::model::Settings::default());
+            core.in_control = true;
+            core.apply(crate::model::Incoming {
+                agent: "codex".into(), event: None,
+                body: serde_json::json!({"session": state, "state": state, "title": state}),
+            });
+            core.faces()[0].clone()
+        };
+
+        let idle = face_for("idle");
+        assert!(!face_needs_render(Some(&idle), &idle, false));
+        assert!(face_needs_render(Some(&idle), &KeyFace::Empty, false));
+        let mut changed_idle = idle.clone();
+        if let KeyFace::Session(face) = &mut changed_idle { face.title.push_str(" renamed"); }
+        assert!(face_needs_render(Some(&idle), &changed_idle, false));
+        for state in ["thinking", "waiting_question", "done"] {
+            let animated = face_for(state);
+            assert!(face_needs_render(Some(&animated), &animated, false), "{state} stays animated");
+        }
+        assert!(face_needs_render(Some(&idle), &idle, true));
+
+        let mut core = crate::model::Core::new(crate::model::Settings::default());
+        core.in_control = true;
+        core.apply(crate::model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"waiting-hub", "state":"waiting_question"}),
+        });
+        let hub = core.faces()[crate::model::HUB_KEY].clone();
+        assert!(face_needs_render(Some(&hub), &hub, false), "a waiting hub remains animated");
+    }
+
+    #[test]
+    fn quota_render_changes_when_available_percentage_changes() {
+        let font = load_font();
+        let make = |remaining| KeyFace::Quota(crate::quota::Quota {
+            provider: "Codex".into(), window: "Weekly".into(), remaining: Some(remaining), reset: None,
+            reset_text: Some("Resets tomorrow".into()), updated: Some(crate::quota::observed_now()), source: "test".into(),
+        });
+        let low = render_key(&make(37.0), 10.0, &font);
+        let high = render_key(&make(74.0), 10.0, &font);
+        assert_ne!(low.data(), high.data(), "the physical quota meter must reflect a changed available percentage");
     }
 }
 

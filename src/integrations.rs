@@ -25,6 +25,14 @@ pub fn open_exact(agent: Option<&AgentDef>, s: &crate::model::Session) {
             return;
         }
     }
+    // Open a standard Claude chat by its stable ID in Claude, including from Code mode.
+    if s.agent == "claude-desktop" {
+        if let Some(url) = claude_chat_url(&s.id) {
+            let bundle = if s.app_bundle.is_empty() { "com.anthropic.claudefordesktop" } else { &s.app_bundle };
+            let _ = Command::new("/usr/bin/open").args(["-b", bundle, &url]).spawn();
+            return;
+        }
+    }
     // A followed desktop app: bring it forward, then open the conversation inside it.
     if !s.app_bundle.is_empty() {
         let (bundle, title) = (s.app_bundle.clone(), s.title.clone());
@@ -91,6 +99,12 @@ pub fn open_exact(agent: Option<&AgentDef>, s: &crate::model::Session) {
         return;
     }
     open_session(agent, &s.id);
+}
+
+/// The canonical URL for a standard chat captured from Claude's accessibility tree.
+pub fn claude_chat_url(id: &str) -> Option<String> {
+    let ok = !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    ok.then(|| format!("https://claude.ai/chat/{id}"))
 }
 
 /// ClaudeSessionFile.configDirectory (0x1000c8b70): $CLAUDE_CONFIG_DIR, else ~/.claude.

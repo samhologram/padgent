@@ -1,15 +1,15 @@
-# AgentPad mechanics
+# Padgent mechanics
 
-AgentPad shows agent sessions on screen and can drive the Logitech MX Creative Keypad.
+Padgent shows agent sessions on screen and can drive the Logitech MX Creative Keypad.
 The physical keypad driver is experimental. Settings, imported agent definitions and
-per-agent preferences are stored in the AgentPad configuration directory.
+per-agent preferences remain in the existing AgentPad configuration directory for compatibility.
 
 ## Sessions and actions
 
 Sessions can come from local agent records, hooks, or desktop apps followed through macOS
 Accessibility. The application displays each session’s activity, age and latest message.
-Tapping a key opens its conversation or terminal; holding a key for 0.6 seconds opens its
-focus view, and holding it for two seconds clears it. The two page buttons navigate sessions;
+Tapping a key opens its conversation or terminal; holding a key for 0.6 seconds archives it locally until work resumes. Archives are kept in memory
+and reset when Padgent restarts. The two page buttons navigate pages;
 holding both for 1.5 seconds releases the keypad to Logi Options+.
 
 ## Display and keypad

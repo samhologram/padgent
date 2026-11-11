@@ -232,11 +232,11 @@ mod imp {
 
 pub use imp::*;
 
-/// Appends a line to ~/Library/Logs/AgentPad.log (kept under 512 KB).
+/// Appends a line to ~/Library/Logs/Padgent.log (kept under 512 KB).
 pub fn log(msg: &str) {
     use std::io::Write;
     let Some(home) = dirs::home_dir() else { return };
-    let path = home.join("Library/Logs/AgentPad.log");
+    let path = home.join("Library/Logs/Padgent.log");
     if std::fs::metadata(&path).map(|m| m.len() > 512 * 1024).unwrap_or(false) {
         let _ = std::fs::write(&path, b"");
     }

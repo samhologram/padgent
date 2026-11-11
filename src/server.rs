@@ -128,7 +128,7 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
         return false;
     }
     if method == "GET" && (path == "/health" || path == "/") {
-        respond(&mut stream, 200, "{\"ok\":true,\"app\":\"agentpad\"}");
+        respond(&mut stream, 200, "{\"ok\":true,\"app\":\"padgent\"}");
         return false;
     }
     if method != "POST" {

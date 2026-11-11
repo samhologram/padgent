@@ -81,7 +81,7 @@ impl Tray {
     pub fn new() -> Option<Tray> {
         let icon = TrayIconBuilder::new()
             .with_icon_templated(icon(false))
-            .with_tooltip("AgentPad")
+            .with_tooltip("Padgent")
             .with_menu(Box::new(Menu::new()))
             .build()
             .ok()?;
@@ -148,7 +148,7 @@ impl Tray {
         let _ = menu.append(&MenuItem::with_id("toggle", toggle, true, None));
         let _ = menu.append(&MenuItem::with_id("settings", "Settings…", true, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&MenuItem::with_id("quit", "Quit AgentPad", true, None));
+        let _ = menu.append(&MenuItem::with_id("quit", "Quit Padgent", true, None));
         self.icon.set_menu(Some(Box::new(menu)));
     }
 }

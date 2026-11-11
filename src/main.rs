@@ -1,4 +1,4 @@
-//! AgentPad — an open-source keypad and menu bar for agent sessions.
+//! Padgent — an open-source keypad and menu bar for agent sessions.
 
 mod colour;
 mod field;
@@ -9,6 +9,7 @@ mod integrations;
 mod mac;
 mod model;
 mod paint;
+mod quota;
 mod server;
 mod tray;
 mod watch;
@@ -66,8 +67,10 @@ struct App {
     popup_keys: [bool; KEY_COUNT],
     popup_pages: [bool; 2],
     screenshot: Option<String>,
+    screenshot_menu_bar: bool,
     frames: u32,
     shot_done: Arc<AtomicBool>,
+    shot_failed: Arc<AtomicBool>,
     shot_requested: bool,
     keys_prev: [bool; KEY_COUNT],
     pages_prev: [bool; 2],
@@ -164,7 +167,7 @@ fn hint(ui: &mut Ui, text: &str) {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<String>) -> App {
+    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<String>, screenshot_menu_bar: bool, shot_failed: Arc<AtomicBool>) -> App {
         setup_style(&cc.egui_ctx);
         let mut settings = Settings::load();
         let demo = screenshot.is_some();
@@ -204,6 +207,7 @@ impl App {
             }
             watch::start(core.clone(), wake.clone());
             local::start(core.clone(), wake.clone());
+            quota::start(core.clone(), wake.clone());
             tray = tray::Tray::new();
             let clicks = tray_clicks.clone();
             let wake_tray = wake.clone();
@@ -282,14 +286,16 @@ impl App {
             tray,
             menu_events,
             tray_clicks,
-            popup_open: false,
+            popup_open: screenshot_menu_bar,
             popup_position: pos2(0.0, 24.0),
             popup_focused: false,
             popup_keys: [false; KEY_COUNT],
             popup_pages: [false; 2],
             screenshot,
+            screenshot_menu_bar,
             frames: 0,
             shot_done: Arc::new(AtomicBool::new(false)),
+            shot_failed,
             shot_requested: false,
             keys_prev: [false; KEY_COUNT],
             pages_prev: [false; 2],
@@ -357,18 +363,21 @@ impl App {
     }
 
     fn popup(&mut self, ctx: &egui::Context) {
-        let builder = egui::ViewportBuilder::default().with_title("AgentPad keypad")
+        let builder = egui::ViewportBuilder::default().with_title("Padgent keypad")
             .with_inner_size([400.0, 480.0]).with_position(self.popup_position)
             .with_resizable(false).with_decorations(false).with_always_on_top();
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("tray-keypad"), builder, |ui, _| {
+            self.popup_contents(ui, ctx);
+        });
+        if !self.popup_open { self.cancel_popup_inputs(); }
+    }
+
+    fn popup_contents(&mut self, ui: &mut Ui, ctx: &egui::Context) {
             let child_ctx = ui.ctx().clone();
             let focused = child_ctx.input(|i| i.viewport().focused.unwrap_or(false));
-            if focused && !self.popup_focused {
-                self.popup_focused = true;
-                mac::log("tray keypad focused");
-            }
-            if child_ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested())
-                || (self.popup_focused && !focused) {
+            if focused && !self.popup_focused { self.popup_focused = true; }
+            if !self.screenshot_menu_bar && (child_ctx.input(|i| i.key_pressed(Key::Escape) || i.viewport().close_requested())
+                || (self.popup_focused && !focused)) {
                 self.popup_open = false;
                 mac::log("tray keypad dismissed");
             }
@@ -419,7 +428,7 @@ impl App {
             self.popup_keys = down;
             self.popup_pages = page_down;
             let r = Rect::from_min_size(full.min + vec2(12.0, 436.0), vec2(376.0, 30.0));
-            if ui.put(r, egui::Button::new("Open AgentPad & Settings…")).clicked() {
+            if ui.put(r, egui::Button::new("Open Padgent & Settings…")).clicked() {
                 self.popup_open = false;
                 mac::log("tray keypad dismissed for full app");
                 self.page = Page::Keypad;
@@ -428,8 +437,6 @@ impl App {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
             }
             child_ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        });
-        if !self.popup_open { self.cancel_popup_inputs(); }
     }
 
     fn cancel_popup_inputs(&mut self) {
@@ -445,7 +452,7 @@ impl App {
         let p = ui.painter().clone();
         paint::glass(&p, rect, 22.0, white(0.4), 0.9, true);
         let mut y = rect.top() + 46.0;
-        p.text(pos2(rect.left() + 20.0, y), Align2::LEFT_CENTER, "AgentPad", FontId::proportional(20.0), white(0.96));
+        p.text(pos2(rect.left() + 20.0, y), Align2::LEFT_CENTER, "Padgent", FontId::proportional(20.0), white(0.96));
         y += 18.0;
         let label = self.core.lock().map(|c| c.control_label()).unwrap_or("");
         p.text(pos2(rect.left() + 20.0, y), Align2::LEFT_CENTER, label, FontId::proportional(11.5), white(0.5));
@@ -512,7 +519,7 @@ impl App {
             Hardware::Off => "MX Creative Keypad, shown live on screen. Turn on the physical keypad in Menu bar and hand-over.".to_string(),
             Hardware::NoKeypad => "No keypad connected. Plug in the MX Creative Keypad with its USB-C cable.".to_string(),
             Hardware::Connected => "Keypad connected.".to_string(),
-            Hardware::Driving => "AgentPad has the keypad. Each key is one session in its agent's colour; the hub key counts what is waiting.".to_string(),
+            Hardware::Driving => "Padgent has the keypad. Each key is one session in its agent's colour; the hub key counts what is waiting.".to_string(),
             Hardware::Problem(e) => e.clone(),
         };
         p.text(rect.min + vec2(4.0, 44.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.5), white(0.55));
@@ -639,7 +646,7 @@ impl App {
         p.text(
             pos2(dev.center().x, dev.bottom() + 16.0),
             Align2::CENTER_CENTER,
-            "Hold a key 0.6 s for its focus view, 2 s to clear it · ‹ › page · hold both 1.5 s to hand back to Options+",
+            "Hold a key 0.6 s to archive its conversation until work resumes · ‹ › page · hold both 1.5 s to hand back to Options+",
             FontId::proportional(11.5),
             white(0.45),
         );
@@ -734,7 +741,7 @@ impl App {
 
     fn agents_page(&mut self, ui: &mut Ui) {
         ui.heading("Agents");
-        hint(ui, "AgentPad shows your agents' sessions side by side, each in its own colour. Choose the agents you use. Add other kinds of agents by importing their file, and share yours by exporting it.");
+        hint(ui, "Padgent shows your agents' sessions side by side, each in its own colour. Choose the agents you use. Add other kinds of agents by importing their file, and share yours by exporting it.");
         ui.add_space(6.0);
         let (agents, port, server_status, disabled, hues) = match self.core.lock() {
             Ok(c) => (c.agents.clone(), c.settings.hook_port, c.server_status.clone(), c.settings.disabled_agents.clone(), c.settings.agent_hues.clone()),
@@ -745,7 +752,7 @@ impl App {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if ui.button("Import agent…").clicked() {
-                if let Some(path) = rfd::FileDialog::new().add_filter("AgentPad agent", &["json", "orbagent"]).pick_file() {
+                if let Some(path) = rfd::FileDialog::new().add_filter("Padgent agent", &["json", "orbagent"]).pick_file() {
                     self.agent_notes = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| model::parse_agent_file(&t)) {
                         Ok(list) => {
                             let mut notes = Vec::new();
@@ -1044,12 +1051,12 @@ impl App {
         let running: Vec<(String, String)> = watch::running_apps();
         let trusted = watch::trusted();
         card(ui, "Apps to follow", |ui| {
-            hint(ui, "AgentPad follows the open conversations of these desktop apps, cloud or local, without any login here: whether a reply is being written and its last message. macOS asks you to allow AgentPad in Accessibility first.");
+            hint(ui, "Padgent follows the open conversations of these desktop apps, cloud or local, without any login here: whether a reply is being written and its last message. macOS asks you to allow Padgent in Accessibility first.");
             ui.horizontal(|ui| {
                 let (r, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                 ui.painter().circle_filled(r.center(), 5.0, if trusted { Color32::from_rgb(48, 209, 88) } else { Color32::from_rgb(255, 159, 10) });
                 ui.label(if trusted { "Accessibility: allowed" } else { "Accessibility: not allowed yet" });
-                if ui.button(if trusted { "Open Accessibility settings" } else { "Allow AgentPad in Accessibility" }).clicked() {
+                if ui.button(if trusted { "Open Accessibility settings" } else { "Allow Padgent in Accessibility" }).clicked() {
                     watch::request_access();
                 }
                 if ui.button("Allow Input Monitoring (keypad)").clicked() {
@@ -1057,7 +1064,7 @@ impl App {
                 }
             });
             if self.core.lock().map(|c| c.accessibility_reset_failed).unwrap_or(false) && !trusted {
-                ui.label(RichText::new("macOS kept the Accessibility entry of an older AgentPad, which it no longer accepts. In Accessibility, select AgentPad and click –, then click +, choose AgentPad in Applications and turn it on.").color(Color32::from_rgb(255, 180, 90)));
+                ui.label(RichText::new("macOS kept the Accessibility entry of an older AgentPad, which it no longer accepts. In Accessibility, select the old AgentPad entry and click –, then click +, choose Padgent in Applications and turn it on.").color(Color32::from_rgb(255, 180, 90)));
             }
             ui.separator();
             if watched.is_empty() {
@@ -1169,7 +1176,7 @@ impl App {
                 ui.label("Keypad brightness");
                 ui.add(egui::Slider::new(&mut s.brightness, 0.1..=1.0));
             });
-            hint(ui, "Sets the keypad's backlight while AgentPad drives it. When AgentPad releases the keypad, its previous brightness returns.");
+            hint(ui, "Sets the keypad's backlight while Padgent drives it. When Padgent releases the keypad, its previous brightness returns.");
             ui.checkbox(&mut s.key_glyphs, "Show tool glyphs on working keys");
             ui.horizontal(|ui| {
                 ui.label("Live text speed");
@@ -1221,7 +1228,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut s.empty_key_url).hint_text("https://… or app link").desired_width(300.0));
             });
             hint(ui, "Optional. Pressing a key with no session opens this link on this computer. Leave blank to do nothing.");
-            hint(ui, "Hold a session key for 0.6 s to open its focus view on all nine keys. The page buttons move to the next session; the hub key goes back.");
+            hint(ui, "Hold a session key for 0.6 s to archive it until the conversation resumes work.");
         });
         if format!("{:?}", c.settings) != before {
             c.revision += 1;
@@ -1250,19 +1257,19 @@ impl App {
                 hint(ui, "Dot shows a terracotta dot on the menu bar icon. Dot and count adds the number of waiting sessions next to it. The menu previews every session with its state and last message.");
                 if ui.button("Preview menu-bar keypad").clicked() { preview = true; }
                 let mut login = s.launch_at_login;
-                if ui.checkbox(&mut login, "Launch AgentPad at login").changed() {
+                if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
                     if integrations::set_launch_at_login(login).is_ok() {
                         s.launch_at_login = login;
                     }
                 }
             });
             card(ui, "Keypad hand-over", |ui| {
-                ui.checkbox(&mut s.auto_take_over_on_launch, "Take over the keypad when AgentPad starts");
-                hint(ui, "Off: AgentPad starts released and Options+ keeps the keypad until you switch.");
+                ui.checkbox(&mut s.auto_take_over_on_launch, "Take over the keypad when Padgent starts");
+                hint(ui, "Off: Padgent starts released and Options+ keeps the keypad until you switch.");
                 if ui.button(if in_control { "Give Keypad to Options+" } else { "Take Over Keypad" }).clicked() {
                     toggle = true;
                 }
-                hint(ui, "While AgentPad is in control, the keypad shows your sessions and your Options+ profile for it pauses. To hand it back from the keypad itself, hold both page buttons for 1.5 s. Quitting always gives it back.");
+                hint(ui, "While Padgent is in control, the keypad shows your sessions and your Options+ profile for it pauses. To hand it back from the keypad itself, hold both page buttons for 1.5 s. Quitting always gives it back.");
             });
             card(ui, "Physical keypad (experimental)", |ui| {
                 ui.checkbox(&mut s.drive_physical_keypad, "Drive the MX Creative Keypad over USB");
@@ -1270,7 +1277,7 @@ impl App {
                     Hardware::Off => "Off: the keypad is shown on screen only.".to_string(),
                     Hardware::NoKeypad => "No keypad connected. Plug in the MX Creative Keypad with its USB-C cable.".into(),
                     Hardware::Connected => "Keypad connected; it stays with Options+ until you take it over.".into(),
-                    Hardware::Driving => "AgentPad has the keypad.".into(),
+                    Hardware::Driving => "Padgent has the keypad.".into(),
                     Hardware::Problem(e) => e.clone(),
                 };
                 hint(ui, &status);
@@ -1283,7 +1290,7 @@ impl App {
         card(ui, "Settings file", |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Export settings…").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().set_file_name("agentpad-settings.json").save_file() {
+                    if let Some(path) = rfd::FileDialog::new().set_file_name("padgent-settings.json").save_file() {
                         let ok = std::fs::write(&path, serde_json::to_string_pretty(&c.settings).unwrap_or_default()).is_ok();
                         c.notify(if ok { "Settings exported." } else { "Export failed. Nothing was saved." });
                     }
@@ -1295,7 +1302,7 @@ impl App {
                                 c.settings = s;
                                 c.notify("Settings imported.");
                             }
-                            _ => c.notify("This file is not an AgentPad settings document."),
+                            _ => c.notify("This file is not a Padgent settings document."),
                         }
                     }
                 }
@@ -1316,7 +1323,7 @@ impl App {
 
     fn about_page(&mut self, ui: &mut Ui) {
         ui.heading("About");
-        card(ui, "AgentPad", |ui| {
+        card(ui, "Padgent", |ui| {
             hint(ui, "An open-source Rust app for agent sessions on a keypad and in the menu bar. It is lightweight: it redraws only while something moves, and drops to 10 fps when everything is idle.");
             hint(ui, "Not affiliated with Logitech, Anthropic or OpenAI. Logitech, MX and Options+ are trademarks of Logitech. Claude is a trademark of Anthropic. Codex and ChatGPT are trademarks of OpenAI.");
             let c = self.core.lock();
@@ -1325,6 +1332,36 @@ impl App {
             }
         });
     }
+}
+
+fn request_screenshot(ctx: &egui::Context, path: String, done: Arc<AtomicBool>, failed: Arc<AtomicBool>) {
+    ctx.request_screenshot(move |img| {
+        let [w, h] = img.size;
+        let mut buf = Vec::with_capacity(w * h * 3);
+        for p in &img.pixels {
+            let [r, g, b, a] = p.to_srgba_unmultiplied();
+            let a = a as f32 / 255.0;
+            let bg = [14.0, 15.0, 22.0];
+            buf.push((r as f32 * a + bg[0] * (1.0 - a)) as u8);
+            buf.push((g as f32 * a + bg[1] * (1.0 - a)) as u8);
+            buf.push((b as f32 * a + bg[2] * (1.0 - a)) as u8);
+        }
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if let Some(dir) = std::path::Path::new(&path).parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                std::fs::create_dir_all(dir)?;
+            }
+            image::save_buffer(&path, &buf, w as u32, h as u32, image::ExtendedColorType::Rgb8)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => eprintln!("Saved screenshot {w}x{h} to {path}"),
+            Err(err) => {
+                eprintln!("Failed to save screenshot {w}x{h} to {path}: {err}");
+                failed.store(true, Ordering::SeqCst);
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+    });
 }
 
 impl eframe::App for App {
@@ -1343,7 +1380,9 @@ impl eframe::App for App {
                 self.open_popup(rect);
             }
         }
-        if self.popup_open { self.popup(ctx); } else { self.cancel_popup_inputs(); }
+        if !self.screenshot_menu_bar {
+            if self.popup_open { self.popup(ctx); } else { self.cancel_popup_inputs(); }
+        }
         if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1364,24 +1403,12 @@ impl eframe::App for App {
             self.frames += 1;
             if self.frames >= 120 && !self.shot_requested {
                 self.shot_requested = true;
-                let done = self.shot_done.clone();
-                ctx.request_screenshot(move |img| {
-                    let [w, h] = img.size;
-                    let mut buf = Vec::with_capacity(w * h * 3);
-                    for p in &img.pixels {
-                        let [r, g, b, a] = p.to_srgba_unmultiplied();
-                        let a = a as f32 / 255.0;
-                        let bg = [14.0, 15.0, 22.0];
-                        buf.push((r as f32 * a + bg[0] * (1.0 - a)) as u8);
-                        buf.push((g as f32 * a + bg[1] * (1.0 - a)) as u8);
-                        buf.push((b as f32 * a + bg[2] * (1.0 - a)) as u8);
-                    }
-                    if let Some(dir) = std::path::Path::new(&path).parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    let _ = image::save_buffer(&path, &buf, w as u32, h as u32, image::ExtendedColorType::Rgb8);
-                    done.store(true, Ordering::SeqCst);
-                });
+                request_screenshot(ctx, path.clone(), self.shot_done.clone(), self.shot_failed.clone());
+            }
+            if self.frames >= 600 && !self.shot_done.load(Ordering::SeqCst) {
+                eprintln!("Screenshot timed out: no rendered image received for {path}");
+                self.shot_failed.store(true, Ordering::SeqCst);
+                self.shot_done.store(true, Ordering::SeqCst);
             }
             if self.shot_done.load(Ordering::SeqCst) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1402,6 +1429,11 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if self.screenshot_menu_bar {
+            let ctx = ui.ctx().clone();
+            self.popup_contents(ui, &ctx);
+            return;
+        }
         let full = ui.max_rect();
         let t = model::now();
         let reduced = self.core.lock().map(|c| c.settings.motion == Motion::Reduced).unwrap_or(false);
@@ -1440,7 +1472,7 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
-    // `--icon <file.png> [size]` draws the app icon (used when packaging AgentPad.app).
+    // `--icon <file.png> [size]` draws the app icon (used when packaging Padgent.app).
     if let Some(i) = args.iter().position(|a| a == "--icon") {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "icon.png".into());
         let size = args.get(i + 2).and_then(|v| v.parse().ok()).unwrap_or(1024);
@@ -1450,16 +1482,22 @@ fn main() -> eframe::Result {
         }
         return Ok(());
     }
-    let screenshot = args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned());
+    let menu_screenshot = args.iter().position(|a| a == "--screenshot-menu-bar").and_then(|i| args.get(i + 1).cloned());
+    let screenshot_menu_bar = menu_screenshot.is_some();
+    let screenshot = menu_screenshot.or_else(|| args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned()));
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("AgentPad")
+        .with_title("Padgent")
         .with_inner_size([1240.0, 780.0])
         .with_min_inner_size([980.0, 640.0])
         .with_transparent(true)
         .with_fullsize_content_view(true)
         .with_title_shown(false)
         .with_titlebar_shown(false);
+    if screenshot_menu_bar {
+        viewport = egui::ViewportBuilder::default().with_title("Padgent keypad")
+            .with_inner_size([400.0, 480.0]).with_resizable(false).with_decorations(false);
+    }
     let mut options = eframe::NativeOptions::default();
     if screenshot.is_some() {
         viewport = viewport.with_active(false);
@@ -1478,5 +1516,9 @@ fn main() -> eframe::Result {
     }
     options.viewport = viewport;
     let shot = screenshot.clone();
-    eframe::run_native("AgentPad", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot)))))
+    let shot_failed = Arc::new(AtomicBool::new(false));
+    let app_shot_failed = shot_failed.clone();
+    let result = eframe::run_native("Padgent", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, screenshot_menu_bar, app_shot_failed)))));
+    if shot_failed.load(Ordering::SeqCst) { std::process::exit(1); }
+    result
 }

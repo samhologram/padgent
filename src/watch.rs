@@ -233,9 +233,14 @@ mod ax {
     unsafe extern "C" {
         fn CFStringCreateWithBytes(a: CFTypeRef, b: *const u8, n: isize, enc: u32, ext: bool) -> CFTypeRef;
         fn CFRelease(cf: CFTypeRef);
+        fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
         fn CFGetTypeID(cf: CFTypeRef) -> usize;
         fn CFStringGetTypeID() -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, kind: isize, value: *mut c_void) -> bool;
         fn CFArrayGetTypeID() -> usize;
+        fn CFURLGetTypeID() -> usize;
+        fn CFURLGetString(url: CFTypeRef) -> CFTypeRef;
         fn CFArrayGetCount(a: CFTypeRef) -> isize;
         fn CFArrayGetValueAtIndex(a: CFTypeRef, i: isize) -> CFTypeRef;
         fn CFStringGetLength(s: CFTypeRef) -> isize;
@@ -307,6 +312,21 @@ mod ax {
         }
     }
 
+    pub fn url_attr(el: CFTypeRef, name: &str) -> Option<String> {
+        let value = attr(el, name)?;
+        unsafe {
+            if CFGetTypeID(value.0) == CFURLGetTypeID() {
+                let url = CFURLGetString(value.0);
+                if url.is_null() { return None; }
+                // CFURLGetString returns a borrowed reference; retain it for Cf.
+                CFRetain(url);
+                string(&Cf(url))
+            } else {
+                string(&value)
+            }
+        }
+    }
+
     pub fn press(el: CFTypeRef, action: &str) -> bool {
         let a = cfstr(action);
         unsafe { AXUIElementPerformAction(el, a.0) == 0 }
@@ -315,6 +335,15 @@ mod ax {
     pub fn set_true(el: CFTypeRef, name: &str) -> bool {
         let k = cfstr(name);
         unsafe { AXUIElementSetAttributeValue(el, k.0, kCFBooleanTrue) == 0 }
+    }
+
+    pub fn number_attr(el: CFTypeRef, name: &str) -> Option<f64> {
+        let number = attr(el, name)?;
+        unsafe {
+            if CFGetTypeID(number.0) != CFNumberGetTypeID() { return None; }
+            let mut value = 0.0;
+            if CFNumberGetValue(number.0, 6, &mut value as *mut f64 as *mut c_void) { Some(value) } else { None }
+        }
     }
 
     pub fn str_attr(el: CFTypeRef, name: &str) -> Option<String> {
@@ -345,10 +374,29 @@ fn pids(bundle: &str) -> Vec<i32> {
 
 struct Window {
     title: String,
+    claude_webarea: Option<(String, String)>,
+    usage_labels: Vec<String>,
+    usage_levels: Vec<(String, f64, String)>,
+    usage_reset: String,
     generating: bool,
     last_text: String,
     /// Conversation titles listed in the app's sidebar (most recent first).
     recent: Vec<String>,
+}
+
+/// Extract the stable ID only from a Claude standard chat page, never a Code route.
+fn claude_chat_id(url: &str) -> Option<String> {
+    let path = url.strip_prefix("https://claude.ai/chat/")?;
+    let id = path.split(['/', '?', '#']).next()?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') { return None; }
+    Some(id.to_string())
+}
+
+/// Keep the standard-chat web area when a window also contains host or utility webviews.
+fn select_claude_webarea(current: &mut Option<(String, String)>, url: &str, title: &str) {
+    if claude_chat_id(url).is_some() {
+        *current = Some((url.to_string(), title.to_string()));
+    }
 }
 
 /// Sidebar entries that are app controls, not conversations.
@@ -369,6 +417,11 @@ fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_
     }
     *budget -= 1;
     let role = ax::str_attr(el, "AXRole").unwrap_or_default();
+    if role == "AXWebArea" {
+        let title = ax::str_attr(el, "AXTitle").unwrap_or_default();
+        let url = ax::url_attr(el, "AXURL").unwrap_or_default();
+        select_claude_webarea(&mut w.claude_webarea, &url, &title);
+    }
     let list_here = in_list || matches!(role.as_str(), "AXOutline" | "AXList" | "AXTable");
     if in_list && matches!(role.as_str(), "AXStaticText" | "AXLink" | "AXButton" | "AXCell") && w.recent.len() < 12 {
         let label = ax::str_attr(el, "AXTitle")
@@ -381,7 +434,10 @@ fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_
             w.recent.push(label);
         }
     }
-    if role == "AXButton" {
+    if matches!(role.as_str(), "AXButton" | "AXPopUpButton") {
+        for label in [ax::str_attr(el, "AXDescription"), ax::str_attr(el, "AXTitle")].into_iter().flatten() {
+            if label.trim().starts_with("Usage:") { w.usage_labels.push(label); }
+        }
         let label = [ax::str_attr(el, "AXDescription"), ax::str_attr(el, "AXTitle"), ax::str_attr(el, "AXHelp")]
             .into_iter()
             .flatten()
@@ -391,9 +447,16 @@ fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_
         if label.contains("stop") && (label.contains("generat") || label.contains("respon") || label.contains("stream") || label.trim() == "stop") {
             w.generating = true;
         }
+    } else if role == "AXLevelIndicator" {
+        let title = ax::str_attr(el, "AXTitle").unwrap_or_default();
+        if let Some(value) = ax::number_attr(el, "AXValue") {
+            w.usage_levels.push((title, value, w.usage_reset.clone()));
+        }
     } else if role == "AXStaticText" || role == "AXTextArea" {
         if let Some(v) = ax::str_attr(el, "AXValue") {
             let v = v.trim();
+            if v.eq_ignore_ascii_case("5-hour limit") || v.to_lowercase().starts_with("weekly · ") { w.usage_reset.clear(); }
+            if v.starts_with("Resets ") { w.usage_reset = v.to_string(); }
             if v.chars().count() >= 40 && role == "AXStaticText" {
                 w.last_text = v.chars().take(400).collect();
             }
@@ -412,7 +475,7 @@ fn windows(pid: i32, electron: bool) -> Vec<Window> {
     let mut out = Vec::new();
     for w in wins.into_iter().take(6) {
         let title = ax::str_attr(w, "AXTitle").unwrap_or_default();
-        let mut win = Window { title, generating: false, last_text: String::new(), recent: Vec::new() };
+        let mut win = Window { title, claude_webarea: None, usage_labels: Vec::new(), usage_levels: Vec::new(), usage_reset: String::new(), generating: false, last_text: String::new(), recent: Vec::new() };
         let mut budget = 3500;
         scan(w, 0, &mut budget, &mut win, false);
         out.push(win);
@@ -425,8 +488,8 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
     std::thread::Builder::new()
         .name("app-watch".into())
         .spawn(move || {
-            // (agent, window) -> (generating, last text)
-            let mut last: HashMap<(String, String), (bool, String)> = HashMap::new();
+            // (agent, conversation) -> (generating, last text, title)
+            let mut last: HashMap<(String, String), (bool, String, String)> = HashMap::new();
             loop {
                 std::thread::sleep(Duration::from_millis(2500));
                 if !ax::trusted() {
@@ -437,7 +500,29 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     let agent = agent.as_str();
                     for pid in pids(&bundle) {
                         for w in windows(pid, electron) {
-                            let raw = w.title.trim();
+                            if agent == "claude-desktop" {
+                                for (window, used, reset) in &w.usage_levels {
+                                    if let Some(observation) = crate::quota::parse_claude_window(window, *used, reset, &crate::quota::observed_now()) {
+                                        if let Ok(mut c) = core.lock() { crate::quota::observe(&mut c, observation); }
+                                        wake();
+                                    }
+                                }
+                                for label in &w.usage_labels {
+                                    if let Some(observation) = crate::quota::parse_claude_usage(label, &crate::quota::observed_now()) {
+                                        if let Ok(mut c) = core.lock() { crate::quota::observe(&mut c, observation); }
+                                        wake();
+                                    }
+                                }
+                            }
+                            // Claude Desktop also hosts Code. Only a verified chat URL is a
+                            // standard conversation; never infer it from the generic window title.
+                            let claude_chat = if agent == "claude-desktop" {
+                                match w.claude_webarea.as_ref().and_then(|(url, _)| claude_chat_id(url)) {
+                                    Some(id) => Some(id),
+                                    None => continue,
+                                }
+                            } else { None };
+                            let raw = if claude_chat.is_some() { w.claude_webarea.as_ref().map(|(_, title)| title.trim()).unwrap_or_default() } else { w.title.trim() };
                             let title = raw
                                 .trim_end_matches(" - ChatGPT")
                                 .trim_end_matches(" - Claude")
@@ -448,7 +533,8 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                     continue;
                                 }
                             }
-                            let id = if title.is_empty() { "current".to_string() } else { title.to_string() };
+                            if claude_chat.is_some() && (title.is_empty() || app_named) { continue; }
+                            let id = claude_chat.unwrap_or_else(|| if title.is_empty() { "current".to_string() } else { title.to_string() });
                             // A Claude Code conversation in the Claude app already has its own key.
                             let is_code = core
                                 .lock()
@@ -468,15 +554,15 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             } else {
                                 "done"
                             };
-                            // Only conversations that are (or were just) writing are sessions.
-                            if prev.is_none() && !w.generating {
+                            // Other watched apps still require an observed generation.
+                            if agent != "claude-desktop" && prev.is_none() && !w.generating {
                                 continue;
                             }
-                            let changed = prev.as_ref() != Some(&(w.generating, w.last_text.clone()));
+                            let changed = prev.as_ref() != Some(&(w.generating, w.last_text.clone(), title.to_string()));
                             if !changed {
                                 continue;
                             }
-                            last.insert(key, (w.generating, w.last_text.clone()));
+                            last.insert(key, (w.generating, w.last_text.clone(), title.to_string()));
                             let fallback = core.lock().ok().and_then(|c| c.agent(agent).map(|a| a.name.clone())).unwrap_or_default();
                             let shown = if title.is_empty() { fallback.as_str() } else { title };
                             if let Ok(mut c) = core.lock() {
@@ -495,4 +581,50 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
         .ok();
     #[cfg(not(target_os = "macos"))]
     let _ = (core, wake);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claude_chat_id, select_claude_webarea};
+
+    #[test]
+    fn claude_chat_id_accepts_only_https_chat_routes_on_the_exact_domain() {
+        assert_eq!(claude_chat_id("https://claude.ai/chat/chat-123").as_deref(), Some("chat-123"));
+        assert_eq!(claude_chat_id("https://claude.ai/chat/AbC123?source=desktop#reply").as_deref(), Some("AbC123"));
+        for url in [
+            "http://claude.ai/chat/chat-123",
+            "https://claude.ai.evil.example/chat/chat-123",
+            "https://evil-claude.ai/chat/chat-123",
+            "https://claude.ai/code/session-123",
+            "https://claude.ai/new",
+            "https://claude.ai/settings",
+            "https://claude.ai/projects",
+            "https://claude.ai/chat/",
+            "https://claude.ai/chat/not_a_valid_id",
+        ] {
+            assert_eq!(claude_chat_id(url), None, "unexpected chat ID from {url}");
+        }
+    }
+
+    #[test]
+    fn utility_web_areas_before_or_after_chat_never_replace_selected_chat() {
+        let chat_url = "https://claude.ai/chat/chat-123";
+        let utility_before = "https://claude.ai/code";
+        let utility_after = "https://claude.ai/settings";
+
+        let mut selected = None;
+        select_claude_webarea(&mut selected, utility_before, "Claude Code");
+        select_claude_webarea(&mut selected, chat_url, "A real conversation");
+        select_claude_webarea(&mut selected, utility_after, "Settings");
+
+        assert_eq!(selected, Some((chat_url.to_string(), "A real conversation".to_string())));
+    }
+
+    #[test]
+    fn later_actual_chat_webarea_updates_selection() {
+        let mut selected = None;
+        select_claude_webarea(&mut selected, "https://claude.ai/chat/first", "First chat");
+        select_claude_webarea(&mut selected, "https://claude.ai/chat/second", "Second chat");
+        assert_eq!(selected, Some(("https://claude.ai/chat/second".into(), "Second chat".into())));
+    }
 }

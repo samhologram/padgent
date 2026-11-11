@@ -1,4 +1,4 @@
-//! Draws the AgentPad app icon: a dark glass slab with a 3×3 keypad of glowing orbs.
+//! Draws the Padgent app icon: a dark glass slab with a 3×3 keypad of glowing orbs.
 
 use crate::colour::{self, Rgb};
 use tiny_skia::{Color, FillRule, GradientStop, LinearGradient, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode, Transform};

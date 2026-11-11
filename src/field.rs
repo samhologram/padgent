@@ -222,7 +222,7 @@ fn smooth_noise(x: f32) -> f32 {
 }
 
 /// Scale for light sizes and their distance from the core.
-pub const ANIM_SCALE: f32 = 1.5;
+pub const ANIM_SCALE: f32 = 1.725;
 
 impl Field {
     pub fn scaled(mut self, s: f32) -> Field {
