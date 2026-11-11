@@ -39,8 +39,6 @@ cargo run -- --screenshot shot.png   # renders the window to a PNG and exits
 cargo run -- --screenshot-menu-bar menu.png  # renders the menu-bar keypad and exits
 ```
 
-The Apple Silicon disk image contains an ad-hoc signed app that is not notarized. It contains no personal data.
-
 On first use macOS asks you to allow Padgent in **Accessibility** (to follow desktop apps),
 **Input Monitoring** (to read the keypad) and **Automation** (to select a terminal tab).
 
