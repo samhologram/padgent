@@ -290,3 +290,11 @@ come from the idle case of legacyParams (0x10052f91c).
   fonts ("fonts: Google Sans Flex/Code not found … using system fonts").
 * Sparkle (grain) dots are at least 1.6 px and the moving lights have a solid centre, so they
   show at the keypad's resolution.
+
+## Holds
+* legacy's hold to approve a request from the keypad (ApprovalTiming.allowHold, 0x100443c68):
+  0.6 s (constant 0x3fe3333333333333), the same as the 0.6 s focus hold. The hold is armed by
+  AppController.beginAllowHold (0x1000a6df8) only while the focused session shows a pending
+  approval with an approval route; otherwise it logs "keypad decision: allow hold not armed".
+* legacy has no hold to clear a key. AgentPad's 2 s hold to clear a key (CLEAR_HOLD_S) is the
+  person's request, longer than every legacy hold so it never fires by accident.

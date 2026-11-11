@@ -625,7 +625,8 @@
    "group": "controls",
    "value": 2.0,
    "unit": "s",
-   "estimated": true
+   "estimated": true,
+   "note": "the person's request; legacy has no clear gesture (its holds are 0.6 s, ApprovalTiming.allowHold 0x100443c68)"
   },
   {
    "name": "text dwell",
