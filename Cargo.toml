@@ -9,13 +9,14 @@ repository = "https://github.com/samhologram/agentpad"
 [dependencies]
 ab_glyph = "0.2"
 dirs = "7.0.0"
-eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "clipboard"] }
 epaint_default_fonts = "0.37"
 hidapi = "2.6.7"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+libc = "0.2.191"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSRunningApplication", "NSWorkspace", "libc"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSGeometry"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSArray", "NSGeometry", "NSURL"] }
 raw-window-handle = "0.6"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }

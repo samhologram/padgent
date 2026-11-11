@@ -75,12 +75,16 @@ pub fn params(activity: Activity, tool: Option<ToolKind>, t: f32, age: f32, redu
             f.ri = 0.55;
         }
         Activity::Idle => {
-            // Slow 6 s breath with a small drift.
+            // legacyParams idle case (0x10052f91c): phase = 0.13·t·2π, x = 0.5 − 0.5·sin,
+            // k = 0.9 + 0.1·x²(3−2x); (ci, hi) = (0.62, 0.18)·k (vector at 0x1009f15f8);
+            // the core drifts sideways by 0.015 of value noise (0x10052fc54).
             f.cs = 0.1;
             f.hs = 0.3;
-            f.cx = 0.5 + 0.015 * wave(t, 6.0);
-            f.ci = 0.3 + 0.05 * wave(t, 6.0);
-            f.hi = 0.1 + 0.05 * wave(t, 6.0);
+            let x = 0.5 - 0.5 * (t * 0.13 * TAU).sin();
+            let k = 0.9 + 0.1 * x * x * (3.0 - 2.0 * x);
+            f.ci = 0.62 * k;
+            f.hi = 0.18 * k;
+            f.cx = 0.5 + 0.015 * (2.0 * smooth_noise(t * 0.05) - 1.0);
         }
         Activity::Starting => {
             // Fades in over 1.4 s while a ring opens every 1.6 s.
@@ -178,7 +182,7 @@ pub fn params(activity: Activity, tool: Option<ToolKind>, t: f32, age: f32, redu
             // A ring bursts out over 1.4 s, then the light settles.
             let burst = (-age / 0.4).exp();
             f.cs = 0.13;
-            f.ci = 0.5 + 0.5 * burst;
+            f.ci = 0.8 + 0.2 * burst;
             f.hs = 0.38;
             f.hi = 0.22 + 0.2 * burst;
             if age < 1.4 {
@@ -210,6 +214,38 @@ pub fn params(activity: Activity, tool: Option<ToolKind>, t: f32, age: f32, redu
         }
     }
     f
+}
+
+/// 1-D value noise with a quintic fade (6t⁵−15t⁴+10t³), as legacy's idle drift uses.
+fn smooth_noise(x: f32) -> f32 {
+    let i = x.floor();
+    let f = x - i;
+    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let a = hash(i as i32 as u32, 17);
+    let b = hash((i as i32 + 1) as u32, 17);
+    a + (b - a) * u
+}
+
+/// How much bigger AgentPad draws the light than legacy's sizes (the person asked for at least
+/// 50% bigger animations). Sizes, ring radii and the moving lights' distance from the core grow;
+/// intensities and timing stay legacy's.
+pub const ANIM_SCALE: f32 = 1.5;
+
+impl Field {
+    pub fn scaled(mut self, s: f32) -> Field {
+        self.cs *= s;
+        self.hs *= s;
+        self.rr *= s;
+        self.rw *= s;
+        self.r2r *= s;
+        self.r2w *= s;
+        for l in [&mut self.l1, &mut self.l2] {
+            l.0 = self.cx + (l.0 - self.cx) * s;
+            l.1 = self.cy + (l.1 - self.cy) * s;
+            l.2 *= s;
+        }
+        self
+    }
 }
 
 /// Cheap repeatable noise for the grain sparkle.

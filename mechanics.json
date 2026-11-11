@@ -512,6 +512,231 @@
    "group": "keypad",
    "value": 0.18,
    "source": "function 0x10052f400 (error case)"
+  },
+  {
+   "name": "host app parent walk",
+   "group": "focus",
+   "value": 64,
+   "source": "function 0x1008234e4"
+  },
+  {
+   "name": "on-screen window list options",
+   "group": "focus",
+   "value": "0x11",
+   "source": "function 0x100824d8c"
+  },
+  {
+   "name": "tab script timeout",
+   "group": "focus",
+   "value": 2,
+   "unit": "s",
+   "source": "function 0x10084d6e0"
+  },
+  {
+   "name": "terminal bundle id",
+   "group": "focus",
+   "value": "com.apple.Terminal",
+   "source": "function 0x10084d6e0"
+  },
+  {
+   "name": "iterm bundle id",
+   "group": "focus",
+   "value": "com.googlecode.iterm2",
+   "source": "function 0x10084d6e0"
+  },
+  {
+   "name": "claude session file limit",
+   "group": "focus",
+   "value": "0x10000",
+   "unit": "bytes",
+   "source": "function 0x10009e994"
+  },
+  {
+   "name": "claude continue link",
+   "group": "focus",
+   "value": "claude://code/continue?session=",
+   "source": "function 0x1000c8cd8"
+  },
+  {
+   "name": "claude host session prefix",
+   "group": "focus",
+   "value": "local_",
+   "source": "function 0x1000c8cd8"
+  },
+  {
+   "name": "codex host app",
+   "group": "focus",
+   "value": "com.openai.codex",
+   "source": "function 0x1000e2af0"
+  },
+  {
+   "name": "antigravity host app",
+   "group": "focus",
+   "value": "com.google.antigravity",
+   "source": "function 0x1000e2af0"
+  },
+  {
+   "name": "kimi host app",
+   "group": "focus",
+   "value": "com.kimi.code.desktop",
+   "source": "function 0x1000e2af0"
+  },
+  {
+   "name": "keypad key list start byte",
+   "group": "hardware",
+   "value": 6,
+   "source": "function 0x1004aff60"
+  },
+  {
+   "name": "codex thread link",
+   "group": "focus",
+   "value": "codex://threads/",
+   "source": "function 0x1006174d0"
+  },
+  {
+   "name": "codex thread id length",
+   "group": "focus",
+   "value": 36,
+   "source": "function 0x10061a884"
+  },
+  {
+   "name": "recent last message",
+   "group": "keypad",
+   "value": 600,
+   "unit": "s",
+   "estimated": true
+  },
+  {
+   "name": "age clock minutes to hours",
+   "group": "keypad",
+   "value": 60,
+   "unit": "min",
+   "source": "function 0x10053e2e8"
+  },
+  {
+   "name": "age clock hours to days",
+   "group": "keypad",
+   "value": 1440,
+   "unit": "min",
+   "source": "function 0x10053e2e8"
+  },
+  {
+   "name": "clear tile hold",
+   "group": "controls",
+   "value": 2.0,
+   "unit": "s",
+   "estimated": true
+  },
+  {
+   "name": "text dwell",
+   "group": "keypad",
+   "value": 1.5,
+   "unit": "s",
+   "source": "function 0x1005000d8"
+  },
+  {
+   "name": "finished reply hold",
+   "group": "keypad",
+   "value": 10,
+   "unit": "s",
+   "source": "function 0x1005000d8"
+  },
+  {
+   "name": "question wait heuristic",
+   "group": "sessions",
+   "value": "recent reply ends with ?",
+   "estimated": true
+  },
+  {
+   "name": "idle core intensity",
+   "group": "light",
+   "value": 0.62,
+   "source": "function 0x10052f91c, data 0x1009f15f8"
+  },
+  {
+   "name": "idle halo intensity",
+   "group": "light",
+   "value": 0.18,
+   "source": "function 0x10052f91c, data 0x1009f15f8"
+  },
+  {
+   "name": "idle breath frequency",
+   "group": "light",
+   "value": 0.13,
+   "unit": "Hz",
+   "source": "function 0x10052f91c"
+  },
+  {
+   "name": "idle breath depth",
+   "group": "light",
+   "value": "0.9 + 0.1·smoothstep",
+   "source": "function 0x10052f91c"
+  },
+  {
+   "name": "idle core drift",
+   "group": "light",
+   "value": 0.015,
+   "source": "function 0x10052f91c (0x10052fc54)"
+  },
+  {
+   "name": "state labels",
+   "group": "keypad",
+   "value": "Empty, Starting, Offline, Tool, Error, Idle, Thinking, Question, Writing, Waiting for approval, Compacting, Done",
+   "source": "function 0x1003dceb4"
+  },
+  {
+   "name": "hub working text",
+   "group": "keypad",
+   "value": "{n} working",
+   "source": "data 0x100b95e40"
+  },
+  {
+   "name": "frame rate cap",
+   "group": "keypad",
+   "value": 30,
+   "unit": "fps",
+   "source": "function 0x10015d4dc"
+  },
+  {
+   "name": "quiet frame rate cap",
+   "group": "keypad",
+   "value": 10,
+   "unit": "fps",
+   "source": "function 0x10015d4dc"
+  },
+  {
+   "name": "reschedule threshold",
+   "group": "keypad",
+   "value": 0.0001,
+   "unit": "s",
+   "source": "function 0x10015d4dc"
+  },
+  {
+   "name": "render times kept",
+   "group": "keypad",
+   "value": 64,
+   "source": "function 0x10016504c"
+  },
+  {
+   "name": "key title font",
+   "group": "keypad",
+   "value": 15.0,
+   "unit": "pt",
+   "source": "function 0x100544c7c"
+  },
+  {
+   "name": "key state font",
+   "group": "keypad",
+   "value": 13.0,
+   "unit": "pt",
+   "source": "function 0x100544c7c"
+  },
+  {
+   "name": "key body font",
+   "group": "keypad",
+   "value": 12.0,
+   "unit": "pt",
+   "source": "function 0x100544c7c"
   }
  ]
 }

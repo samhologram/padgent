@@ -80,12 +80,15 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
     let mut length = 0usize;
     let mut tty = String::new();
     let mut term = String::new();
+    let mut pid = String::new();
     for l in lines {
         let lower = l.to_ascii_lowercase();
         if let Some(i) = l.find(':') {
             let (k, v) = (l[..i].trim().to_ascii_lowercase(), l[i + 1..].trim().to_string());
             if k == "x-tty" && v.len() < 64 {
                 tty = v;
+            } else if k == "x-pid" && v.len() < 12 {
+                pid = v;
             } else if k == "x-term" && v.len() < 64 {
                 term = v;
             }
@@ -110,8 +113,22 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
             Ok(n) => body.extend_from_slice(&chunk[..n]),
         }
     }
+    if method == "GET" && path == "/sessions" {
+        // The sessions on the keypad, in key order (read-only, for scripts).
+        let list: Vec<Value> = core
+            .lock()
+            .map(|c| {
+                c.visible()
+                    .iter()
+                    .map(|s| serde_json::json!({ "agent": s.agent, "session": s.id, "title": s.title, "state": s.activity, "unread": s.unread, "text": s.text }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        respond(&mut stream, 200, &Value::Array(list).to_string());
+        return false;
+    }
     if method == "GET" && (path == "/health" || path == "/") {
-        respond(&mut stream, 200, "{\"ok\":true,\"app\":\"legacy-rs\"}");
+        respond(&mut stream, 200, "{\"ok\":true,\"app\":\"agentpad\"}");
         return false;
     }
     if method != "POST" {
@@ -126,9 +143,41 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
         if !term.is_empty() {
             o.insert("_term".into(), Value::String(term));
         }
+        if !pid.is_empty() {
+            if agent_is_claude(&path) {
+                if let Some(name) = pid
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+                    .and_then(crate::integrations::claude_session_file)
+                    .and_then(|v| v.get("name").and_then(Value::as_str).map(str::to_string))
+                    .filter(|n| !n.trim().is_empty())
+                {
+                    o.entry("title").or_insert(Value::String(name));
+                }
+            }
+            o.insert("_pid".into(), Value::String(pid));
+        }
     }
     if !json.is_object() {
         respond(&mut stream, 400, "{\"error\":\"expected a JSON object\"}");
+        return false;
+    }
+    // POST /open {"agent","session"}: open a session as a key tap would (for scripts).
+    if method == "POST" && path == "/open" {
+        let agent = json.get("agent").and_then(Value::as_str).unwrap_or("").to_string();
+        let session = json.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+        let found = core.lock().ok().and_then(|c| {
+            let s = c.sessions.iter().find(|s| s.agent == agent && s.id == session)?.clone();
+            Some((c.agents.iter().find(|a| a.id == s.agent).cloned(), s))
+        });
+        match found {
+            Some((def, s)) => {
+                crate::mac::on_main(Box::new(move || crate::integrations::open_exact(def.as_ref(), &s)));
+                respond(&mut stream, 200, "{}");
+            }
+            None => respond(&mut stream, 404, "{\"error\":\"no such session\"}"),
+        }
         return false;
     }
     let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -161,4 +210,8 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
         respond(&mut stream, 404, "{\"error\":\"unknown agent: add it in Agents or import its file\"}");
     }
     known
+}
+
+fn agent_is_claude(path: &str) -> bool {
+    path.trim_matches('/').split('/').nth(1) == Some("claude-code")
 }

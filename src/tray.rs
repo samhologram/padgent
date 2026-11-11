@@ -7,6 +7,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 pub struct Tray {
     icon: TrayIcon,
     signature: String,
+    text_signature: String,
+    rebuilt: std::time::Instant,
     last_waiting: Option<usize>,
 }
 
@@ -64,7 +66,7 @@ impl Tray {
             .with_menu(Box::new(Menu::new()))
             .build()
             .ok()?;
-        Some(Tray { icon, signature: String::new(), last_waiting: None })
+        Some(Tray { icon, signature: String::new(), text_signature: String::new(), rebuilt: std::time::Instant::now(), last_waiting: None })
     }
 
     pub fn update(&mut self, core: &Core) {
@@ -86,14 +88,20 @@ impl Tray {
         }
 
         let mut sig = format!("{}|{}|", core.control_label(), core.in_control);
+        let mut text_sig = String::new();
         for s in vis.iter().take(12) {
-            let text: String = s.text.chars().take(60).collect();
-            sig.push_str(&format!("{}:{:?}:{}:{};", s.key(), s.activity, s.title, text));
+            sig.push_str(&format!("{}:{:?}:{};", s.key(), s.activity, s.title));
+            text_sig.extend(s.text.chars().take(60));
+            text_sig.push(';');
         }
-        if sig == self.signature {
+        let structural = sig != self.signature;
+        let text_only = !structural && text_sig != self.text_signature;
+        if !structural && !(text_only && self.rebuilt.elapsed().as_secs_f64() >= 2.0) {
             return;
         }
         self.signature = sig;
+        self.text_signature = text_sig;
+        self.rebuilt = std::time::Instant::now();
 
         let menu = Menu::new();
         let _ = menu.append(&MenuItem::new(core.control_label(), false, None));
@@ -105,9 +113,11 @@ impl Tray {
             let agent = core.agent(&s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
             let line = format!("{}  {} — {} · {}", emoji(s.activity.group()), s.title, agent, s.activity.label());
             let _ = menu.append(&MenuItem::with_id(format!("open:{}", s.key()), line, true, None));
-            if !s.text.is_empty() {
-                let text: String = s.text.chars().take(64).collect();
-                let more = if s.text.chars().count() > 64 { "…" } else { "" };
+            let recent = crate::model::now() - s.text_at <= crate::model::RECENT_TEXT_S;
+            let line = crate::model::key_text(if recent { &s.text } else { "" }, s.unread, s.activity);
+            if !line.is_empty() {
+                let text: String = line.chars().take(64).collect();
+                let more = if line.chars().count() > 64 { "…" } else { "" };
                 let _ = menu.append(&MenuItem::new(format!("        {text}{more}"), false, None));
             }
         }

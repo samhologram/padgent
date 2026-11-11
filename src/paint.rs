@@ -249,13 +249,13 @@ fn paint_field(p: &Painter, r: Rect, fp: &crate::field::Field, orb: Color32, glo
     for (lx, ly, ls, li) in [fp.l1, fp.l2] {
         if li > 0.005 {
             glow(&p, at(lx, ly), ls * k * 2.4, glowc, (li * 1.5).min(1.0));
-            p.circle_filled(at(lx, ly), ls * k * 0.35, with_alpha(lerp_color(orb, white(1.0), 0.5), li));
+            p.circle_filled(at(lx, ly), (ls * k * 0.4).max(3.0), with_alpha(lerp_color(orb, white(1.0), 0.55), li.min(1.0)));
         }
     }
     if fp.ripple > 0.001 {
         for i in 0..3 {
             let s = (t / 1.5 + i as f32 / 3.0).fract();
-            p.circle_stroke(c, k * (fp.cs + 0.26 * s), Stroke::new(1.4, with_alpha(orb, fp.ripple * 2.5 * (1.0 - s))));
+            p.circle_stroke(c, k * (fp.cs + 0.26 * crate::field::ANIM_SCALE * s), Stroke::new(1.4, with_alpha(orb, fp.ripple * 2.5 * (1.0 - s))));
         }
     }
     if fp.ci > 0.001 {
@@ -269,7 +269,7 @@ fn paint_field(p: &Painter, r: Rect, fp: &crate::field::Field, orb: Color32, glo
             let ang = crate::field::hash(i, step) * TAU;
             let d = crate::field::hash(i + 97, step) * fp.hs * k;
             let q = c + vec2(ang.cos(), ang.sin()) * d;
-            p.circle_filled(q, 0.9, with_alpha(lerp_color(orb, white(1.0), 0.6), fp.grain * 5.0 * crate::field::hash(i + 7, step)));
+            p.circle_filled(q, (k * 0.012).max(1.6), with_alpha(lerp_color(orb, white(1.0), 0.6), (fp.grain * 7.0 * crate::field::hash(i + 7, step)).min(1.0)));
         }
     }
 }
@@ -283,7 +283,7 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     let orb = c32(f.orb);
     let glowc = c32(f.glow);
     let g = f.activity.group();
-    let mut fp = crate::field::params(f.activity, f.tool, phase, age, reduced);
+    let mut fp = crate::field::params(f.activity, f.tool, phase, age, reduced).scaled(crate::field::ANIM_SCALE);
     if f.dots {
         fp.ci *= 0.35;
     }
@@ -339,25 +339,67 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
         p.text(pos2(r.right() - k * 0.09, r.top() + k * 0.12), Align2::RIGHT_CENTER, format!("×{}", f.subagents), FontId::proportional(k * 0.075), white(0.75));
     }
 
-    // Agent badge, name and live text underneath the light.
+    // Agent badge and name, then the state in legacy's words with its age, then what it's
+    // doing (live), its unread count or its last turn, and the last message.
     let x = r.left() + k * 0.08;
-    let title_y = r.top() + k * 0.585;
-    let badge_rect = Rect::from_min_size(pos2(x, title_y + k * 0.005), vec2(k * 0.17, k * 0.105));
-    p.rect_filled(badge_rect, CornerRadius::same((k * 0.05) as u8), with_alpha(orb, 0.28));
-    p.text(badge_rect.center(), Align2::CENTER_CENTER, &f.badge, FontId::proportional(k * 0.068), white(0.92));
     let w = k * 0.84;
+    let title_y = r.top() + k * 0.5;
+    let badge_rect = Rect::from_min_size(pos2(x, title_y + k * 0.01), vec2(k * 0.2, k * 0.12));
+    p.rect_filled(badge_rect, CornerRadius::same((k * 0.055) as u8), with_alpha(c32(f.agent_colour), 0.55));
+    p.text(badge_rect.center(), Align2::CENTER_CENTER, &f.badge, FontId::proportional(k * 0.08), white(0.95));
     let tx = badge_rect.right() + k * 0.035;
-    let mut job = egui::text::LayoutJob::simple_singleline(f.title.clone(), FontId::proportional(k * 0.1), white(0.96));
+    let mut job = egui::text::LayoutJob::simple_singleline(f.title.clone(), FontId::proportional(k * 0.125), white(0.96));
     job.wrap.max_width = r.right() - k * 0.08 - tx;
     job.wrap.max_rows = 1;
     job.wrap.overflow_character = Some('…');
     let galley = p.layout_job(job);
     p.galley(pos2(tx, title_y), galley, white(0.96));
-    let live = if f.text.is_empty() || f.focus_header { f.activity.label().to_string() } else { f.text.clone() };
-    let caret = matches!(f.activity, Activity::Streaming | Activity::Thinking) && (cx.t * 2.0) as i64 % 2 == 0 && !f.text.is_empty();
-    let shown = if caret { format!("{live}▍") } else { live };
-    let col = if g == Group::Waiting { lerp_color(cx.waiting, white(0.9), 0.35) } else { white(0.62) };
-    text_block(p, pos2(x, title_y + k * 0.13), w, &shown, k * 0.078, col, 2, false);
+
+    let sy = title_y + k * 0.155;
+    let state_col = match g {
+        Group::Waiting => lerp_color(cx.waiting, white(1.0), 0.2),
+        Group::Error => Color32::from_rgb(240, 110, 90),
+        Group::Working => lerp_color(orb, white(1.0), 0.4),
+        Group::Offline => white(0.4),
+        _ => white(0.6),
+    };
+    p.text(pos2(x, sy), Align2::LEFT_TOP, state_word(f.activity), FontId::proportional(k * 0.095), state_col);
+    let corner = crate::model::age_compact(f.last_turn, t);
+    if !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
+        p.text(pos2(r.right() - k * 0.08, sy), Align2::RIGHT_TOP, corner, FontId::proportional(k * 0.085), white(0.5));
+    }
+    let ly = sy + k * 0.125;
+    if f.focus_header {
+        text_block(p, pos2(x, ly), w, f.activity.label(), k * 0.088, white(0.6), 2, false);
+    } else if matches!(g, Group::Working | Group::Waiting) {
+        let live = if f.text.is_empty() {
+            if g == Group::Working { "…".to_string() } else { f.activity.label().to_string() }
+        } else {
+            f.text.clone()
+        };
+        let caret = matches!(f.activity, Activity::Streaming | Activity::Thinking) && (t * 2.0) as i64 % 2 == 0 && !f.text.is_empty();
+        let shown = if caret { format!("{live}▍") } else { live };
+        let col = if g == Group::Waiting { lerp_color(cx.waiting, white(0.9), 0.35) } else { white(0.7) };
+        text_block(p, pos2(x, ly), w, &shown, k * 0.088, col, 2, false);
+    } else {
+        let line = if f.unread > 0 {
+            format!("{} unread", f.unread)
+        } else if g == Group::Offline {
+            format!("{} not running", f.agent_name)
+        } else {
+            format!("last turn {}", crate::model::age_long(f.last_turn, t))
+        };
+        let col = if f.unread > 0 { lerp_color(orb, white(1.0), 0.5) } else { white(0.5) };
+        let h = text_block(p, pos2(x, ly), w, &line, k * 0.088, col, 1, false);
+        if !f.last_message.is_empty() {
+            text_block(p, pos2(x, ly + h), w, &f.last_message, k * 0.088, white(0.4), 1, false);
+        }
+    }
+}
+
+/// State word on a tile: legacy's SessionActivity.label (0x1003dceb4).
+fn state_word(a: Activity) -> &'static str {
+    if a == Activity::Empty { "Idle" } else { a.label() }
 }
 
 fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {
@@ -371,8 +413,14 @@ fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {
         p.text(c + vec2(0.0, k * 0.2), Align2::CENTER_CENTER, "waiting", FontId::proportional(k * 0.085), lerp_color(wc, white(1.0), 0.4));
     } else {
         glow(p, c, k * 0.32, white(0.8), if h.dimmed { 0.08 } else { 0.18 });
-        p.circle_stroke(c, k * 0.1, Stroke::new(2.0, white(0.7)));
-        p.text(c + vec2(0.0, k * 0.2), Align2::CENTER_CENTER, if h.working > 0 { "working" } else { "all clear" }, FontId::proportional(k * 0.085), white(0.6));
+        if h.working == 0 {
+            p.circle_stroke(c, k * 0.1, Stroke::new(2.0, white(0.7)));
+        }
+        if h.working > 0 {
+            p.text(c, Align2::CENTER_CENTER, h.working.to_string(), FontId::proportional(k * 0.2), white(0.9));
+        }
+        let label = if h.working > 0 { "working" } else { "none waiting" }; // "{n} working" (0x100b95e40)
+        p.text(c + vec2(0.0, k * 0.2), Align2::CENTER_CENTER, label, FontId::proportional(k * 0.075), white(0.6));
     }
     // One small orb per session.
     let n = h.dots.len().min(12);

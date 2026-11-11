@@ -12,6 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tiny_skia::{Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode, Stroke, Transform};
 
+/// FrameLoop.reschedule (0x10015d4dc): keep the tick interval unless it changes by more than this.
+/// legacy's FontSet (0x100544c7c): key title 15 pt (weight 600), state line 13 pt mono (500),
+/// body text 12 pt mono (400).
+const TITLE_PT: f32 = 15.0;
+const STATE_PT: f32 = 13.0;
+const BODY_PT: f32 = 12.0;
+const RESCHEDULE_THRESHOLD_S: f64 = 0.0001;
 const VENDOR: u16 = 0x046D;
 const USAGE_PAGE: u16 = 0xFF43;
 const USAGE: u16 = 0x1A10;
@@ -210,10 +217,11 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
     let k = KEY_SIZE as f32;
     let g = f.activity.group();
     let age = (t - f.since).max(0.0) as f32;
-    let mut fp = crate::field::params(f.activity, f.tool, phase, age, false);
+    let mut fp = crate::field::params(f.activity, f.tool, phase, age, false).scaled(crate::field::ANIM_SCALE);
     if f.dots {
         fp.ci *= 0.35;
     }
+    // Same placement as the on-screen key: y measured up from the bottom, light near the top.
     let at = |x: f32, y: f32| (x * k, k - (y - 0.1) * k);
     let (cx, cy) = at(fp.cx, fp.cy);
     let rr = (fp.cs * k).max(k * 0.08);
@@ -238,17 +246,29 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
         if li > 0.005 {
             let (x, y) = at(lx, ly);
             glow(pm, x, y, ls * k * 2.4, f.glow, (li * 1.5).min(1.0));
+            // A solid centre so the moving lights read as dots on the keypad's small screen.
+            fill_circle(pm, x, y, (ls * k * 0.4).max(2.0), color(f.orb.mix(Rgb(255, 255, 255), 0.55), li.min(1.0)));
         }
     }
     if fp.ripple > 0.001 {
         for i in 0..3 {
             let s = (phase / 1.5 + i as f32 / 3.0).fract();
-            stroke_poly(pm, &arc_pts(cx, cy, k * (fp.cs + 0.26 * s), 0.0, std::f32::consts::TAU), 1.2, color(f.orb, fp.ripple * 2.5 * (1.0 - s)));
+            stroke_poly(pm, &arc_pts(cx, cy, k * (fp.cs + 0.26 * crate::field::ANIM_SCALE * s), 0.0, std::f32::consts::TAU), 1.2, color(f.orb, fp.ripple * 2.5 * (1.0 - s)));
         }
     }
     if fp.ci > 0.001 {
         glow(pm, cx, cy, fp.cs * k * 2.4, f.orb, fp.ci.min(1.0));
         fill_circle(pm, cx, cy, fp.cs * k * 0.62, color(f.orb.mix(Rgb(255, 255, 255), 0.45), fp.ci));
+    }
+    if fp.grain > 0.001 {
+        // Sparkle that re-seeds at the state's grain rate, sized to show at 118 px.
+        let step = (phase / fp.grain_rate.max(0.02)) as u32;
+        for i in 0..14u32 {
+            let ang = crate::field::hash(i, step) * std::f32::consts::TAU;
+            let d = crate::field::hash(i + 97, step) * fp.hs * k;
+            let a = (fp.grain * 7.0 * crate::field::hash(i + 7, step)).min(1.0);
+            fill_circle(pm, cx + ang.cos() * d, cy + ang.sin() * d, 1.6, color(f.orb.mix(Rgb(255, 255, 255), 0.6), a));
+        }
     }
     let ink = crate::colour::ink_on(f.orb);
     if f.dots {
@@ -270,16 +290,43 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
             _ => {}
         }
     }
-    // Badge, name and live text underneath the light.
-    let ty = k * 0.70;
-    draw_text(pm, font, 10.0, 7.0, ty, &f.badge, f.orb, 0.95);
-    let title = fit(font, 13.0, &f.title, k - 30.0);
-    draw_text(pm, font, 13.0, 26.0, ty, &title, Rgb(255, 255, 255), 0.95);
-    let live = if f.text.is_empty() { f.activity.label().to_string() } else { f.text.clone() };
-    let tc = if g == Group::Waiting { f.orb.mix(Rgb(255, 255, 255), 0.35) } else { Rgb(200, 200, 205) };
-    for (i, l) in wrap(font, 10.5, &live, k - 14.0, 2).iter().enumerate() {
-        draw_text(pm, font, 10.5, 7.0, k * 0.83 + i as f32 * 12.0, l, tc, 0.85);
+    // Badge and name under the light, then the state in legacy's words, then the live text,
+    // unread count or last turn.
+    let white = Rgb(255, 255, 255);
+    let ty = k * 0.61;
+    fill_circle(pm, 13.0, ty - 5.0, 7.5, color(f.agent_colour, 0.9));
+    let ink = crate::colour::ink_on(f.agent_colour);
+    draw_text(pm, font, 8.0, 13.0 - text_width(font, 8.0, &f.badge) / 2.0, ty - 2.0, &f.badge, ink, 0.95);
+    let title = fit(font, TITLE_PT, &f.title, k - 32.0);
+    draw_text(pm, font, TITLE_PT, 25.0, ty, &title, white, 0.95);
+    // legacy's SessionActivity.label (0x1003dceb4).
+    let state = if f.activity == Activity::Empty { "Idle" } else { f.activity.label() };
+    let sc = match g {
+        Group::Waiting => waiting_tint(f.orb),
+        Group::Working => f.orb.mix(white, 0.4),
+        _ => Rgb(160, 160, 165),
+    };
+    let sy = k * 0.745;
+    draw_text(pm, font, STATE_PT, 7.0, sy, state, sc, 0.95);
+    let corner = crate::model::age_compact(f.last_turn, t);
+    if !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
+        draw_text(pm, font, BODY_PT, k - 7.0 - text_width(font, BODY_PT, &corner), sy, &corner, Rgb(150, 150, 155), 0.9);
     }
+    let live = if matches!(g, Group::Working | Group::Waiting) {
+        crate::model::key_text(&f.text, f.unread, f.activity)
+    } else if f.unread > 0 {
+        format!("{} unread", f.unread)
+    } else {
+        format!("last turn {}", crate::model::age_long(f.last_turn, t))
+    };
+    let tc = if g == Group::Waiting { f.orb.mix(white, 0.35) } else { Rgb(195, 195, 200) };
+    for (i, l) in wrap(font, BODY_PT, &live, k - 14.0, 2).iter().enumerate() {
+        draw_text(pm, font, BODY_PT, 7.0, k * 0.865 + i as f32 * 13.0, l, tc, 0.85);
+    }
+}
+
+fn waiting_tint(c: Rgb) -> Rgb {
+    c.mix(Rgb(255, 255, 255), 0.15)
 }
 
 fn render_hub(pm: &mut Pixmap, h: &HubFace, phase: f32, font: &FontVec) {
@@ -506,8 +553,9 @@ fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
         if n < 4 || buf[1] != 0xFF {
             if n == 0 { break; } else { continue; }
         }
-        if buf[0] == 0x13 && buf[2] == 0x02 && buf[3] == 0x00 && n >= 6 && buf[4] == 0x01 {
-            let now_pressed: Vec<usize> = buf[5..n].iter().take_while(|b| **b != 0).filter(|b| **b <= 9).map(|b| (*b - 1) as usize).collect();
+        if buf[0] == 0x13 && buf[2] == 0x02 && buf[3] == 0x00 && n >= 6 && buf[5] == 0x01 {
+            let now_pressed: Vec<usize> = buf[6..n].iter().take_while(|b| **b != 0).filter(|b| **b <= 9).map(|b| (*b - 1) as usize).collect();
+            crate::mac::log(&format!("keypad keys {now_pressed:?}"));
             if let Ok(mut c) = core.lock() {
                 for k in &now_pressed {
                     if !d.pressed.contains(k) {
@@ -533,6 +581,7 @@ fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
                     }
                 }
             }
+            crate::mac::log(&format!("keypad page buttons {pages:?}"));
             if let Ok(mut c) = core.lock() {
                 for i in 0..2 {
                     if pages[i] != d.pages[i] {
@@ -547,7 +596,10 @@ fn poll_input(d: &mut Device, core: &Arc<Mutex<Core>>) -> bool {
     any
 }
 
-fn send_frame(d: &mut Device, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec, waiting: Rgb, brightness: f32) -> Result<(), String> {
+/// Sends the keys that changed or animate; between key images it reads the keypad so a press
+/// is seen at once even while a full frame is going out. Returns whether a key was pressed.
+fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec, waiting: Rgb, brightness: f32) -> Result<bool, String> {
+    let mut pressed = false;
     // KEEP_ALIVE every second; without it the panel reverts to the Logi image after 3 s
     // without frames, so then the hub key is re-sent instead.
     if d.keep_alive != 0 && d.last_keep_alive.elapsed().as_secs_f64() >= KEEP_ALIVE_INTERVAL_S {
@@ -577,8 +629,38 @@ fn send_frame(d: &mut Device, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontV
         }
         d.sent[i] = Some(f.clone());
         d.last_frame = Instant::now();
+        if poll_input(d, core) {
+            run_key_actions(core);
+            pressed = true;
+        }
     }
-    Ok(())
+    Ok(pressed)
+}
+
+/// Opens what a physical key asked for on the main thread, like a click in the window.
+fn run_key_actions(core: &Arc<Mutex<Core>>) {
+    let Ok(mut c) = core.lock() else { return };
+    let actions = std::mem::take(&mut c.actions);
+    if actions.is_empty() {
+        return;
+    }
+    let (agents, sessions) = (c.agents.clone(), c.sessions.clone());
+    drop(c);
+    crate::mac::on_main(Box::new(move || {
+        for a in actions {
+            match a {
+                crate::model::Action::Open { agent, session } => {
+                    let def = agents.iter().find(|d| d.id == agent);
+                    match sessions.iter().find(|s| s.agent == agent && s.id == session) {
+                        Some(s) => crate::integrations::open_exact(def, s),
+                        None => crate::integrations::open_session(def, &session),
+                    }
+                }
+                crate::model::Action::OpenUrl(u) => crate::integrations::open_url(&u),
+                crate::model::Action::ShowWindow => crate::mac::show_app(),
+            }
+        }
+    }));
 }
 
 pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
@@ -605,7 +687,9 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     }
                 }
             };
+            let mut interval = 1.0 / 30.0_f64;
             loop {
+                let frame_start = Instant::now();
                 let (drive, control, fps, brightness) = match core.lock() {
                     Ok(c) => (c.settings.drive_physical_keypad, c.in_control, c.fps(), c.settings.brightness),
                     Err(_) => return,
@@ -685,6 +769,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     }
                     (Some(d), true) => {
                         if poll_input(d, &core) {
+                            run_key_actions(&core);
                             wake();
                         }
                         let snapshot = core.lock().ok().map(|mut c| {
@@ -692,7 +777,11 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             (c.faces(), c.waiting_colour())
                         });
                         if let Some((faces, waiting)) = snapshot {
-                            if let Err(e) = send_frame(d, &faces, crate::model::now(), &font, waiting, brightness) {
+                            let sent = send_frame(d, &core, &faces, crate::model::now(), &font, waiting, brightness);
+                            if let Ok(true) = sent {
+                                wake();
+                            }
+                            if let Err(e) = sent {
                                 // Image recovery: reopen silently after 2, 5, 15, then 30 s.
                                 dev = None;
                                 path = None;
@@ -705,7 +794,15 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     }
                     (None, false) => {}
                 }
-                std::thread::sleep(Duration::from_millis(1000 / fps.max(1) as u64));
+                // Steady frame clock: sleep only what's left of this frame's budget. Like
+                // FrameLoop.reschedule, the interval only changes when it moves by more than
+                // RESCHEDULE_THRESHOLD_S.
+                let wanted = 1.0 / fps.max(1) as f64;
+                if (wanted - interval).abs() > RESCHEDULE_THRESHOLD_S {
+                    interval = wanted;
+                }
+                let budget = Duration::from_secs_f64(interval);
+                std::thread::sleep(budget.saturating_sub(frame_start.elapsed()).max(Duration::from_millis(2)));
             }
         })
         .ok();
@@ -763,6 +860,52 @@ mod tests {
             let pm = render_key(f, crate::model::now(), &font, Rgb(230, 140, 60), 0.8);
             let j = jpeg(&pm);
             assert!(!j.is_empty() && j.len() <= MAX_SINGLE_JPEG, "jpeg {} bytes", j.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn frame_cost() {
+        let font = load_font();
+        let mut c = crate::model::Core::new(crate::model::Settings::default());
+        for (i, st) in ["thinking", "streaming", "tool", "waiting_permission", "idle", "done", "thinking", "compacting"].iter().enumerate() {
+            c.apply(crate::model::Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session": format!("s{i}"), "state": st, "text": "Rebuilding the hero with the new glass cards and a longer line"}) });
+        }
+        c.in_control = true;
+        let faces = c.faces();
+        let t0 = Instant::now();
+        let mut bytes = 0;
+        for n in 0..10 {
+            for f in faces.iter() {
+                let pm = render_key(f, n as f64 * 0.033, &font, Rgb(255, 120, 60), 1.0);
+                bytes += jpeg(&pm).len();
+            }
+        }
+        eprintln!("frame (9 keys): {:.1} ms, {} bytes/frame", t0.elapsed().as_secs_f64() * 100.0, bytes / 10);
+    }
+}
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    /// Writes the keypad's key images to AGENTPAD_KEYS_DIR to look at them.
+    #[test]
+    #[ignore]
+    fn save_keys() {
+        let Ok(dir) = std::env::var("AGENTPAD_KEYS_DIR") else { return };
+        let font = load_font();
+        let mut c = crate::model::Core::new(crate::model::Settings::default());
+        for (i, st) in ["thinking", "streaming", "tool", "waiting_permission", "idle", "done", "compacting", "error"].iter().enumerate() {
+            c.apply(crate::model::Incoming { agent: "claude-code".into(), event: None, body: serde_json::json!({"session": format!("s{i}"), "state": st, "title": format!("api-server {i}"), "text": "Tracing the 502s back to the pool"}) });
+        }
+        c.in_control = true;
+        for (i, f) in c.faces().iter().enumerate() {
+            let pm = render_key(f, 2.3, &font, Rgb(255, 120, 60), 1.0);
+            let _ = std::fs::write(format!("{dir}/key{i}.jpg"), jpeg(&pm));
         }
     }
 }

@@ -19,6 +19,9 @@ pub const HUB_KEY: usize = 8;
 pub const SESSION_KEYS_PER_PAGE: usize = 8;
 pub const FOCUS_HOLD_S: f64 = 0.6;
 pub const HAND_BACK_HOLD_S: f64 = 1.5;
+/// Holding a session key this long clears its tile until the session has something new
+/// (the person's choice; not in the original).
+pub const CLEAR_HOLD_S: f64 = 2.0;
 // Session timings (SessionTracker.Environment.live 0x10075703c → SessionTimings, applied by
 // SessionRecord.resolve 0x100749a48).
 pub const STREAMING_WINDOW_S: f64 = 1.5;
@@ -30,6 +33,69 @@ pub const REMOVE_AFTER_S: f64 = 43200.0;
 pub const SUBAGENT_FORGET_AFTER_S: f64 = 1800.0;
 /// SubagentSnapshot.doneDecaySeconds (0x1004644d4).
 pub const SUBAGENT_DONE_DECAY_S: f64 = 30.0;
+/// Estimated: how long a key keeps showing the last message before it's only the light.
+pub const RECENT_TEXT_S: f64 = 600.0;
+/// KeyMemory.advanced (0x1005000d8): text on a key stays at least 1.5 s before the next
+/// replaces it (respectDwell).
+pub const TEXT_DWELL_S: f64 = 1.5;
+
+/// Apps whose sessions come from their own records (local.rs), never from their windows.
+/// (Claude's chats have no local record, so its window is still followed while it writes.)
+pub const NATIVE_SOURCES: [&str; 1] = ["com.openai.codex"];
+
+/// What a key shows under its name: the recent last message, else unread replies, else only
+/// a waiting or error state; idle and working keys show just their light.
+pub fn key_text(text: &str, unread: u32, activity: Activity) -> String {
+    if !text.is_empty() && activity == Activity::Thinking {
+        format!("Thinking… {text}")
+    } else if !text.is_empty() && activity == Activity::WaitingQuestion {
+        format!("Question · {text}")
+    } else if !text.is_empty() {
+        text.to_string()
+    } else if activity == Activity::Thinking {
+        "Thinking…".to_string()
+    } else if unread > 0 {
+        format!("{unread} unread")
+    } else if matches!(activity.group(), Group::Waiting | Group::Error) {
+        activity.label().to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// PhaseText.clockText: whole minutes since `since`: nothing under a minute, then "Nm ago",
+/// "Nh ago" from 60 minutes, "Nd ago" from 1,440 minutes.
+pub fn age_text(since: f64, now: f64) -> String {
+    let minutes = ((now - since).max(0.0) / 60.0) as i64;
+    match minutes {
+        m if m < 1 => String::new(),
+        m if m < 60 => format!("{m}m ago"),
+        m if m < 1440 => format!("{}h ago", m / 60),
+        m => format!("{}d ago", m / 1440),
+    }
+}
+
+/// Compact age like legacy's tile corner: "33m", "1h", "2d" (nothing under a minute).
+pub fn age_compact(since: f64, now: f64) -> String {
+    let m = ((now - since).max(0.0) / 60.0) as i64;
+    match m {
+        m if m < 1 => String::new(),
+        m if m < 60 => format!("{m}m"),
+        m if m < 1440 => format!("{}h", m / 60),
+        m => format!("{}d", m / 1440),
+    }
+}
+
+/// "33 min ago", "1 h ago", "2 d ago" (legacy's "last turn …" line).
+pub fn age_long(since: f64, now: f64) -> String {
+    let m = ((now - since).max(0.0) / 60.0) as i64;
+    match m {
+        m if m < 1 => "just now".into(),
+        m if m < 60 => format!("{m} min ago"),
+        m if m < 1440 => format!("{} h ago", m / 60),
+        m => format!("{} d ago", m / 1440),
+    }
+}
 
 pub fn now() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -89,6 +155,7 @@ impl Activity {
         }
     }
 
+    /// legacy's SessionActivity.label (0x1003dceb4, jump table 0x1009e56d0).
     pub fn label(self) -> &'static str {
         use Activity::*;
         match self {
@@ -99,7 +166,7 @@ impl Activity {
             Tool => "Tool",
             Streaming => "Writing",
             WaitingPermission => "Waiting for approval",
-            WaitingQuestion => "Waiting for your answer",
+            WaitingQuestion => "Question",
             Done => "Done",
             Error => "Error",
             Compacting => "Compacting",
@@ -618,6 +685,14 @@ pub struct Session {
     /// Terminal device and program the agent runs in (from the hook's X-TTY / X-Term).
     pub tty: String,
     pub term: String,
+    /// The agent's process (from the hook's X-PID), used to find the app it runs in.
+    pub pid: i32,
+    /// Replies not yet read in the agent's own app (Codex read receipts).
+    pub unread: u32,
+    /// Cleared from the keypad at this time; it comes back with its next update.
+    pub cleared_at: Option<f64>,
+    /// Text waiting for the current one's 1.5 s dwell to pass.
+    pub pending_text: Option<String>,
 }
 
 impl Session {
@@ -681,6 +756,13 @@ pub struct SessionFace {
     pub subagents: u32,
     pub focus_header: bool,
     pub dots: bool,
+    pub unread: u32,
+    /// The last message whatever its age (shown dim on the tile, as legacy does).
+    pub last_message: String,
+    /// When the session last did something (for "last turn 33 min ago").
+    pub last_turn: f64,
+    /// The agent's own colour (badge).
+    pub agent_colour: Rgb,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -693,6 +775,8 @@ pub struct HubFace {
     pub dots: Vec<Rgb>,
     pub waiting_colour: Rgb,
     pub dimmed: bool,
+    /// Sessions per agent: (name, colour, count), as legacy's hub lists them.
+    pub agents: Vec<(String, Rgb, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -713,6 +797,7 @@ pub struct Core {
     pub hardware: Hardware,
     key_down: [Option<f64>; KEY_COUNT],
     hold_fired: [bool; KEY_COUNT],
+    clear_fired: [bool; KEY_COUNT],
     page_down: [Option<f64>; 2],
     pub actions: Vec<Action>,
     pub revision: u64,
@@ -739,6 +824,7 @@ impl Core {
             hardware: Hardware::Off,
             key_down: [None; KEY_COUNT],
             hold_fired: [false; KEY_COUNT],
+            clear_fired: [false; KEY_COUNT],
             page_down: [None; 2],
             actions: Vec::new(),
             revision: 0,
@@ -761,6 +847,9 @@ impl Core {
             .filter_map(|a| {
                 let b = self.settings.watch_apps.get(&a.id).cloned().unwrap_or_else(|| a.watch_app.clone());
                 let b = b.trim().to_string();
+                if NATIVE_SOURCES.contains(&b.as_str()) {
+                    return None;
+                }
                 let electron = a.electron || b.contains("claude") || b.contains("antigravity");
                 (!b.is_empty()).then(|| (a.id.clone(), b, electron))
             })
@@ -878,6 +967,10 @@ impl Core {
                     app_bundle: String::new(),
                     tty: String::new(),
                     term: String::new(),
+                    pid: 0,
+                    unread: 0,
+                    cleared_at: None,
+                    pending_text: None,
                 });
                 self.sessions.len() - 1
             }
@@ -891,6 +984,9 @@ impl Core {
             let v = v.trim();
             s.tty = if v.starts_with("/dev/") { v.to_string() } else { format!("/dev/{v}") };
         }
+        if let Some(v) = str_at(b, &["_pid"]).and_then(|v| v.trim().parse::<i32>().ok()) {
+            s.pid = v;
+        }
         if let Some(v) = str_at(b, &["_term"]) {
             s.term = v.to_string();
         }
@@ -898,10 +994,27 @@ impl Core {
             s.title = title;
         }
         if let Some(text) = text {
-            if text != s.text {
+            if text != s.text && !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S && b.get("_text_at").is_none() {
+                // The current text hasn't had its 1.5 s yet: show the new one after it.
+                s.pending_text = Some(text);
+            } else if text != s.text {
+                s.pending_text = None;
                 s.text = text;
+                // A message the agent's records date (Codex) keeps its own time.
+                s.text_at = b.get("_text_at").and_then(Value::as_f64).filter(|v| *v > 0.0).unwrap_or(t);
+            }
+        }
+        if b.get("_clear_text").and_then(Value::as_bool) == Some(true) {
+            // A new live step without words yet: drop the previous step's text (after its dwell).
+            if !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S {
+                s.pending_text = Some(String::new());
+            } else {
+                s.text.clear();
                 s.text_at = t;
             }
+        }
+        if let Some(n) = b.get("_unread").and_then(Value::as_u64) {
+            s.unread = n.min(999) as u32;
         }
         if activity == Activity::Tool {
             s.tool = Some(ToolKind::from_tool_name(tool_name));
@@ -949,6 +1062,11 @@ impl Core {
         let t = now();
         let mut changed = false;
         for s in &mut self.sessions {
+            if s.pending_text.is_some() && t - s.text_at >= TEXT_DWELL_S {
+                s.text = s.pending_text.take().unwrap_or_default();
+                s.text_at = t;
+                changed = true;
+            }
             let quiet = t - s.updated;
             let next = match s.activity {
                 // The sample sessions don't stream real text, so they keep their state.
@@ -979,7 +1097,7 @@ impl Core {
             self.resort();
             self.touch();
         }
-        // Hold a session key for 0.6 s → focus view.
+        // Hold a session key for 0.6 s → focus view; keep holding to 2 s → clear the tile.
         for i in 0..KEY_COUNT {
             if let Some(d) = self.key_down[i] {
                 if !self.hold_fired[i] && t - d >= FOCUS_HOLD_S && i != HUB_KEY && self.focus.is_none() {
@@ -987,6 +1105,17 @@ impl Core {
                     if let Some(s) = self.session_at(i) {
                         self.focus = Some(s.key());
                         self.touch();
+                    }
+                }
+                if self.hold_fired[i] && !self.clear_fired[i] && t - d >= CLEAR_HOLD_S && i != HUB_KEY {
+                    self.clear_fired[i] = true;
+                    if let Some(key) = self.focus.take() {
+                        if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == key) {
+                            s.cleared_at = Some(s.updated);
+                        }
+                        self.resort();
+                        self.touch();
+                        self.notify("Cleared. The key comes back when the session has something new.");
                     }
                 }
             }
@@ -1010,7 +1139,10 @@ impl Core {
         let t = now();
         let recency = self.settings.recency_minutes as f64 * 60.0;
         // Working and waiting sessions always keep a key; others only while recent.
-        let recent = |s: &&Session| matches!(s.activity.group(), Group::Working | Group::Waiting) || t - s.updated < recency;
+        let recent = |s: &&Session| {
+            let cleared = s.cleared_at.map(|c| s.updated <= c).unwrap_or(false);
+            !cleared && (matches!(s.activity.group(), Group::Working | Group::Waiting) || t - s.updated < recency)
+        };
         let mut v: Vec<&Session> = self
             .order
             .iter()
@@ -1048,8 +1180,11 @@ impl Core {
         quiet && now() - self.last_change > self.settings.idle_dim_minutes as f64 * 60.0
     }
 
+    /// FrameLoop.reschedule (0x10015d4dc): min(30, max(targetFPS, 1)), and at most 10 when
+    /// the keypad is quiet (dimmed here); the timer repeats at 1/fps.
     pub fn fps(&self) -> u32 {
-        if self.dimmed() { 10 } else { self.settings.target_fps.clamp(10, 60) }
+        let fps = self.settings.target_fps.max(1).min(30);
+        if self.dimmed() { fps.min(10) } else { fps }
     }
 
     // ---- colours
@@ -1133,7 +1268,8 @@ impl Core {
         let face_of = |s: &Session, header: bool| {
             let (orb, glow) = self.colours(s);
             let shown = ((t - s.text_at) * speed).max(0.0) as usize;
-            let text: String = s.text.chars().take(shown).collect();
+            // Only a recent last message is shown; otherwise the unread count, otherwise nothing.
+            let text: String = if t - s.text_at <= RECENT_TEXT_S { s.text.chars().take(shown).collect() } else { String::new() };
             let def = self.agent(&s.agent);
             SessionFace {
                 key: s.key(),
@@ -1149,6 +1285,10 @@ impl Core {
                 subagents: s.subagents,
                 focus_header: header,
                 dots: def.map(|d| d.style == "dots").unwrap_or(false),
+                unread: s.unread,
+                last_message: s.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string(),
+                last_turn: s.updated,
+                agent_colour: colour::rotate(colour::hex_u32(0xd9a441), self.hue_of(&s.agent) - colour::REFERENCE_HUE),
             }
         };
         if let Some(fk) = &self.focus {
@@ -1180,6 +1320,20 @@ impl Core {
             dots: vis.iter().take(12).map(|s| self.colours(s).0).collect(),
             waiting_colour: self.waiting_colour(),
             dimmed: self.dimmed(),
+            agents: {
+                let mut list: Vec<(String, Rgb, usize)> = Vec::new();
+                for s in &vis {
+                    let name = self.agent(&s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
+                    match list.iter_mut().find(|(n, _, _)| *n == name) {
+                        Some(e) => e.2 += 1,
+                        None => {
+                            let hue = self.hue_of(&s.agent);
+                            list.push((name, colour::rotate(colour::hex_u32(0xd9a441), hue - colour::REFERENCE_HUE), 1));
+                        }
+                    }
+                }
+                list
+            },
         });
         out
     }
@@ -1190,6 +1344,7 @@ impl Core {
         if i < KEY_COUNT && self.key_down[i].is_none() {
             self.key_down[i] = Some(now());
             self.hold_fired[i] = false;
+            self.clear_fired[i] = false;
         }
     }
 
@@ -1249,6 +1404,10 @@ impl Core {
     pub fn hold_progress(&self, i: usize) -> f32 {
         match self.key_down.get(i).copied().flatten() {
             Some(d) if !self.hold_fired[i] => ((now() - d) / FOCUS_HOLD_S).clamp(0.0, 1.0) as f32,
+            // After the focus view opens the ring fills again toward clearing the tile.
+            Some(d) if !self.clear_fired[i] && self.focus.is_some() => {
+                (((now() - d) - FOCUS_HOLD_S) / (CLEAR_HOLD_S - FOCUS_HOLD_S)).clamp(0.0, 1.0) as f32
+            }
             _ => 0.0,
         }
     }
@@ -1353,6 +1512,10 @@ impl Core {
                 app_bundle: String::new(),
                 tty: String::new(),
                 term: String::new(),
+                pid: 0,
+                unread: 0,
+                cleared_at: None,
+                pending_text: None,
             });
         }
         self.resort();
@@ -1396,4 +1559,43 @@ pub fn wrap_chunks(text: &str, keys: usize, per_key: usize) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_text_waits_for_the_dwell() {
+        let mut c = Core::new(Settings::default());
+        c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"streaming","text":"first"}) });
+        c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"streaming","text":"second"}) });
+        assert_eq!(c.sessions[0].text, "first");
+        assert_eq!(c.sessions[0].pending_text.as_deref(), Some("second"));
+        c.sessions[0].text_at -= TEXT_DWELL_S;
+        c.tick();
+        assert_eq!(c.sessions[0].text, "second");
+    }
+
+    #[test]
+    fn age_clock_like_legacy() {
+        assert_eq!(age_text(0.0, 59.0), "");
+        assert_eq!(age_text(0.0, 5.0 * 60.0), "5m ago");
+        assert_eq!(age_text(0.0, 61.0 * 60.0), "1h ago");
+        assert_eq!(age_text(0.0, 1441.0 * 60.0), "1d ago");
+    }
+
+    #[test]
+    fn long_hold_clears_until_next_update() {
+        let mut c = Core::new(Settings::default());
+        c.in_control = true;
+        c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"idle","title":"A"}) });
+        assert_eq!(c.visible().len(), 1);
+        let key = c.visible()[0].key();
+        c.sessions[0].cleared_at = Some(c.sessions[0].updated);
+        assert_eq!(c.visible().len(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"thinking"}) });
+        assert_eq!(c.visible()[0].key(), key);
+    }
 }

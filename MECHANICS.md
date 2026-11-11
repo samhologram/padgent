@@ -114,7 +114,7 @@ p < 0.5 → 4p³, else 1 − (2 − 2p)³ / 2; slot = (index mod 3, index div 3)
 * Interface match: Logitech vendor 0x046D, usage page 0xFF43, usage 0x1A10 (isVendorInterface 0x10049cf34).
 * Features: 0x1B04 (reprogrammable controls: divert the page buttons), 0x8040 (LCD brightness).
 * Page buttons: control IDs 0x01A1 (previous) and 0x01A2 (next) (InputParser.parse 0x1004aff60).
-* Key presses: input report 0x13, byte 2 = 0x02, byte 3 = 0x00, byte 4 = 0x01, then pressed key numbers 1–9.
+* Key presses: input report 0x13, byte 1 = 0xFF, byte 2 = 0x02, byte 3 = 0x00, byte 5 = 0x01, then the pressed key numbers 1–9 from byte 6 until a 0 (InputParser.parse reads [x0+0x25] and the list from +0x26).
 * Image ACK: input report 0x13 / 0x02 / 0x2B; status (0,0|1) ok, (1,1) busy, 0xFB error (ackStatus 0x1004afef0).
 * HID++ request: 20 bytes `11 FF <featureIndex> <function<<4 | 0x0E> <16 params>` (HIDPPFrame.request 0x1004afb0c).
 * Key image packets (VLPFraming.packets 0x1004af5c0): 4095-byte reports starting `14 FF 02 2B`, byte 4 =
@@ -176,7 +176,7 @@ size 0.1, grain rate 0.2. Fixed values traced per state:
 | state | values |
 |---|---|
 | offline | ring r 0.13, w 0.032, i 0.55 (no core) |
-| idle | core 0.1, halo 0.3; breath and drift on a 6 s clock |
+| idle | core 0.1, halo 0.3; (ci, hi) = (0.62, 0.18)·k, k = 0.9 + 0.1·smoothstep(0.5 − 0.5·sin(2π·0.13·t)) (0x10052f91c, vector 0x1009f15f8); core x drifts 0.015 by value noise at 0.05/s (0x10052fc54) |
 | starting | halo 0.34; fades in over 1.4 s, ring every 1.6 s |
 | thinking | halo i 0.3, light1 i 0.3, light2 size 0.11 i 0.26, grain 0.1 @ 0.22; core pulse 3.2 s (±0.07 around 0.88), lights circle at 5.3 s / 11 s |
 | tool | core 0.095, halo 0.32, lights size 0.052 / 0.062 moved by ToolMotion.frame per tool |
@@ -195,3 +195,98 @@ Apple Events ("exact terminal tab focus"). The rebuild: a followed app's convers
 by raising the window with that title or pressing the sidebar entry with that title; a Claude
 Code / Codex session's tab is found by the terminal device its hook reports (X-TTY) in Terminal or
 iTerm2; other terminals are brought forward. Each listed conversation gets its own key.
+
+## Bringing a session's app to the front
+* `HostAppActivator.bringForward` (0x100824d8c): `NSApp yieldActivationToApplication:` the app,
+  then `activateFromApplication:currentApplication options:ActivateAllWindows`, else
+  `activateWithOptions:`; if that failed or the app has no on-screen window
+  (`CGWindowListCopyWindowInfo` with options 0x11, owner pid, layer 0), reopen it through
+  `NSWorkspace openApplicationAtURL:` with `activates = true`.
+* `HostAppActivator.activateHostApp(for:)` (0x1008234e4): from the agent's process walk up at most
+  64 parents to the first app with a regular activation policy, then bring it forward.
+* `TerminalFocusScript.make` (0x10084d6e0): only for a tty "/dev/" + `\Atty[A-Za-z0-9]*\z`.
+  Terminal (`com.apple.Terminal`): find the tab whose tty matches, `set selected`, un-minimize the
+  window, `set index of targetWindow to 1`, `activate`. iTerm2 (`com.googlecode.iterm2`): find the
+  session, `select` session, tab and window after un-minimizing, `activate`. Both start with
+  "if application id … is not running then return false" and run `with timeout of 2 seconds`.
+* Key presses from the physical keypad are handled on the main thread whatever the window does.
+
+## Opening a session — `AppController.openHost` (0x10009c96c)
+* Claude Code inside the Claude desktop app: `ClaudeSessionFile.desktopURL(pid:sessionID:configDirectory:)`
+  (0x10009e994) reads `<config>/sessions/<pid>.json` (config = $CLAUDE_CONFIG_DIR or ~/.claude,
+  0x1000c8b70; files over 64 KB are ignored); when its `sessionId` is the session, its
+  `hostSessionId` goes to `continueURL` (0x1000c8cd8): only "local_" + 1–64 of [A-Za-z0-9-], giving
+  `claude://code/continue?session=<hostSessionId>`, which opens that exact conversation.
+* Otherwise the terminal host of the agent's process (`activateHostApp`) and its tab.
+* `hostBundleID(for:)` (0x1000e2af0): codex → com.openai.codex, zcode → dev.zcode.app,
+  antigravity → com.google.antigravity, kimiCode → com.kimi.code.desktop.
+* The rebuild also titles Claude Code keys with the session file's `name`.
+
+## Which sessions are listed (like legacy: live or recent agents only)
+* Claude Code: `<config>/sessions/<pid>.json` for running processes; `status` busy → working,
+  busy then idle → done, idle → idle; the file's `name` is the key title (ClaudeSessionFile).
+* Codex: user threads (`thread_source = 'user'`, not archived, with a name or a first message)
+  from the newest `~/.codex/state_N.sqlite` (CodexStateStore.databaseURL 0x10061d058) active
+  within the recent-sessions window; the latest turn in `thread_history_N.sqlite` gives the
+  state (inProgress → working unless older than staleBusyAfter, completed → done, failed → error,
+  interrupted → idle), its final agent message the last message, and turns since the read
+  receipt's `first_unread_turn` the unread count. Tapping opens `codex://threads/<id>` (CodexAppLink,
+  0x1006174d0; ids checked by isThreadID 0x10061a884).
+* Desktop apps with their own records (Codex, Claude) aren't followed through their windows;
+  other followed apps only count while a reply is being written. No sidebar entries.
+* Under the name a key shows the last message when it is recent (10 minutes, estimated), else
+  "N unread", else only a waiting or error state.
+
+## Key text and clock — `phaseText` (0x1004fe4ac), `PhaseText.clockText` (0x10053e2e8)
+legacy's key text is the session's last text, trimmed, per state, with no time limit; idle keys
+add an age clock: whole minutes since the last activity, nothing under 1 minute, "Nm ago" under
+60, "Nh ago" under 1,440, else "Nd ago". The rebuild shows the clock in the menu bar preview, and
+on keys only the recent last message or the unread count (the person's choice).
+Holding a key 2 s clears its tile until the session's next update (the person's choice).
+
+## Live text — `Typewriter.typedCount` (0x10054f74c), `KeyMemory.advanced` (0x1005000d8)
+typed characters = clamp(⌊cps × (t − t0)⌋, 0, length) with cps 18. New text replaces a key's text
+only after the current text has shown 1.5 s (respectDwell); a finished reply is held 10 s
+(holdUntil = min(now, t) + 10); clock text refreshes after 0.1 s.
+Waiting for an answer: Codex waits come from its app-server's pending decisions in legacy
+(CodexThreadState.resolve 0x10062b414, PendingDecision), which the rebuild can't reach; the rebuild
+marks a session "waiting for your answer" when Claude Code calls its AskUserQuestion tool, or when a
+recent final reply (within 10 minutes) ends with a question mark (heuristic, estimated).
+
+## Tile layout (AgentPad's own liquid-glass keys; states as legacy shows them)
+Square glass keys as the person asked to keep: the state light (legacyParams) behind a frosted
+veil near the top, then the agent badge and title, then the state word, then what it's doing.
+State words are legacy's `SessionActivity.label` (0x1003dceb4, jump table 0x1009e56d0, words
+stored inline in the code; the long one at 0x100a97f20): Empty, Starting, Offline, Tool, Error,
+Idle, Thinking, Question, Writing, Waiting for approval, Compacting, Done. Finished and idle keys
+show the compact age on the right ("33m", "1h"; 0x10053e2e8), then "N unread" or "last turn …"
+and the last message dimmed; working and waiting keys show the live text. Hub: "{n} working"
+(0x100b95e40) / "N waiting" / "none waiting", one small light per session. Idle light intensities
+come from the idle case of legacyParams (0x10052f91c).
+
+## Frame loop (FrameLoop)
+* Rate (reschedule 0x10015d4dc, 0x10015d5e0..0x10015d644): fps = min(cap, max(targetFPS, 1)),
+  cap 30 (15 in two of its loop modes); without a preview open and with the quiet flag set,
+  fps = min(fps, 10); a preview or popover mirror forces 30. The tick interval is 1/fps.
+* The tick runs on a repeating dispatch timer from "now" (Scheduling.live 0x10015cae8), so frames
+  keep a steady clock instead of sleeping a full interval after the work; it is only
+  rescheduled when the interval changes by more than 0.0001 s (constant at 0x10015d678).
+* Render times: the last 64 are kept and their median reported (recordRenderTime 0x10016504c).
+* Menu bar (StatusItemController.refresh 0x1003cf2d0): the icon is redrawn only when its mode
+  changes (lastMode) and the title only when its text changes (lastTitle); tooltips
+  "legacy: in control" / "keypad released" / "a session needs you". AgentPad's menu, which
+  lists sessions, is rebuilt at once on a change of sessions or states and at most every 2 s
+  for live text (AgentPad's own choice, so streaming text doesn't rebuild it constantly).
+* AgentPad reads keypad presses between key images so a press is seen during a long frame.
+
+## AgentPad's own sizing (asked by the person, not legacy's)
+* The light is drawn 1.5× legacy's sizes (`field::ANIM_SCALE`): core, halo, ring radii and
+  widths, the moving lights and their distance from the core. Intensities and timing are legacy's.
+* Bigger text: on screen title 0.125, state 0.095, lines 0.088 of the key. On the keypad's
+  118 px keys the sizes are legacy's own FontSet (legacyPhoneRender.FontSet.init 0x100544c7c):
+  title 15 pt weight 600, state line 13 pt mono weight 500, body 12 pt mono weight 400. Its other
+  slots: 14.5 (600), 13.5 mono (500), 36 (500), 13/12/11, 19, 24 mono, 20 mono, 14.5 mono, 12 and
+  12 mono (700), 17 and 22 (700); fonts Google Sans Flex / Google Sans Code, else the system
+  fonts ("fonts: Google Sans Flex/Code not found … using system fonts").
+* Sparkle (grain) dots are at least 1.6 px and the moving lights have a solid centre, so they
+  show at the keypad's resolution.

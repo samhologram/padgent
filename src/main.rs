@@ -3,6 +3,7 @@
 mod colour;
 mod field;
 mod hardware;
+mod local;
 mod icon;
 mod integrations;
 mod mac;
@@ -86,6 +87,24 @@ fn setup_style(ctx: &egui::Context) {
             f.insert(0, "sf".into());
         }
     }
+    let mut mono = vec![];
+    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/SFNSMono.ttf") {
+        fonts.font_data.insert("sfmono".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        mono.push("sfmono".to_string());
+    }
+    let mut bold = vec![];
+    if let Ok(bytes) = std::fs::read("/System/Library/Fonts/Menlo.ttc") {
+        // Menlo.ttc holds Regular, Bold, Italic, Bold Italic: face 1 is Bold.
+        let mut fd = egui::FontData::from_owned(bytes);
+        fd.index = 1;
+        fonts.font_data.insert("menlobold".into(), Arc::new(fd));
+        bold.push("menlobold".to_string());
+    }
+    let fallback: Vec<String> = fonts.families.get(&egui::FontFamily::Monospace).cloned().unwrap_or_default();
+    mono.extend(fallback.iter().cloned());
+    bold.extend(mono.iter().cloned());
+    fonts.families.insert(egui::FontFamily::Name("mono".into()), mono);
+    fonts.families.insert(egui::FontFamily::Name("monobold".into()), bold);
     ctx.set_fonts(fonts);
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals(egui::Visuals::dark());
@@ -168,11 +187,17 @@ impl App {
                 }
             }
             mac::set_menu_bar_app();
-            let port = core.lock().map(|c| c.settings.hook_port).unwrap_or(47800);
+            let port = std::env::var("AGENTPAD_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| core.lock().map(|c| c.settings.hook_port).unwrap_or(47800));
             server::start(core.clone(), port, wake.clone());
             integrations::upgrade_claude_hooks(port);
-            hardware::start(core.clone(), wake.clone());
+            if std::env::var("AGENTPAD_NO_KEYPAD").is_err() {
+                hardware::start(core.clone(), wake.clone());
+            }
             watch::start(core.clone(), wake.clone());
+            local::start(core.clone(), wake.clone());
             tray = tray::Tray::new();
             // Repair a stale Accessibility entry left by an earlier build, once per signature.
             let rc = core.clone();
@@ -191,10 +216,39 @@ impl App {
             });
             let events = menu_events.clone();
             let w2 = wake.clone();
+            let mc = core.clone();
             tray_icon::menu::MenuEvent::set_event_handler(Some(move |e: tray_icon::menu::MenuEvent| {
                 let id = e.id().0.clone();
+                mac::log(&format!("menu: {id}"));
                 if id == "show" || id == "settings" {
                     mac::show_app();
+                }
+                if let Some(key) = id.strip_prefix("open:") {
+                    // Open now: this runs on the main thread even while the window is hidden.
+                    let found = mc.lock().ok().and_then(|c| {
+                        let (agent, session) = key.split_once(':')?;
+                        let s = c.sessions.iter().find(|s| s.agent == agent && s.id == session)?.clone();
+                        Some((c.agents.iter().find(|a| a.id == s.agent).cloned(), s))
+                    });
+                    match found {
+                        Some((def, s)) => integrations::open_exact(def.as_ref(), &s),
+                        None => mac::log(&format!("menu: no session for {key}")),
+                    }
+                    return;
+                }
+                if id == "toggle" {
+                    if let Ok(mut c) = mc.lock() {
+                        if c.in_control { c.release() } else { c.take_over() }
+                    }
+                    w2();
+                    return;
+                }
+                if id == "quit" {
+                    hardware::shutdown(&mc);
+                    if let Ok(c) = mc.lock() {
+                        c.settings.save();
+                    }
+                    std::process::exit(0);
                 }
                 if let Ok(mut v) = events.lock() {
                     v.push(id);
@@ -235,7 +289,10 @@ impl App {
         };
         for a in actions {
             match a {
-                Action::Open { agent, session } => self.open_exact(&agents, &agent, &session),
+                Action::Open { agent, session } => {
+                    mac::log(&format!("click: open {agent}:{session}"));
+                    self.open_exact(&agents, &agent, &session)
+                }
                 Action::OpenUrl(u) => integrations::open_url(&u),
                 Action::ShowWindow => {
                     mac::show_app();
@@ -481,7 +538,7 @@ impl App {
         p.text(
             pos2(dev.center().x, dev.bottom() + 16.0),
             Align2::CENTER_CENTER,
-            "Hold a key 0.6 s for its focus view · ‹ › page · hold both 1.5 s to hand back to Options+",
+            "Hold a key 0.6 s for its focus view, 2 s to clear it · ‹ › page · hold both 1.5 s to hand back to Options+",
             FontId::proportional(11.5),
             white(0.45),
         );
@@ -540,10 +597,17 @@ impl App {
             job.wrap.overflow_character = Some('…');
             let title = p.layout_job(job);
             p.galley(pos2(row.left() + 38.0, row.top() + 9.0), title, white(0.95));
-            let meta = format!("{agent} · {}", s.activity.label());
+            let age = model::age_text(s.updated, model::now());
+            let meta = if age.is_empty() || g != Group::Idle {
+                format!("{agent} · {}", s.activity.label())
+            } else {
+                format!("{agent} · {} · {age}", s.activity.label())
+            };
             p.text(pos2(row.left() + 38.0, row.top() + 33.0), Align2::LEFT_CENTER, meta, FontId::proportional(11.5), if g == Group::Waiting { c32(c.waiting_colour()) } else { white(0.55) });
-            if !s.text.is_empty() {
-                let mut job = egui::text::LayoutJob::simple_singleline(s.text.clone(), FontId::proportional(11.0), white(0.42));
+            let recent = model::now() - s.text_at <= model::RECENT_TEXT_S;
+            let line = model::key_text(if recent { &s.text } else { "" }, s.unread, s.activity);
+            if !line.is_empty() {
+                let mut job = egui::text::LayoutJob::simple_singleline(line.clone(), FontId::proportional(11.0), white(0.42));
                 job.wrap.max_width = row.width() - 46.0;
                 job.wrap.max_rows = 1;
                 job.wrap.overflow_character = Some('…');
@@ -774,14 +838,18 @@ impl App {
                     } else {
                         hint(ui, "Point the agent's hooks (or any script) at this command; it reads the hook JSON from standard input:");
                         let cmd = integrations::hook_command(&a.id, port);
-                        ui.add(egui::TextEdit::multiline(&mut cmd.clone()).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY));
+                        // Read-only but selectable, so ⌘C works on a selection too.
+                        ui.add(egui::TextEdit::multiline(&mut cmd.as_str()).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY));
                         if ui.button("Copy hook command").clicked() {
-                            ui.ctx().copy_text(cmd);
+                            ui.ctx().copy_text(cmd.clone());
+                            self.agent_notes = vec![if integrations::copy_to_clipboard(&cmd) { "Hook command copied.".into() } else { "Couldn't copy: select the command and press ⌘C.".into() }];
                         }
                         hint(ui, "Or post a state directly:");
                         let ex = integrations::example_event(&a.id, port);
+                        ui.add(egui::TextEdit::multiline(&mut ex.as_str()).font(egui::TextStyle::Monospace).desired_rows(2).desired_width(f32::INFINITY));
                         if ui.button("Copy example").clicked() {
-                            ui.ctx().copy_text(ex);
+                            ui.ctx().copy_text(ex.clone());
+                            self.agent_notes = vec![if integrations::copy_to_clipboard(&ex) { "Example copied.".into() } else { "Couldn't copy: select the example and press ⌘C.".into() }];
                         }
                     }
                     ui.separator();

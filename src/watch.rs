@@ -10,14 +10,13 @@ use std::time::Duration;
 
 /// Opens a followed app on one conversation: raise the window with that title, or press the
 /// sidebar entry with that title (the way legacy opens an exact task "through Accessibility").
-pub fn focus_conversation(bundle: &str, title: &str, electron: bool) {
-    let _ = std::process::Command::new("open").args(["-b", bundle]).status();
+pub fn focus_conversation(bundle: &str, title: &str, electron: bool) -> bool {
     #[cfg(target_os = "macos")]
     {
         if !ax::trusted() {
-            return;
+            return false;
         }
-        std::thread::sleep(Duration::from_millis(350));
+        std::thread::sleep(Duration::from_millis(250));
         fn find(el: ax::CFTypeRef, title: &str, depth: usize, budget: &mut usize) -> bool {
             if depth > 40 || *budget == 0 {
                 return false;
@@ -55,22 +54,43 @@ pub fn focus_conversation(bundle: &str, title: &str, electron: bool) {
                 if !title.is_empty() && t.contains(title) {
                     ax::press(*w, "AXRaise");
                     ax::set_true(*w, "AXMain");
-                    return;
+                    return true;
                 }
             }
             for w in &wins {
                 let mut budget = 5000;
                 if find(*w, title, 0, &mut budget) {
                     ax::press(*w, "AXRaise");
-                    return;
+                    ax::set_true(*w, "AXMain");
+                    return true;
                 }
             }
         }
     }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (bundle, title, electron);
+    false
 }
 
 /// Running apps with a bundle id, for picking which app an agent follows.
 pub fn running_apps() -> Vec<(String, String)> {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Vec<(String, String)>)>> = Mutex::new(None);
+    if let Ok(mut c) = CACHE.lock() {
+        if let Some((at, v)) = c.as_ref() {
+            if at.elapsed() < Duration::from_secs(2) {
+                return v.clone();
+            }
+        }
+        let v = running_apps_now();
+        *c = Some((Instant::now(), v.clone()));
+        return v;
+    }
+    running_apps_now()
+}
+
+fn running_apps_now() -> Vec<(String, String)> {
     #[cfg(target_os = "macos")]
     {
         use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
@@ -94,6 +114,23 @@ pub fn running_apps() -> Vec<(String, String)> {
 }
 
 pub fn trusted() -> bool {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+    if let Ok(mut c) = CACHE.lock() {
+        if let Some((at, v)) = *c {
+            if at.elapsed() < Duration::from_secs(2) {
+                return v;
+            }
+        }
+        let v = trusted_now();
+        *c = Some((Instant::now(), v));
+        return v;
+    }
+    trusted_now()
+}
+
+fn trusted_now() -> bool {
     #[cfg(target_os = "macos")]
     return ax::trusted();
     #[cfg(not(target_os = "macos"))]
@@ -412,6 +449,14 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                 }
                             }
                             let id = if title.is_empty() { "current".to_string() } else { title.to_string() };
+                            // A Claude Code conversation in the Claude app already has its own key.
+                            let is_code = core
+                                .lock()
+                                .map(|c| c.sessions.iter().any(|s| s.agent == "claude-code" && s.title == id))
+                                .unwrap_or(false);
+                            if is_code {
+                                continue;
+                            }
                             let key = (agent.to_string(), id.clone());
                             let prev = last.get(&key).cloned();
                             let state = if w.generating {
@@ -423,6 +468,10 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             } else {
                                 continue_state(&prev)
                             };
+                            // Only conversations that are (or were just) writing are sessions.
+                            if prev.is_none() && !w.generating {
+                                continue;
+                            }
                             let changed = prev.as_ref() != Some(&(w.generating, w.last_text.clone()));
                             if !changed {
                                 continue;
@@ -438,28 +487,6 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                 });
                             }
                             wake();
-                        }
-                        // One key per conversation: recent conversations from the sidebar.
-                        for w in windows(pid, electron) {
-                            let active = w.title.trim().to_string();
-                            for title in w.recent.iter().take(8) {
-                                if *title == active {
-                                    continue;
-                                }
-                                let key = (agent.to_string(), title.clone());
-                                if last.contains_key(&key) {
-                                    continue;
-                                }
-                                last.insert(key, (false, String::new()));
-                                if let Ok(mut c) = core.lock() {
-                                    c.apply(Incoming {
-                                        agent: agent.to_string(),
-                                        event: None,
-                                        body: json!({ "session": title, "state": "idle", "title": title, "_app": bundle }),
-                                    });
-                                }
-                                wake();
-                            }
                         }
                     }
                 }
