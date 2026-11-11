@@ -190,7 +190,7 @@ fn wrap(font: &FontVec, size: f32, s: &str, max_w: f32, rows: usize) -> Vec<Stri
 
 /// Renders one key to a 118×118 picture, matching the on-screen key as closely as a
 /// small LCD allows.
-pub fn render_key(face: &KeyFace, t: f64, font: &FontVec, waiting: Rgb, brightness: f32) -> Pixmap {
+pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
     let k = KEY_SIZE as f32;
     let mut pm = Pixmap::new(KEY_SIZE, KEY_SIZE).expect("pixmap");
     pm.fill(Color::from_rgba8(14, 15, 20, 255));
@@ -208,14 +208,13 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec, waiting: Rgb, brightne
                 draw_text(&mut pm, font, 13.0, 9.0, 24.0 + i as f32 * 16.0, l, white, 0.9);
             }
         }
-        KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font, waiting),
+        KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
         KeyFace::Hub(h) => render_hub(&mut pm, h, phase, font),
     }
-    let _ = brightness; // the LCD backlight is set through feature 0x8040 instead
     pm
 }
 
-fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &FontVec, waiting: Rgb) {
+fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &FontVec) {
     // Same light field as the on-screen key (field.rs).
     let k = KEY_SIZE as f32;
     let g = f.activity.group();
@@ -228,7 +227,6 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
     let at = |x: f32, y: f32| (x * k, k - (y - 0.1) * k);
     let (cx, cy) = at(fp.cx, fp.cy);
     let rr = (fp.cs * k).max(k * 0.08);
-    let _ = waiting;
     if fp.floor > 0.001 {
         if let Some(rect) = tiny_skia::Rect::from_xywh(0.0, 0.0, k, k) {
             let path = PathBuilder::from_rect(rect);
@@ -633,7 +631,7 @@ fn image_needs_send(previous: Option<&[u8]>, current: &[u8], refresh: bool) -> b
 }
 
 /// Send only changed rendered images. Poll input and service the heartbeat between keys.
-fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec, waiting: Rgb, brightness: f32) -> Result<bool, String> {
+fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec) -> Result<bool, String> {
     let mut pressed = false;
     service_keep_alive(d)?;
     if d.last_display_update.elapsed() < DISPLAY_FRAME_INTERVAL {
@@ -642,7 +640,7 @@ fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COU
     let refresh = d.keep_alive == 0 && d.last_frame.elapsed().as_secs_f64() > KEEP_ALIVE_INTERVAL_S;
     for (i, f) in faces.iter().enumerate() {
         service_keep_alive(d)?;
-        let pm = render_key(f, t, font, waiting, brightness);
+        let pm = render_key(f, t, font);
         let jpg = jpeg(&pm);
         if jpg.is_empty() {
             return Err(format!("Could not encode keypad image for key {i}"));
@@ -801,10 +799,10 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         }
                         let snapshot = core.lock().ok().map(|mut c| {
                             c.tick();
-                            (c.faces(), c.waiting_colour())
+                            c.faces()
                         });
-                        if let Some((faces, waiting)) = snapshot {
-                            let sent = send_frame(d, &core, &faces, crate::model::now(), &font, waiting, brightness);
+                        if let Some(faces) = snapshot {
+                            let sent = send_frame(d, &core, &faces, crate::model::now(), &font);
                             if let Ok(true) = sent {
                                 wake();
                             }
@@ -906,7 +904,7 @@ mod tests {
         core.in_control = true;
         core.load_demo();
         for f in core.faces().iter() {
-            let pm = render_key(f, crate::model::now(), &font, Rgb(230, 140, 60), 0.8);
+            let pm = render_key(f, crate::model::now(), &font);
             let j = jpeg(&pm);
             assert!(!j.is_empty() && j.len() <= MAX_SINGLE_JPEG, "jpeg {} bytes", j.len());
         }
@@ -930,7 +928,7 @@ mod bench {
         let mut bytes = 0;
         for n in 0..10 {
             for f in faces.iter() {
-                let pm = render_key(f, n as f64 * 0.033, &font, Rgb(255, 120, 60), 1.0);
+                let pm = render_key(f, n as f64 * 0.033, &font);
                 bytes += jpeg(&pm).len();
             }
         }
@@ -953,7 +951,7 @@ mod preview {
         }
         c.in_control = true;
         for (i, f) in c.faces().iter().enumerate() {
-            let pm = render_key(f, 2.3, &font, Rgb(255, 120, 60), 1.0);
+            let pm = render_key(f, 2.3, &font);
             let _ = std::fs::write(format!("{dir}/key{i}.jpg"), jpeg(&pm));
         }
     }

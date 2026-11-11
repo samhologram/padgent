@@ -69,7 +69,6 @@ struct App {
     frames: u32,
     shot_done: Arc<AtomicBool>,
     shot_requested: bool,
-    quitting: bool,
     keys_prev: [bool; KEY_COUNT],
     pages_prev: [bool; 2],
     selected_agent: String,
@@ -292,7 +291,6 @@ impl App {
             frames: 0,
             shot_done: Arc::new(AtomicBool::new(false)),
             shot_requested: false,
-            quitting: false,
             keys_prev: [false; KEY_COUNT],
             pages_prev: [false; 2],
             selected_agent: "claude-code".into(),
@@ -335,22 +333,7 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                "toggle" => {
-                    if let Ok(mut c) = self.core.lock() {
-                        if c.in_control { c.release() } else { c.take_over() }
-                    }
-                }
-                "quit" => {
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                other => {
-                    if let Some(key) = other.strip_prefix("open:") {
-                        if let Some((agent, session)) = key.split_once(':') {
-                            self.open_exact(&agents, agent, session);
-                        }
-                    }
-                }
+                _ => {}
             }
         }
     }
@@ -1362,7 +1345,7 @@ impl eframe::App for App {
             }
         }
         if self.popup_open { self.popup(ctx); } else { self.cancel_popup_inputs(); }
-        if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() && !self.quitting {
+        if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }

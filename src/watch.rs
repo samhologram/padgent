@@ -466,7 +466,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             } else if prev.is_none() {
                                 "idle"
                             } else {
-                                continue_state(&prev)
+                                "done"
                             };
                             // Only conversations that are (or were just) writing are sessions.
                             if prev.is_none() && !w.generating {
@@ -495,8 +495,4 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
         .ok();
     #[cfg(not(target_os = "macos"))]
     let _ = (core, wake);
-}
-
-fn continue_state(_prev: &Option<(bool, String)>) -> &'static str {
-    "done"
 }
