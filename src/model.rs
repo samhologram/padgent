@@ -18,7 +18,7 @@ pub const HUB_KEY: usize = 8;
 pub const SESSION_KEYS_PER_PAGE: usize = 8;
 /// Idle sessions older than this stay available, but start no earlier than page two.
 pub const IDLE_SECOND_PAGE_AFTER_S: f64 = 30.0 * 60.0;
-/// Hold a session key to hide it locally until work resumes.
+/// Hold a session key to move it to the end until work resumes.
 pub const ARCHIVE_HOLD_S: f64 = 0.6;
 pub const HAND_BACK_HOLD_S: f64 = 1.5;
 // Session timings (SessionTracker.Environment.live 0x10075703c → SessionTimings, applied by
@@ -710,7 +710,7 @@ pub struct Session {
     pub pid: i32,
     /// Replies not yet read in the agent's own app (Codex read receipts).
     pub unread: u32,
-    /// Locally hidden until a new turn or resumed work.
+    /// Placed after normal sessions until a new turn or resumed work.
     pub archived: bool,
     /// Text waiting for the current one's 1.5 s dwell to pass.
     pub pending_text: Option<String>,
@@ -1159,7 +1159,7 @@ impl Core {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == key) {
                         s.archived = true;
                         self.touch();
-                        self.notify("Archived until the conversation resumes work.");
+                        self.notify("Moved to the end until the conversation resumes work.");
                     }
                 }
             }
@@ -1212,10 +1212,18 @@ impl Core {
             s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
         });
         let mut slots: Vec<Option<&Session>> = recent.into_iter().map(Some).collect();
-        if !old_idle.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE {
+        // Archived sessions remain reachable after all normal sessions, including those
+        // outside the recency window. Never fill the first page's reserved holes with them.
+        let mut archived: Vec<&Session> = self.order.iter()
+            .filter_map(|key| self.sessions.iter().find(|s| &s.key() == key))
+            .filter(|s| s.archived && self.agent_enabled(&s.agent))
+            .collect();
+        archived.extend(self.sessions.iter().filter(|s| s.archived && self.agent_enabled(&s.agent) && !self.order.contains(&s.key())));
+        if (!old_idle.is_empty() || !archived.is_empty()) && slots.len() < SESSION_KEYS_PER_PAGE {
             slots.resize(SESSION_KEYS_PER_PAGE, None);
         }
         slots.extend(old_idle.into_iter().map(Some));
+        slots.extend(archived.into_iter().map(Some));
         slots
     }
 
@@ -1446,7 +1454,7 @@ impl Core {
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == *key) {
                     s.archived = true;
                     self.touch();
-                    self.notify("Archived until the conversation resumes work.");
+                    self.notify("Moved to the end until the conversation resumes work.");
                 }
             }
         }
@@ -1454,7 +1462,7 @@ impl Core {
         match target {
             Some(KeyPressTarget::Hub) => {
                 let slots = self.keypad_slots();
-                if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| s.activity.group() == Group::Waiting)) {
+                if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| !s.archived && s.activity.group() == Group::Waiting)) {
                     self.page = pos / SESSION_KEYS_PER_PAGE;
                 } else { self.actions.push(Action::ShowWindow); }
                 self.touch();
@@ -1800,6 +1808,58 @@ mod tests {
         });
         assert!(!core.sessions[0].archived);
         assert_eq!(core.visible()[0].id, "archived");
+    }
+
+    #[test]
+    fn archived_sessions_follow_old_idle_tiles_and_return_to_normal_order_on_resume() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        let mut core = Core::new(settings);
+        core.in_control = true;
+        add_test_session(&mut core, "active", "thinking");
+        add_test_session(&mut core, "old-idle", "idle");
+        add_test_session(&mut core, "archived-waiting", "waiting_question");
+        core.sessions.iter_mut().find(|s| s.id == "old-idle").unwrap().since = now() - IDLE_SECOND_PAGE_AFTER_S - 60.0;
+        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().archived = true;
+        core.resort();
+
+        let slots = core.keypad_slots_at(now());
+        assert_eq!(slots[0].unwrap().id, "active");
+        assert!(slots[1..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none), "archives must not consume reserved page-one holes");
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "archived-waiting");
+        assert_eq!(core.waiting_count(), 0, "archived waiting sessions are absent from normal counts");
+
+        core.page = 1;
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
+        core.key_down(1);
+        core.key_up(1);
+        assert!(matches!(core.actions.as_slice(), [Action::Open { agent, session }] if agent == "codex" && session == "archived-waiting"));
+
+        core.apply(Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"archived-waiting", "state":"thinking"}),
+        });
+        assert!(!core.sessions.iter().find(|s| s.id == "archived-waiting").unwrap().archived);
+        assert_eq!(core.visible()[0].id, "archived-waiting", "resumed work returns to the ordinary recent ordering");
+        assert_eq!(core.keypad_slots_at(now())[0].unwrap().id, "archived-waiting");
+    }
+
+    #[test]
+    fn archived_waiting_session_does_not_drive_hub_navigation() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        add_test_session(&mut core, "active", "thinking");
+        add_test_session(&mut core, "archived-waiting", "waiting_question");
+        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().archived = true;
+        core.resort();
+
+        assert_eq!(core.waiting_count(), 0);
+        assert!(matches!(&core.faces()[HUB_KEY], KeyFace::Hub(hub) if hub.waiting == 0));
+        core.key_down(HUB_KEY);
+        core.key_up(HUB_KEY);
+        assert_eq!(core.page, 0, "the archived waiting tile must not redirect to its later page");
+        assert!(matches!(core.actions.as_slice(), [Action::ShowWindow]));
     }
 
     #[test]

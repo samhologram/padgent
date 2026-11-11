@@ -646,7 +646,7 @@ impl App {
         p.text(
             pos2(dev.center().x, dev.bottom() + 16.0),
             Align2::CENTER_CENTER,
-            "Hold a key 0.6 s to archive its conversation until work resumes · ‹ › page · hold both 1.5 s to hand back to Options+",
+            "Hold a key 0.6 s to move its conversation to the end until work resumes · ‹ › page · hold both 1.5 s to hand back to Options+",
             FontId::proportional(11.5),
             white(0.45),
         );
@@ -1228,7 +1228,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut s.empty_key_url).hint_text("https://… or app link").desired_width(300.0));
             });
             hint(ui, "Optional. Pressing a key with no session opens this link on this computer. Leave blank to do nothing.");
-            hint(ui, "Hold a session key for 0.6 s to archive it until the conversation resumes work.");
+            hint(ui, "Hold a session key for 0.6 s to move it to the end until the conversation resumes work.");
         });
         if format!("{:?}", c.settings) != before {
             c.revision += 1;
