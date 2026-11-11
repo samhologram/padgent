@@ -439,6 +439,7 @@ struct Device {
     pressed: Vec<usize>,
     pages: [bool; 2],
     sent: Vec<Option<Vec<u8>>>,
+    displayed_view: Option<DisplayView>,
     last_frame: Instant,
     last_display_update: Instant,
 }
@@ -531,6 +532,7 @@ fn take_over(api: &hidapi::HidApi, path: &std::ffi::CStr, brightness: f32) -> Re
         pressed: Vec::new(),
         pages: [false; 2],
         sent: vec![None; KEY_COUNT],
+        displayed_view: None,
         last_frame: Instant::now() - Duration::from_secs(5),
         last_display_update: Instant::now() - DISPLAY_FRAME_INTERVAL,
     })
@@ -630,16 +632,45 @@ fn image_needs_send(previous: Option<&[u8]>, current: &[u8], refresh: bool) -> b
     refresh || previous != Some(current)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisplayView {
+    page: usize,
+    focus: Option<String>,
+    in_control: bool,
+}
+
+fn display_view(core: &Core) -> DisplayView {
+    DisplayView { page: core.page.min(core.pages() - 1), focus: core.focus.clone(), in_control: core.in_control }
+}
+
+// A page transition must redraw every key, including empty slots.
+fn prepare_display_view(previous: &mut Option<DisplayView>, current: &DisplayView, sent: &mut [Option<Vec<u8>>]) -> bool {
+    if previous.as_ref() == Some(current) {
+        return false;
+    }
+    sent.fill(None);
+    *previous = Some(current.clone());
+    true
+}
+
 /// Send only changed rendered images. Poll input and service the heartbeat between keys.
-fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec) -> Result<bool, String> {
+fn send_frame(d: &mut Device, core: &Arc<Mutex<Core>>, view: &DisplayView, faces: &[KeyFace; KEY_COUNT], t: f64, font: &FontVec) -> Result<bool, String> {
     let mut pressed = false;
     service_keep_alive(d)?;
     if d.last_display_update.elapsed() < DISPLAY_FRAME_INTERVAL {
         return Ok(false);
     }
+    if prepare_display_view(&mut d.displayed_view, view, &mut d.sent) {
+        let empty = faces.iter().filter(|face| matches!(face, KeyFace::Empty)).count();
+        crate::mac::log(&format!("keypad refresh page {} focus {} empty {empty}", view.page + 1, view.focus.is_some()));
+    }
     let refresh = d.keep_alive == 0 && d.last_frame.elapsed().as_secs_f64() > KEEP_ALIVE_INTERVAL_S;
     for (i, f) in faces.iter().enumerate() {
         service_keep_alive(d)?;
+        // Input or another window may have changed the view since this snapshot.
+        if core.lock().map(|c| display_view(&c) != *view).unwrap_or(true) {
+            break;
+        }
         let pm = render_key(f, t, font);
         let jpg = jpeg(&pm);
         if jpg.is_empty() {
@@ -799,10 +830,10 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         }
                         let snapshot = core.lock().ok().map(|mut c| {
                             c.tick();
-                            c.faces()
+                            (display_view(&c), c.faces())
                         });
-                        if let Some(faces) = snapshot {
-                            let sent = send_frame(d, &core, &faces, crate::model::now(), &font);
+                        if let Some((view, faces)) = snapshot {
+                            let sent = send_frame(d, &core, &view, &faces, crate::model::now(), &font);
                             if let Ok(true) = sent {
                                 wake();
                             }
@@ -886,6 +917,46 @@ mod tests {
     #[test]
     fn physical_frame_cap_is_ten_hertz() {
         assert_eq!(DISPLAY_FRAME_INTERVAL, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn page_transition_invalidates_occupied_cache_so_empty_slot_image_is_sent() {
+        let mut previous = Some(DisplayView { page: 0, focus: None, in_control: true });
+        let mut sent = vec![Some(vec![0x11, 0x22]); KEY_COUNT];
+        let next = DisplayView { page: 1, focus: None, in_control: true };
+
+        assert!(prepare_display_view(&mut previous, &next, &mut sent));
+        assert!(sent.iter().all(Option::is_none));
+        let blank_slot_jpeg = [0xFF, 0xD8, 0x00, 0xFF, 0xD9];
+        assert!(image_needs_send(sent[0].as_deref(), &blank_slot_jpeg, false));
+    }
+
+    #[test]
+    fn page_transition_forces_resend_even_when_rendered_bytes_are_equal() {
+        let mut previous = Some(DisplayView { page: 0, focus: None, in_control: true });
+        let same_hub_jpeg = vec![0xFF, 0xD8, 0x42, 0xFF, 0xD9];
+        let mut sent = vec![Some(same_hub_jpeg.clone()); KEY_COUNT];
+        let next = DisplayView { page: 1, focus: None, in_control: true };
+
+        assert!(prepare_display_view(&mut previous, &next, &mut sent));
+        assert!(image_needs_send(sent[crate::model::HUB_KEY].as_deref(), &same_hub_jpeg, false));
+        assert!(!prepare_display_view(&mut previous, &next, &mut sent));
+    }
+
+    #[test]
+    fn aborted_page_transition_cannot_leave_partial_cache_as_current() {
+        let first = DisplayView { page: 0, focus: None, in_control: true };
+        let second = DisplayView { page: 1, focus: None, in_control: true };
+        let third = DisplayView { page: 2, focus: Some("codex:focus".into()), in_control: true };
+        let mut previous = Some(first);
+        let mut sent = vec![Some(vec![0x10]); KEY_COUNT];
+
+        assert!(prepare_display_view(&mut previous, &second, &mut sent));
+        // Only one key from this view reaches the device before a new view is observed.
+        sent[0] = Some(vec![0x20]);
+        assert!(prepare_display_view(&mut previous, &third, &mut sent));
+        assert_eq!(previous, Some(third));
+        assert!(sent.iter().all(Option::is_none));
     }
 
     #[test]
