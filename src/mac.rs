@@ -105,8 +105,27 @@ mod imp {
         let Some(mtm) = MainThreadMarker::new() else { return };
         for window in NSApplication::sharedApplication(mtm).windows().iter() {
             if window.title().to_string() == "Padgent Island" {
-                window.setLevel(NSStatusWindowLevel + 1);
-                window.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary);
+                if window.level() != NSStatusWindowLevel + 1 { window.setLevel(NSStatusWindowLevel + 1); }
+                let current = window.collectionBehavior();
+                let desired = current | NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary;
+                if current != desired { window.setCollectionBehavior(desired); }
+            }
+        }
+    }
+
+    /// Keep the menu keypad above the island and focus it once when it is created.
+    pub fn configure_keypad_window() {
+        use objc2_app_kit::{NSStatusWindowLevel, NSWindowCollectionBehavior};
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        for window in NSApplication::sharedApplication(mtm).windows().iter() {
+            if window.title().to_string() == "Padgent keypad" {
+                if window.level() != NSStatusWindowLevel + 2 {
+                    window.setLevel(NSStatusWindowLevel + 2);
+                    window.makeKeyAndOrderFront(None);
+                }
+                let current = window.collectionBehavior();
+                let desired = current | NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary;
+                if current != desired { window.setCollectionBehavior(desired); }
             }
         }
     }
@@ -258,6 +277,7 @@ mod imp {
     pub fn show_app() {}
     pub fn island_geometry() -> (f32, f32, f32, f32) { (0.0, 0.0, 0.0, 28.0) }
     pub fn configure_island_window() {}
+    pub fn configure_keypad_window() {}
     pub fn tray_popup_position(rect: tray_icon::Rect, width: f32, _height: f32) -> (f32, f32) {
         (rect.position.x as f32 + rect.size.width as f32 / 2.0 - width / 2.0,
             rect.position.y as f32 + rect.size.height as f32)

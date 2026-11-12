@@ -512,11 +512,12 @@ fn feature_index(dev: &hidapi::HidDevice, id: u16) -> Option<u8> {
     hidpp(dev, 0x00, 0, &[(id >> 8) as u8, id as u8]).map(|r| r[4]).filter(|i| *i != 0)
 }
 
-fn find(api: &mut hidapi::HidApi) -> Option<std::ffi::CString> {
-    let _ = api.refresh_devices();
-    api.device_list()
+fn find(api: &mut hidapi::HidApi) -> (Option<std::ffi::CString>, bool) {
+    let refreshed = api.refresh_devices().is_ok();
+    let path = api.device_list()
         .find(|d| d.vendor_id() == VENDOR && d.usage_page() == USAGE_PAGE && d.usage() == USAGE)
-        .map(|d| d.path().to_owned())
+        .map(|d| d.path().to_owned());
+    (path, refreshed)
 }
 
 fn take_over(api: &hidapi::HidApi, path: &std::ffi::CStr, brightness: f32) -> Result<Device, String> {
@@ -895,6 +896,15 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                     }
                 }
             };
+            let set_presence = |presence: Option<bool>| {
+                if let Ok(mut c) = core.lock() {
+                    if c.keypad_connected != presence {
+                        c.keypad_connected = presence;
+                        c.revision += 1;
+                        wake();
+                    }
+                }
+            };
             let mut interval = 1.0 / 30.0_f64;
             loop {
                 let frame_start = Instant::now();
@@ -907,7 +917,18 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         release(d);
                     }
                     connected_at = None;
-                    api = None;
+                    let observe = core.lock().map(|c| c.settings.island_visibility == crate::model::IslandVisibility::WhenDisconnected).unwrap_or(false);
+                    if observe {
+                        if api.is_none() { api = hidapi::HidApi::new().ok(); }
+                        if last_scan.elapsed() > Duration::from_secs(2) {
+                            last_scan = Instant::now();
+                            let found = api.as_mut().map(find);
+                            set_presence(found.as_ref().and_then(|(p, refreshed)| refreshed.then_some(p.is_some())));
+                        }
+                    } else {
+                        api = None;
+                        set_presence(None);
+                    }
                     set(&core, Hardware::Off);
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
@@ -915,6 +936,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                 if api.is_none() {
                     api = hidapi::HidApi::new().ok();
                     if api.is_none() {
+                        set_presence(None);
                         set(&core, Hardware::Problem("USB access is unavailable".into()));
                         std::thread::sleep(Duration::from_secs(2));
                         continue;
@@ -924,7 +946,9 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                 if dev.is_none() && last_scan.elapsed() > Duration::from_secs(2) {
                     last_scan = Instant::now();
                     let was = path.is_some();
-                    path = find(a);
+                    let (found, refreshed) = find(a);
+                    set_presence(refreshed.then_some(found.is_some()));
+                    path = found;
                     if path.is_none() {
                         retries = 0;
                         arrived = None;
@@ -960,6 +984,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                         retries = 0;
                                         connected_at = Some(Instant::now());
                                         dev = Some(d);
+                                        set_presence(Some(true));
                                         set(&core, Hardware::Driving);
                                     }
                                     Err(e) => {

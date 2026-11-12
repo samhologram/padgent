@@ -528,6 +528,25 @@ pub enum Motion {
     Reduced,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IslandVisibility { Never, Always, WhenDisconnected }
+
+impl Default for IslandVisibility {
+    fn default() -> Self { Self::Always }
+}
+
+fn deserialize_island_visibility<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<IslandVisibility, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum LegacyOrCurrent { Legacy(bool), Current(IslandVisibility) }
+    Ok(match LegacyOrCurrent::deserialize(deserializer)? {
+        LegacyOrCurrent::Legacy(true) => IslandVisibility::Always,
+        LegacyOrCurrent::Legacy(false) => IslandVisibility::Never,
+        LegacyOrCurrent::Current(mode) => mode,
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -551,7 +570,8 @@ pub struct Settings {
     pub state_colours: BTreeMap<String, String>,
     pub waiting_hue: f32,
     pub menu_indicator: MenuIndicator,
-    pub island_enabled: bool,
+    #[serde(alias = "islandEnabled", deserialize_with = "deserialize_island_visibility")]
+    pub island_visibility: IslandVisibility,
     pub motion: Motion,
     pub demo_mode: bool,
     pub drive_physical_keypad: bool,
@@ -593,7 +613,7 @@ impl Default for Settings {
             .collect(),
             waiting_hue: colour::REFERENCE_WAITING_HUE,
             menu_indicator: MenuIndicator::DotAndCount,
-            island_enabled: true,
+            island_visibility: IslandVisibility::Always,
             motion: Motion::Full,
             demo_mode: false,
             // Take the keypad from Logi Options+ when the app opens, as the original does.
@@ -840,6 +860,7 @@ pub struct Core {
     pub quotas: Vec<crate::quota::Quota>,
     pub in_control: bool,
     pub hardware: Hardware,
+    pub keypad_connected: Option<bool>,
     key_down: [Option<f64>; KEY_COUNT],
     key_target: [Option<KeyPressTarget>; KEY_COUNT],
     hold_fired: [bool; KEY_COUNT],
@@ -869,6 +890,7 @@ impl Core {
             quotas: Vec::new(),
             in_control,
             hardware: Hardware::Off,
+            keypad_connected: None,
             key_down: [None; KEY_COUNT],
             key_target: std::array::from_fn(|_| None),
             hold_fired: [false; KEY_COUNT],
@@ -1185,6 +1207,14 @@ impl Core {
             if t - at > 6.0 {
                 self.notice = None;
             }
+        }
+    }
+
+    pub fn island_visible(&self) -> bool {
+        match self.settings.island_visibility {
+            IslandVisibility::Never => false,
+            IslandVisibility::Always => true,
+            IslandVisibility::WhenDisconnected => self.keypad_connected == Some(false),
         }
     }
 
@@ -1656,18 +1686,47 @@ mod tests {
     }
 
     #[test]
-    fn island_setting_defaults_on_for_old_configs_and_persists_changes() {
-        // Settings predates this field, so old config files must keep the feature enabled.
-        let old: Settings = serde_json::from_str(r#"{"format":"agentpad.settings","version":1}"#).unwrap();
-        assert!(old.island_enabled);
-        assert!(Settings::default().island_enabled);
+    fn island_visibility_setting_migrates_legacy_boolean_and_round_trips_enum() {
+        assert_eq!(Settings::default().island_visibility, IslandVisibility::Always);
 
-        let mut changed = old;
-        changed.island_enabled = false;
-        let saved = serde_json::to_value(&changed).unwrap();
-        assert_eq!(saved["islandEnabled"], false);
-        let restored: Settings = serde_json::from_value(saved).unwrap();
-        assert!(!restored.island_enabled);
+        let legacy_enabled: Settings = serde_json::from_value(serde_json::json!({"islandEnabled": true})).unwrap();
+        let legacy_disabled: Settings = serde_json::from_value(serde_json::json!({"islandEnabled": false})).unwrap();
+        let absent: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(legacy_enabled.island_visibility, IslandVisibility::Always);
+        assert_eq!(legacy_disabled.island_visibility, IslandVisibility::Never);
+        assert_eq!(absent.island_visibility, IslandVisibility::Always);
+
+        let mut settings = Settings::default();
+        settings.island_visibility = IslandVisibility::WhenDisconnected;
+        let stored = serde_json::to_value(&settings).unwrap();
+        assert_eq!(stored["islandVisibility"], "whenDisconnected");
+        assert!(stored.get("islandEnabled").is_none());
+        let restored: Settings = serde_json::from_value(stored).unwrap();
+        assert_eq!(restored.island_visibility, IslandVisibility::WhenDisconnected);
+    }
+
+    #[test]
+    fn island_when_disconnected_tracks_physical_presence_not_keypad_control_state() {
+        let cases = [
+            (IslandVisibility::Never, None, Hardware::NoKeypad, false, false),
+            (IslandVisibility::Always, Some(false), Hardware::NoKeypad, false, true),
+            (IslandVisibility::WhenDisconnected, None, Hardware::Off, false, false),
+            // Connected means physically present even while Options+ still has control.
+            (IslandVisibility::WhenDisconnected, Some(true), Hardware::Connected, false, false),
+            (IslandVisibility::WhenDisconnected, Some(true), Hardware::Driving, true, false),
+            (IslandVisibility::WhenDisconnected, Some(true), Hardware::Problem("busy".into()), false, false),
+            (IslandVisibility::WhenDisconnected, Some(false), Hardware::NoKeypad, false, true),
+            (IslandVisibility::WhenDisconnected, Some(false), Hardware::Off, true, true),
+        ];
+        for (visibility, connected, hardware, in_control, expected) in cases {
+            let mut settings = Settings::default();
+            settings.island_visibility = visibility;
+            let mut core = Core::new(settings);
+            core.keypad_connected = connected;
+            core.hardware = hardware;
+            core.in_control = in_control;
+            assert_eq!(core.island_visible(), expected, "visibility={visibility:?}, connected={connected:?}, in_control={in_control}");
+        }
     }
 
     #[test]

@@ -19,7 +19,7 @@ use eframe::egui::{
     vec2,
 };
 use model::{
-    Action, AgentDef, ColourKeysBy, Core, Group, Hardware, KEY_COUNT, MenuIndicator, Motion, ReorderOn, Settings,
+    Action, AgentDef, ColourKeysBy, Core, Group, Hardware, IslandVisibility, KEY_COUNT, MenuIndicator, Motion, ReorderOn, Settings,
 };
 use paint::{c32, white, with_alpha};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +67,17 @@ struct IslandAgent {
 }
 
 struct IslandQuota { provider: String, session: Option<f64>, weekly: Option<f64>, colour: colour::Rgb }
+
+fn island_wings(active: &[IslandAgent], quotas: &[IslandQuota], notch: f32) -> (f32, f32) {
+    let count = active.len().min(2);
+    let values: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
+    if count == 0 && values == 0 {
+        let wing = if notch > 0.0 { 16.0 } else { 44.0 };
+        (wing, wing)
+    } else {
+        (6.0 + count as f32 * 76.0, 6.0 + values as f32 * 42.0)
+    }
+}
 
 enum IslandAction { None, Expand, Quotas, Open(String, String) }
 
@@ -433,22 +444,20 @@ impl App {
 
     fn island(&mut self, ctx: &egui::Context) {
         let (enabled, active, quotas, brightness, reduced) = match self.core.lock() {
-            Ok(c) => (c.settings.island_enabled,
+            Ok(c) => (c.island_visible(),
                 island_agents(&c), island_quotas(&c),
                 c.settings.brightness, c.settings.motion == Motion::Reduced),
             Err(_) => return,
         };
         if !enabled && self.popup_from_island { self.popup_open = false; }
-        if !enabled || (active.is_empty() && quotas.is_empty() && !(self.popup_open && self.popup_from_island) && self.island_progress <= 0.0) {
+        if !enabled {
             self.island_geometry = None;
             return;
         }
         let geometry = mac::island_geometry();
         let (x, y, notch, height) = geometry;
         let h = height.clamp(28.0, 40.0);
-        let left_width = 6.0 + active.len().min(2) as f32 * 76.0;
-        let quota_count: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
-        let right_width = 6.0 + quota_count as f32 * 42.0;
+        let (left_width, right_width) = island_wings(&active, &quotas, notch);
         let width = (notch + 2.0 * (left_width.max(right_width) + 6.0)).max(400.0);
         let expanded = self.popup_open && self.popup_from_island;
         let body_width = notch + left_width + right_width + 12.0;
@@ -512,10 +521,7 @@ impl App {
         let rect = ui.max_rect();
         let p = ui.painter().clone();
         let gap = notch;
-        let count = active.len().min(2);
-        let quota_count: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
-        let left_width = 6.0 + count as f32 * 76.0;
-        let right_width = if quota_count == 0 { 6.0 } else { 6.0 + quota_count as f32 * 42.0 };
+        let (left_width, right_width) = island_wings(active, quotas, notch);
         let left_edge = rect.center().x - gap / 2.0 - left_width;
         let right_edge = rect.center().x + gap / 2.0 + right_width;
         let hit = Rect::from_min_max(pos2(left_edge - 6.0, rect.top()), pos2(right_edge + 6.0, rect.top() + h + 2.0));
@@ -580,7 +586,8 @@ impl App {
             }
             self.popup_contents(ui, ctx);
         });
-        if !self.popup_open { self.cancel_popup_inputs(); }
+        if self.popup_open { mac::configure_keypad_window(); }
+        else { self.cancel_popup_inputs(); }
     }
 
     fn popup_contents(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -1469,7 +1476,12 @@ impl App {
                 });
                 hint(ui, "Dot shows a terracotta dot on the menu bar icon. Dot and count adds the number of waiting sessions next to it. The menu previews every session with its state and last message.");
                 if ui.button("Preview menu-bar keypad").clicked() { preview = true; }
-                ui.checkbox(&mut s.island_enabled, "Show active agents around the camera notch");
+                ui.horizontal(|ui| {
+                    ui.label("Notch island");
+                    ui.selectable_value(&mut s.island_visibility, IslandVisibility::Never, "Never");
+                    ui.selectable_value(&mut s.island_visibility, IslandVisibility::Always, "Always");
+                    ui.selectable_value(&mut s.island_visibility, IslandVisibility::WhenDisconnected, "When keypad disconnected");
+                });
                 hint(ui, "Click a conversation to open it, a quota to see usage, or the island background to unfold the keypad. The island responds gently to hover.");
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
@@ -1599,7 +1611,7 @@ impl eframe::App for App {
         // still needs a paint pass so atlas updates reach the GPU for those windows.
         if self.screenshot.is_none() {
             let needs_children = self.popup_open || self.core.lock().map(|c|
-                c.settings.island_enabled && (!island_agents(&c).is_empty() || !island_quotas(&c).is_empty())
+                c.island_visible()
             ).unwrap_or(false);
             if needs_children { ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden); }
             if !self.popup_open { self.cancel_popup_inputs(); }
