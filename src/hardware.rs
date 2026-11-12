@@ -223,6 +223,17 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
             draw_text(&mut pm, font, 10.0, (k - text_width(font, 10.0, &detail)) / 2.0, k * 0.93, &detail, white, 0.6);
         }
         KeyFace::QuotaHub => { let label = "Quotas"; draw_text(&mut pm, font, 18.0, (k - text_width(font, 18.0, label)) / 2.0, 64.0, label, white, 0.9); }
+        KeyFace::Step(step) => {
+            for (line, y, size) in [(&step.kind, 20.0, 11.0), (&step.title, 42.0, 14.0), (&step.status, 60.0, 10.0)] {
+                let text = fit(font, size, line, k - 12.0);
+                draw_text(&mut pm, font, size, (k - text_width(font, size, &text)) / 2.0, y, &text, white, 0.85);
+            }
+            for (i, line) in wrap(font, 10.0, &step.text, k - 12.0, 3).iter().enumerate() {
+                let text = fit(font, 10.0, line, k - 12.0);
+                draw_text(&mut pm, font, 10.0, (k - text_width(font, 10.0, &text)) / 2.0, 79.0 + i as f32 * 13.0, &text, white, 0.85);
+            }
+        }
+        KeyFace::Back => { let label = "← Back"; draw_text(&mut pm, font, 16.0, (k - text_width(font, 16.0, label)) / 2.0, 64.0, label, white, 0.9); }
         KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
         KeyFace::Hub(h) => render_hub(&mut pm, h, phase, font),
     }
@@ -721,10 +732,11 @@ struct DisplayView {
     quota_page: usize,
     page: usize,
     in_control: bool,
+    detail: Option<(String, usize)>,
 }
 
 fn display_view(core: &Core) -> DisplayView {
-    DisplayView { quota_view: core.quota_view, quota_page: core.quota_page, page: core.page.min(core.pages() - 1), in_control: core.in_control }
+    DisplayView { quota_view: core.quota_view, quota_page: core.quota_page, page: core.page.min(core.pages() - 1), in_control: core.in_control, detail: core.detail_key.clone().map(|key| (key, core.detail_page)) }
 }
 
 // A page transition must redraw every key, including empty slots.
@@ -1139,8 +1151,8 @@ mod tests {
 
     #[test]
     fn page_change_clears_old_page_retry_deadline_and_render_cache() {
-        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true };
-        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
+        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true, detail: None };
+        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true, detail: None };
         let future = Instant::now() + Duration::from_secs(30);
         let mut previous = Some(first);
         let mut sent = vec![Some(vec![0xAA]); KEY_COUNT];
@@ -1226,9 +1238,9 @@ mod tests {
 
     #[test]
     fn page_transition_invalidates_occupied_cache_so_empty_slot_image_is_sent() {
-        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true });
+        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true, detail: None });
         let mut sent = vec![Some(vec![0x11, 0x22]); KEY_COUNT];
-        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
+        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true, detail: None };
 
         assert!(prepare_display_view(&mut previous, &next, &mut sent));
         assert!(sent.iter().all(Option::is_none));
@@ -1238,10 +1250,10 @@ mod tests {
 
     #[test]
     fn page_transition_forces_resend_even_when_rendered_bytes_are_equal() {
-        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true });
+        let mut previous = Some(DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true, detail: None });
         let same_hub_jpeg = vec![0xFF, 0xD8, 0x42, 0xFF, 0xD9];
         let mut sent = vec![Some(same_hub_jpeg.clone()); KEY_COUNT];
-        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
+        let next = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true, detail: None };
 
         assert!(prepare_display_view(&mut previous, &next, &mut sent));
         assert!(image_needs_send(sent[crate::model::HUB_KEY].as_deref(), &same_hub_jpeg, false));
@@ -1250,9 +1262,9 @@ mod tests {
 
     #[test]
     fn aborted_page_transition_cannot_leave_partial_cache_as_current() {
-        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true };
-        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true };
-        let third = DisplayView { quota_view: false, quota_page: 0, page: 2, in_control: true };
+        let first = DisplayView { quota_view: false, quota_page: 0, page: 0, in_control: true, detail: None };
+        let second = DisplayView { quota_view: false, quota_page: 0, page: 1, in_control: true, detail: None };
+        let third = DisplayView { quota_view: false, quota_page: 0, page: 2, in_control: true, detail: None };
         let mut previous = Some(first);
         let mut sent = vec![Some(vec![0x10]); KEY_COUNT];
 

@@ -79,7 +79,7 @@ fn island_wings(active: &[IslandAgent], quotas: &[IslandQuota], notch: f32) -> (
     }
 }
 
-enum IslandAction { None, Expand, Quotas, Open(String, String) }
+enum IslandAction { None, Expand, Quotas, Open(String, String), Steps(String, String) }
 
 fn island_quotas(c: &Core) -> Vec<IslandQuota> {
     c.quota_rows().into_iter().filter_map(|row| {
@@ -238,6 +238,25 @@ impl App {
         }
         if demo {
             core.in_control = true;
+            if std::env::args().any(|arg| arg == "--demo-steps") {
+                if let Some(session) = core.sessions.first_mut() {
+                    session.steps = [
+                        ("Thinking", "Plan", "Review the task and identify the next steps."),
+                        ("Tool", "Search", "Find the relevant project files and references."),
+                        ("Tool", "Read", "Inspect the current implementation and its behavior."),
+                        ("Tool", "Edit", "Update the interface and preserve existing settings."),
+                        ("Tool", "Run", "Check the changes with the available tests."),
+                        ("Thinking", "Review", "Check the result for layout and navigation issues."),
+                        ("Tool", "Inspect", "Compare the final view with the requested behavior."),
+                        ("Reply", "Summary", "Describe the result and any remaining limitations."),
+                        ("Update", "Complete", "The demonstration is ready for review."),
+                    ].into_iter().enumerate().map(|(i, (kind, title, text))| model::SessionStep {
+                        kind: kind.into(), status: "Observed".into(), title: title.into(), text: text.into(), signature: format!("demo-step-{i}"),
+                    }).collect();
+                    let key = session.key();
+                    core.open_session_steps(&key);
+                }
+            }
         }
         if screenshot_island {
             for (provider, window, remaining) in [("Codex", "Weekly", 72.0), ("Claude", "Session", 55.0), ("Claude", "Weekly", 40.0)] {
@@ -488,6 +507,20 @@ impl App {
             let agents = self.core.lock().map(|c| c.agents.clone()).unwrap_or_default();
             self.open_exact(&agents, agent, session);
         }
+        if let IslandAction::Steps(agent, session) = &action {
+            let opened = self.core.lock().map(|mut c| {
+                let key = c.sessions.iter().find(|s| s.agent == *agent && s.id == *session).map(|s| s.key());
+                if let Some(key) = key { c.open_session_steps(&key); true } else { false }
+            }).unwrap_or(false);
+            if opened {
+                self.popup_open = true;
+                self.popup_from_island = true;
+                self.popup_focused = false;
+                mac::show_app();
+                ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("agent-island"), egui::ViewportCommand::Focus);
+                ctx.request_repaint();
+            }
+        }
         if matches!(action, IslandAction::Expand | IslandAction::Quotas) {
             ctx.request_repaint();
             if matches!(action, IslandAction::Quotas) {
@@ -535,8 +568,29 @@ impl App {
         for (i, agent) in active.iter().take(2).enumerate() {
             let left = rect.center().x - gap / 2.0 - 76.0 - i as f32 * 76.0;
             let tile = Rect::from_min_size(pos2(left, rect.top() + 3.0 + expansion * 0.5), vec2(72.0, h - 6.0));
-            let response = ui.interact(tile, egui::Id::unique(("island-session", &agent.agent, &agent.session)), Sense::click())
-                .on_hover_text(format!("{} · {}", agent.name, agent.title));
+            let id = egui::Id::unique(("island-session", &agent.agent, &agent.session));
+            let response = ui.interact(tile, id, Sense::click_and_drag())
+                .on_hover_text(format!("{} · {} — hold for steps", agent.name, agent.title));
+            // Keep the press bound to this session even when the displayed order changes.
+            // A pointer leaving the tile cancels it until release.
+            let state_id = id.with("hold");
+            let mut hold: Option<(f64, bool, bool)> = ui.ctx().data(|d| d.get_temp(state_id));
+            let down = response.is_pointer_button_down_on();
+            if down {
+                let (start, mut fired, mut cancelled) = if ui.input(|i| i.pointer.primary_pressed()) {
+                    (now, false, false)
+                } else { hold.unwrap_or((now, false, false)) };
+                if !ui.input(|i| i.pointer.interact_pos().is_some_and(|pos| tile.contains(pos))) { cancelled = true; }
+                if !cancelled && !fired && now - start >= model::DETAIL_HOLD_S {
+                    fired = true;
+                    action = IslandAction::Steps(agent.agent.clone(), agent.session.clone());
+                }
+                hold = Some((start, fired, cancelled));
+                ui.ctx().data_mut(|d| d.insert_temp(state_id, (start, fired, cancelled)));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(30));
+            } else {
+                ui.ctx().data_mut(|d| d.remove::<(f64, bool, bool)>(state_id));
+            }
             p.rect_filled(tile, CornerRadius::same(9), Color32::from_rgb(20, 22, 29));
             paint::compact_field(&p, tile, agent.activity, agent.tool, agent.since, agent.orb, agent.glow, brightness, reduced, now);
             if response.hovered() { p.rect_filled(tile, CornerRadius::same(9), white(0.09)); }
@@ -557,7 +611,9 @@ impl App {
                 let offset = if overflow > 0.0 { let period = overflow as f64 / 20.0 + 2.0; ((now % period - 1.0).max(0.0) * 20.0).min(overflow as f64) as f32 } else { 0.0 };
                 text_p.galley(pos2(text_rect.left() - offset, text_rect.center().y - galley.size().y / 2.0), galley, white(0.96));
             }
-            if response.clicked() { action = IslandAction::Open(agent.agent.clone(), agent.session.clone()); }
+            if response.clicked() && !hold.is_some_and(|(_, fired, cancelled)| fired || cancelled) {
+                action = IslandAction::Open(agent.agent.clone(), agent.session.clone());
+            }
         }
         let mut quota_x = rect.center().x + gap / 2.0 + 6.0;
         for quota in quotas.iter().take(2) {
@@ -866,7 +922,7 @@ impl App {
         p.text(
             pos2(dev.center().x, dev.bottom() + 16.0),
             Align2::CENTER_CENTER,
-            "Hold a key 0.6 s to archive its conversation until work resumes · ‹ › page · hold both 1.5 s to hand back to Options+",
+            "Hold a key 0.6 s for observed steps · ‹ › page · Back returns · hold both 1.5 s to hand back to Options+",
             FontId::proportional(11.5),
             white(0.45),
         );
@@ -1448,7 +1504,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut s.empty_key_url).hint_text("https://… or app link").desired_width(300.0));
             });
             hint(ui, "Optional. Pressing a key with no session opens this link on this computer. Leave blank to do nothing.");
-            hint(ui, "Hold a session key for 0.6 s to archive it until the conversation resumes work.");
+            hint(ui, "Hold a session key for 0.6 s to view observed steps. Use the page buttons to browse and Back to return. Opening an inactive conversation moves it to later pages until work resumes.");
         });
         if format!("{:?}", c.settings) != before {
             c.revision += 1;
@@ -1482,7 +1538,7 @@ impl App {
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::Always, "Always");
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::WhenDisconnected, "When keypad disconnected");
                 });
-                hint(ui, "Click a conversation to open it, a quota to see usage, or the island background to unfold the keypad. The island responds gently to hover.");
+                hint(ui, "Click a conversation to open it, or hold it for 0.6 s to view its steps. Click a quota to see usage, or the island background to unfold the keypad.");
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
                     if integrations::set_launch_at_login(login).is_ok() {
@@ -1854,7 +1910,7 @@ mod island_tests {
     }
 
     #[test]
-    fn completed_session_survives_decay_and_expiry_until_open_then_hides_everywhere() {
+    fn completed_session_survives_decay_and_expiry_until_open_then_is_shelved_after_normal_tiles() {
         let mut core = Core::new(Settings::default());
         add_session(&mut core, "codex", "finished", "done");
         let t = model::now();
@@ -1874,7 +1930,8 @@ mod island_tests {
         assert!(core.sessions[0].archived);
         assert!(!core.sessions[0].pending_attention);
         assert!(core.visible().is_empty());
-        assert!(core.faces().iter().all(|face| !matches!(face, model::KeyFace::Session(_))));
+        core.page = 1;
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:finished"));
         assert!(island_agents(&core).is_empty());
     }
 
@@ -1909,7 +1966,8 @@ mod island_tests {
         });
         assert!(core.sessions[0].archived);
         assert!(core.visible().is_empty());
-        assert!(core.faces().iter().all(|face| !matches!(face, model::KeyFace::Session(_))));
+        core.page = 1;
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:reply"), "read inactive work remains reachable on the shelved tail page");
         assert!(island_agents(&core).is_empty());
 
         // A genuinely active update reopens the record and restores it to both views.

@@ -70,6 +70,9 @@ select t.id as id, coalesce(nullif(t.name,''), nullif(t.title,''), nullif(substr
    order by i.rollout_ordinal desc, i.updated_at_ordinal desc limit 1) as live_json,
  (select i.item_id from h.thread_items i where i.thread_id=t.id and i.turn_id=(select x.turn_id from h.thread_turns x where x.thread_id=t.id order by x.rollout_ordinal desc limit 1)
    order by i.rollout_ordinal desc, i.updated_at_ordinal desc limit 1) as live_id,
+ (select json_group_array(json_object('id', item_id, 'turn', turn_id, 'type', item_type, 'item', item_json)) from
+   (select i.item_id, i.turn_id, i.item_type, i.item_json from h.thread_items i where i.thread_id=t.id and i.turn_id=(select x.turn_id from h.thread_turns x where x.thread_id=t.id order by x.rollout_ordinal desc limit 1)
+    order by i.rollout_ordinal desc limit 12)) as steps_json,
  (select count(*) from h.thread_turns x where x.thread_id=t.id and r.first_unread_turn is not null and
    x.rollout_ordinal >= (select y.rollout_ordinal from h.thread_turns y where y.thread_id=t.id and y.turn_id=r.first_unread_turn)) as unread
 from threads t left join thread_read_receipts r on r.thread_id=t.id
@@ -223,6 +226,67 @@ fn claude_live(path: &Path, busy: bool) -> Option<Live> {
     None
 }
 
+/// Bounded assistant-only transcript summaries, in chronological order.
+fn claude_steps(path: &Path) -> Vec<Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else { return Vec::new() };
+    let Ok(meta) = file.metadata() else { return Vec::new() };
+    let start = meta.len().saturating_sub(192 * 1024);
+    if file.seek(SeekFrom::Start(start)).is_err() { return Vec::new(); }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() { return Vec::new(); }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out = Vec::new();
+    for (line_index, raw) in text.lines().enumerate() {
+        if start > 0 && line_index == 0 { continue; }
+        let Ok(row) = serde_json::from_str::<Value>(raw) else { continue };
+        if row.get("type").and_then(Value::as_str) != Some("assistant") { continue; }
+        let Some(uuid) = row.get("uuid").and_then(Value::as_str) else { continue };
+        let Some(blocks) = row.pointer("/message/content").and_then(Value::as_array) else { continue };
+        for (index, block) in blocks.iter().enumerate() {
+            let (kind, title) = match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "thinking" => ("Thinking", "Thinking".to_string()),
+                "text" => ("Reply", "Reply".to_string()),
+                "tool_use" => ("Tool", block.get("name").and_then(Value::as_str).unwrap_or("Tool").to_string()),
+                _ => continue,
+            };
+            let detail = match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "thinking" => line(block.get("thinking").and_then(Value::as_str).unwrap_or(""), 160),
+                "text" => line(block.get("text").and_then(Value::as_str).unwrap_or(""), 160),
+                "tool_use" => tool_detail(&title, &block.get("input").cloned().unwrap_or(Value::Null)),
+                _ => String::new(),
+            };
+            out.push(json!({"id": format!("{uuid}:{index}"), "kind":kind, "title":title, "status":"Observed", "text":detail}));
+        }
+    }
+    if out.len() > 12 { out.drain(..out.len() - 12); }
+    out
+}
+
+fn codex_steps(value: &Value) -> Vec<Value> {
+    let mut rows: Vec<Value> = value.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    rows.reverse();
+    rows.into_iter().filter_map(|row| {
+        let id = row.get("id")?.as_str()?;
+        let turn = row.get("turn").and_then(Value::as_str).unwrap_or("");
+        let kind = row.get("type").and_then(Value::as_str).unwrap_or("");
+        let item: Value = row.get("item").and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+        let (category, title) = match kind {
+            "reasoning" => ("Thinking", "Thinking".to_string()),
+            "agentMessage" => ("Reply", "Reply".to_string()),
+            "commandExecution" => ("Tool", "Shell".to_string()),
+            "mcpToolCall" | "dynamicToolCall" | "collabAgentToolCall" => ("Tool", item.get("tool").and_then(Value::as_str).unwrap_or("Tool").to_string()),
+            "fileChange" => ("Tool", "Editing".to_string()),
+            "webSearch" => ("Tool", "Search".to_string()),
+            "contextCompaction" => ("Update", "Compacting".to_string()),
+            _ => return None,
+        };
+        let status = item.get("status").and_then(Value::as_str).unwrap_or("Observed");
+        let (_, detail, _) = codex_live(kind, &item);
+        Some(json!({"id":format!("{turn}:{id}"), "kind":category, "title":title, "status":status, "text":detail}))
+    }).collect()
+}
+
 /// The newest item of a Codex turn in progress.
 fn codex_live(item_type: &str, item: &Value) -> (&'static str, String, String) {
     match item_type {
@@ -245,7 +309,20 @@ fn codex_live(item_type: &str, item: &Value) -> (&'static str, String, String) {
             let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
             let server = item.get("server").and_then(Value::as_str).unwrap_or("");
             let name = if server.is_empty() { tool.to_string() } else { format!("{server}.{tool}") };
-            ("tool", name.clone(), name)
+            let is_question_tool = ["request_user_input", "request_user_input_async"].iter().any(|suffix| {
+                tool == *suffix || tool.strip_suffix(suffix).is_some_and(|prefix| prefix.ends_with('.') || prefix.ends_with('/') || prefix.ends_with(':') || prefix.ends_with("__"))
+            });
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+            let pending = !matches!(status.as_str(), "completed" | "complete" | "failed" | "cancelled" | "canceled");
+            if is_question_tool && pending {
+                let args = item.get("arguments").cloned().unwrap_or(Value::Null);
+                let args = args.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(args);
+                let question = args.get("questions").and_then(Value::as_array).and_then(|questions| {
+                    questions.iter().find_map(|q| q.get("question").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                        .or_else(|| q.get("title").and_then(Value::as_str).filter(|s| !s.trim().is_empty())))
+                }).unwrap_or("");
+                ("waitingQuestion", line(question, 240), String::new())
+            } else { ("tool", name.clone(), name) }
         }
         "fileChange" => {
             let path = item.pointer("/changes/0/path").and_then(Value::as_str).unwrap_or("files");
@@ -286,7 +363,8 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         } else {
                             None
                         };
-                        let sig = format!("{status}|{}", live.as_ref().map(|l| l.3.as_str()).unwrap_or(""));
+                        let steps = transcripts.get(id).map(|p| claude_steps(p)).unwrap_or_default();
+                        let sig = format!("{status}|{}|{}", live.as_ref().map(|l| l.3.as_str()).unwrap_or(""), serde_json::to_string(&steps).unwrap_or_default());
                         if prev.as_deref() == Some(sig.as_str()) {
                             continue;
                         }
@@ -309,6 +387,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             state = "waitingQuestion";
                         }
                         let mut body = json!({ "session": id, "state": state, "_pid": pid.to_string() });
+                        body["_steps"] = json!(steps);
                         if let Some(n) = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()) {
                             body["title"] = json!(n);
                         } else if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
@@ -360,7 +439,8 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             tool = tl;
                             live_sig = format!("{}:{}", v.get("live_id").and_then(Value::as_str).unwrap_or(""), message.len());
                         }
-                        let sig = format!("{state}|{unread}|{}|{live_sig}", message.len());
+                        let steps = codex_steps(&v["steps_json"]);
+                        let sig = format!("{state}|{unread}|{message}|{live_sig}|{}", serde_json::to_string(&steps).unwrap_or_default());
                         if last.get(id) == Some(&sig) {
                             continue;
                         }
@@ -375,7 +455,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         if !running && asks(&message) && now_s() - message_at <= crate::model::RECENT_TEXT_S {
                             state = "waitingQuestion";
                         }
-                        let mut body = json!({ "session": id, "state": state, "_app": "com.openai.codex", "_unread": unread });
+                        let mut body = json!({ "session": id, "state": state, "_app": "com.openai.codex", "_unread": unread, "_steps": steps });
                         if let Some(n) = v.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) {
                             body["title"] = json!(n);
                         }
@@ -423,5 +503,43 @@ mod tests {
         assert!(super::asks("Use OAuth device flow or PKCE?"));
         assert!(super::asks("On garde la v2 ? "));
         assert!(!super::asks("All 214 checks passed."));
+    }
+
+    #[test]
+    fn pending_codex_user_input_tools_show_the_first_question() {
+        for (tool, status, arguments, expected) in [
+            ("request_user_input", "inProgress", serde_json::json!({"questions":[{"question":"Which region?"}]}), "Which region?"),
+            ("mcp__codex__request_user_input_async", "running", serde_json::json!({"questions":[{"title":"Choose a format"}]}), "Choose a format"),
+        ] {
+            let item = serde_json::json!({"tool":tool, "status":status, "arguments":arguments});
+            let (state, text, tool_name) = super::codex_live("mcpToolCall", &item);
+            assert_eq!(state, "waitingQuestion", "tool={tool}");
+            assert_eq!(text, expected, "tool={tool}");
+            assert!(tool_name.is_empty(), "the waiting state should not be rendered as an ordinary tool: {tool}");
+        }
+    }
+
+    #[test]
+    fn completed_failed_and_cancelled_user_input_calls_remain_tool_updates() {
+        for status in ["completed", "complete", "failed", "cancelled", "canceled"] {
+            let item = serde_json::json!({
+                "tool":"request_user_input",
+                "status":status,
+                "arguments":{"questions":[{"question":"Already answered?"}]}
+            });
+            let (state, _, tool_name) = super::codex_live("mcpToolCall", &item);
+            assert_eq!(state, "tool", "status={status}");
+            assert_eq!(tool_name, "request_user_input", "status={status}");
+        }
+    }
+
+    #[test]
+    fn similarly_named_unrelated_tools_do_not_become_waiting_questions() {
+        for tool in ["my_request_user_input", "request_user_input_helper", "shell"] {
+            let item = serde_json::json!({"tool":tool, "status":"running", "arguments":{"questions":[{"question":"Not a prompt"}]}});
+            let (state, _, tool_name) = super::codex_live("mcpToolCall", &item);
+            assert_eq!(state, "tool", "tool={tool}");
+            assert_eq!(tool_name, tool, "tool={tool}");
+        }
     }
 }

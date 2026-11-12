@@ -16,12 +16,15 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   desktop apps. Add any other agent by importing an `.orbagent.json` file, or follow any desktop
   app's conversations through macOS Accessibility (no logins in Padgent).
 - **Keypad:** eight session keys and a hub key that counts what's waiting; previous/next page
-  buttons; hold a key 0.6 s to archive its conversation until work resumes; hold both page buttons 1.5 s to hand the keypad
+  buttons; hold a key 0.6 s to show observed steps, one per key; use the page buttons and Back to return; hold both page buttons 1.5 s to hand the keypad
   back to Logi Options+. Each key's light follows the session's state (thinking, tool, writing,
   waiting for approval or an answer, done, error, compacting). Sessions idle for more than
   30 minutes move to page 2 or later, leaving page 1 for active and recent sessions.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
-  session runs in (Terminal, iTerm2).
+  session runs in (Terminal, iTerm2). Opening an inactive conversation moves it behind all
+  ordinary sessions, on page 2 or later; it returns when work resumes.
+- **Desktop activity:** follows the activity shown by desktop chats, including synchronized
+  replies started elsewhere. Recognized assistant questions show a Question status.
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.

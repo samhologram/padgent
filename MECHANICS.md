@@ -8,9 +8,12 @@ per-agent preferences remain in the existing AgentPad configuration directory fo
 
 Sessions can come from local agent records, hooks, or desktop apps followed through macOS
 Accessibility. The application displays each session’s activity, age and latest message.
-Tapping a key opens its conversation or terminal; holding a key for 0.6 seconds hides it from the keypad until work resumes. Archives are kept in memory
-and reset when Padgent restarts. The two page buttons navigate pages;
-holding both for 1.5 seconds releases the keypad to Logi Options+.
+Tapping a key opens its conversation or terminal. Inactive conversations move to the end,
+on page 2 or later, in the order opened; resumed work returns them to the active pages.
+Holding a key for 0.6 seconds opens its observed steps, one per key. Back occupies the
+bottom-right key. The two page buttons navigate conversation or step pages.
+The local ordering resets when Padgent restarts. Holding both page buttons for 1.5 seconds
+releases the keypad to Logi Options+.
 
 ## Display and keypad
 

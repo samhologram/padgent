@@ -379,9 +379,42 @@ struct Window {
     usage_levels: Vec<(String, f64, String)>,
     usage_reset: String,
     generating: bool,
+    running_titles: Vec<String>,
     last_text: String,
+    reply: ReplyObservation,
     /// Conversation titles listed in the app's sidebar (most recent first).
     recent: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum MessageActor { #[default] Unknown, Assistant, User }
+
+#[derive(Default)]
+struct ReplyObservation { actor: MessageActor, text: String }
+
+impl ReplyObservation {
+    fn new_message(&mut self) { self.actor = MessageActor::Unknown; self.text.clear(); }
+    fn heading(&mut self, label: &str) {
+        let label = label.trim().to_lowercase();
+        if label.starts_with("claude responded:") || label.starts_with("chatgpt said:") {
+            self.actor = MessageActor::Assistant;
+        } else if label.starts_with("you said:") {
+            self.actor = MessageActor::User;
+        }
+    }
+    fn text(&mut self, value: &str) {
+        if self.actor == MessageActor::Assistant && !value.trim().is_empty() {
+            self.text = value.trim().chars().rev().take(400).collect::<String>().chars().rev().collect();
+        }
+    }
+    fn is_question(&self, generating: bool) -> bool {
+        !generating && self.actor == MessageActor::Assistant && self.text.trim_end().ends_with('?')
+    }
+}
+
+fn is_message_wrapper(label: &str) -> bool {
+    let label = label.trim();
+    (label.starts_with("Message ") && label.contains(" of ")) || label == "Currently streaming message"
 }
 
 /// Extract the stable ID only from a Claude standard chat page, never a Code route.
@@ -410,13 +443,45 @@ fn is_control_label(s: &str) -> bool {
     l.len() < 3 || l.len() > 90 || WORDS.contains(&l.as_str()) || l.starts_with("previous ")
 }
 
+// A long transcript can exhaust the AX node budget before the composer and its
+// Stop button are reached. Keep the latest message and controls discoverable.
+fn recent_message_start(label: &str, children: usize) -> usize {
+    if label.trim().eq_ignore_ascii_case("chat messages") {
+        children.saturating_sub(3)
+    } else {
+        0
+    }
+}
+
+fn message_child_start(label: &str, in_messages: bool, children: usize) -> usize {
+    if in_messages && children > 3 { children - 3 } else { recent_message_start(label, children) }
+}
+
+fn running_title(label: &str) -> Option<&str> {
+    label.trim().strip_suffix(" Running").map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn current_conversation_running(agent: &str, title: &str, running_titles: &[String]) -> bool {
+    agent == "claude-desktop" && !title.is_empty() && running_titles.iter().any(|t| t == title)
+}
+
 #[cfg(target_os = "macos")]
-fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_list: bool) {
+fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_list: bool, in_messages: bool, in_message: bool) {
     if depth > 40 || *budget == 0 {
         return;
     }
     *budget -= 1;
     let role = ax::str_attr(el, "AXRole").unwrap_or_default();
+    let label = if role == "AXGroup" || role == "AXHeading" {
+        ax::str_attr(el, "AXDescription").filter(|s| !s.is_empty())
+            .or_else(|| ax::str_attr(el, "AXTitle")).unwrap_or_default()
+    } else { String::new() };
+    let message_here = role == "AXGroup" && is_message_wrapper(&label);
+    if message_here { w.reply.new_message(); }
+    let in_message = in_message || message_here;
+    if in_message && role == "AXHeading" { w.reply.heading(&label); }
+    // Message action bars contain timestamps and controls, not response text.
+    if in_message && role == "AXToolbar" { return; }
     if role == "AXWebArea" {
         let title = ax::str_attr(el, "AXTitle").unwrap_or_default();
         let url = ax::url_attr(el, "AXURL").unwrap_or_default();
@@ -435,6 +500,9 @@ fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_
         }
     }
     if matches!(role.as_str(), "AXButton" | "AXPopUpButton") {
+        for label in [ax::str_attr(el, "AXDescription"), ax::str_attr(el, "AXTitle")].into_iter().flatten() {
+            if let Some(title) = running_title(&label) { w.running_titles.push(title.to_string()); }
+        }
         for label in [ax::str_attr(el, "AXDescription"), ax::str_attr(el, "AXTitle")].into_iter().flatten() {
             if label.trim().starts_with("Usage:") { w.usage_labels.push(label); }
         }
@@ -457,14 +525,18 @@ fn scan(el: ax::CFTypeRef, depth: usize, budget: &mut usize, w: &mut Window, in_
             let v = v.trim();
             if v.eq_ignore_ascii_case("5-hour limit") || v.to_lowercase().starts_with("weekly · ") { w.usage_reset.clear(); }
             if v.starts_with("Resets ") { w.usage_reset = v.to_string(); }
+            if v.eq_ignore_ascii_case("Claude is responding") { w.generating = true; }
+            if in_message && role == "AXStaticText" { w.reply.text(v); }
             if v.chars().count() >= 40 && role == "AXStaticText" {
                 w.last_text = v.chars().take(400).collect();
             }
         }
     }
     let (_keep, kids) = ax::list(el, "AXChildren");
-    for k in kids {
-        scan(k, depth + 1, budget, w, list_here);
+    let messages_here = label.trim().eq_ignore_ascii_case("chat messages");
+    let start = message_child_start(&label, in_messages, kids.len());
+    for k in kids.into_iter().skip(start) {
+        scan(k, depth + 1, budget, w, list_here, messages_here, in_message);
     }
 }
 
@@ -475,9 +547,9 @@ fn windows(pid: i32, electron: bool) -> Vec<Window> {
     let mut out = Vec::new();
     for w in wins.into_iter().take(6) {
         let title = ax::str_attr(w, "AXTitle").unwrap_or_default();
-        let mut win = Window { title, claude_webarea: None, usage_labels: Vec::new(), usage_levels: Vec::new(), usage_reset: String::new(), generating: false, last_text: String::new(), recent: Vec::new() };
+        let mut win = Window { title, claude_webarea: None, usage_labels: Vec::new(), usage_levels: Vec::new(), usage_reset: String::new(), generating: false, running_titles: Vec::new(), last_text: String::new(), reply: ReplyObservation::default(), recent: Vec::new() };
         let mut budget = 3500;
-        scan(w, 0, &mut budget, &mut win, false);
+        scan(w, 0, &mut budget, &mut win, false, false, false);
         out.push(win);
     }
     out
@@ -489,7 +561,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
         .name("app-watch".into())
         .spawn(move || {
             // (agent, conversation) -> (generating, last text, title)
-            let mut last: HashMap<(String, String), (bool, String, String)> = HashMap::new();
+            let mut last: HashMap<(String, String), (bool, bool, String, String)> = HashMap::new();
             loop {
                 std::thread::sleep(Duration::from_millis(2500));
                 if !ax::trusted() {
@@ -527,9 +599,12 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                 .trim_end_matches(" - ChatGPT")
                                 .trim_end_matches(" - Claude")
                                 .trim();
+                            let generating = w.generating || current_conversation_running(agent, title, &w.running_titles);
+                            let question = w.reply.is_question(generating);
+                            let text = if w.reply.actor == MessageActor::Assistant && !w.reply.text.is_empty() { &w.reply.text } else { &w.last_text };
                             let app_named = core.lock().ok().and_then(|c| c.agent(agent).map(|a| a.name == title || a.app_name == title)).unwrap_or(false);
                             if title.is_empty() || app_named {
-                                if !w.generating && w.last_text.is_empty() {
+                                if !generating && w.last_text.is_empty() {
                                     continue;
                                 }
                             }
@@ -545,8 +620,10 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             }
                             let key = (agent.to_string(), id.clone());
                             let prev = last.get(&key).cloned();
-                            let state = if w.generating {
+                            let state = if generating {
                                 "streaming"
+                            } else if question {
+                                "waitingQuestion"
                             } else if prev.as_ref().map(|p| p.0).unwrap_or(false) {
                                 "done"
                             } else if prev.is_none() {
@@ -555,21 +632,21 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                 "done"
                             };
                             // Other watched apps still require an observed generation.
-                            if agent != "claude-desktop" && prev.is_none() && !w.generating {
+                            if agent != "claude-desktop" && prev.is_none() && !generating && !question {
                                 continue;
                             }
-                            let changed = prev.as_ref() != Some(&(w.generating, w.last_text.clone(), title.to_string()));
+                            let changed = prev.as_ref() != Some(&(generating, question, text.clone(), title.to_string()));
                             if !changed {
                                 continue;
                             }
-                            last.insert(key, (w.generating, w.last_text.clone(), title.to_string()));
+                            last.insert(key, (generating, question, text.clone(), title.to_string()));
                             let fallback = core.lock().ok().and_then(|c| c.agent(agent).map(|a| a.name.clone())).unwrap_or_default();
                             let shown = if title.is_empty() { fallback.as_str() } else { title };
                             if let Ok(mut c) = core.lock() {
                                 c.apply(Incoming {
                                     agent: agent.to_string(),
                                     event: None,
-                                    body: json!({ "session": id, "state": state, "title": shown, "text": w.last_text, "_app": bundle }),
+                                    body: json!({ "session": id, "state": state, "title": shown, "text": text, "_app": bundle }),
                                 });
                             }
                             wake();
@@ -585,7 +662,64 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{claude_chat_id, select_claude_webarea};
+    use super::{claude_chat_id, current_conversation_running, message_child_start, recent_message_start, running_title, select_claude_webarea, ReplyObservation};
+
+    #[test]
+    fn only_a_finished_latest_assistant_question_waits() {
+        let mut reply = ReplyObservation::default();
+        reply.new_message();
+        reply.heading("Claude responded: Choose");
+        reply.text("On continue ?");
+        assert!(reply.is_question(false));
+        assert!(!reply.is_question(true), "streaming takes precedence");
+        reply.text("Terminé.");
+        assert!(!reply.is_question(false));
+        reply.new_message();
+        reply.heading("You said: pourquoi ?");
+        reply.text("pourquoi ?");
+        assert!(!reply.is_question(false), "latest user message is not an assistant question");
+        reply.new_message();
+        reply.text("Draft in composer?");
+        assert!(!reply.is_question(false), "unattributed text is not an assistant question");
+        reply.heading("ChatGPT said: question");
+        reply.text("Yes?");
+        assert!(reply.is_question(false), "short assistant questions are retained");
+    }
+
+    #[test]
+    fn running_sidebar_label_requires_an_explicit_suffix() {
+        assert_eq!(running_title("Example conversation Running"), Some("Example conversation"));
+        assert_eq!(running_title("Running advice"), None);
+        assert_eq!(running_title("Running"), None);
+    }
+
+    #[test]
+    fn only_the_matching_claude_conversation_uses_the_sidebar_signal() {
+        let running = vec!["Another conversation".to_string()];
+        assert!(!current_conversation_running("claude-desktop", "Current conversation", &running));
+        assert!(current_conversation_running("claude-desktop", "Another conversation", &running));
+        assert!(!current_conversation_running("chatgpt", "Another conversation", &running));
+        assert!(!current_conversation_running("claude-desktop", "", &running));
+    }
+
+    #[test]
+    fn long_chat_history_keeps_latest_messages_and_other_containers_intact() {
+        assert_eq!(recent_message_start("Chat messages", 20), 17);
+        assert_eq!(recent_message_start("Chat messages", 2), 0);
+        assert_eq!(recent_message_start("Sidebar", 20), 0);
+    }
+
+    #[test]
+    fn long_history_leaves_budget_for_composer_after_transcript() {
+        // The observed tree is Chat messages -> inner list -> many message nodes,
+        // followed by the composer. Model a 3,500-node budget and 2,000 messages.
+        let mut budget = 3500usize;
+        let message_count = 2000usize;
+        let first = message_child_start("", true, message_count);
+        for _ in first..message_count { budget = budget.saturating_sub(5); }
+        assert!(budget > 0, "composer remains reachable");
+        assert_eq!(first, 1997);
+    }
 
     #[test]
     fn claude_chat_id_accepts_only_https_chat_routes_on_the_exact_domain() {

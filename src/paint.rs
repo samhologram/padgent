@@ -219,11 +219,18 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
             text_block(p, pos2(r.center().x, r.top() + k * 0.84), k * 0.86, &crate::quota::detail(q), k * 0.085, white(0.6), 1, true);
         }
         KeyFace::QuotaHub => { p.text(r.center(), Align2::CENTER_CENTER, "Quotas", FontId::proportional(k * 0.16), white(0.9)); }
+        KeyFace::Step(step) => {
+            for (text, y, size) in [(&step.kind, 0.08, 0.10), (&step.title, 0.27, 0.13), (&step.status, 0.48, 0.09)] {
+                text_block(p, pos2(r.center().x, r.top() + k * y), k * 0.86, text, k * size, white(0.85), 1, true);
+            }
+            text_block(p, pos2(r.center().x, r.top() + k * 0.60), k * 0.86, &step.text, k * 0.095, white(0.85), 3, true);
+        }
+        KeyFace::Back => { p.text(r.center(), Align2::CENTER_CENTER, "← Back", FontId::proportional(k * 0.14), white(0.9)); }
         KeyFace::Session(f) => paint_session(p, r, f, cx),
         KeyFace::Hub(h) => paint_hub(p, r, h, cx),
     }
 
-    // Long-press progress towards archiving.
+    // Long-press progress towards the steps view.
     if cx.hold > 0.02 {
         let c = r.center();
         arc(p, c, k * 0.46, -PI / 2.0, TAU * cx.hold, Stroke::new(2.5, white(0.75)));

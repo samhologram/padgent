@@ -18,8 +18,8 @@ pub const HUB_KEY: usize = 8;
 pub const SESSION_KEYS_PER_PAGE: usize = 8;
 /// Idle sessions older than this stay available, but start no earlier than page two.
 pub const IDLE_SECOND_PAGE_AFTER_S: f64 = 30.0 * 60.0;
-/// Hold a session key to hide it until work resumes.
-pub const ARCHIVE_HOLD_S: f64 = 0.6;
+/// Hold a session key to show its observed steps.
+pub const DETAIL_HOLD_S: f64 = 0.6;
 pub const HAND_BACK_HOLD_S: f64 = 1.5;
 // Session timings (SessionTracker.Environment.live 0x10075703c → SessionTimings, applied by
 // SessionRecord.resolve 0x100749a48).
@@ -732,13 +732,19 @@ pub struct Session {
     pub pid: i32,
     /// Replies not yet read in the agent's own app (Codex read receipts).
     pub unread: u32,
-    /// Locally hidden until a new turn or resumed work.
+    /// Shelved on later keypad pages until a new turn or resumed work.
     pub archived: bool,
+    /// Monotonic local ordering of conversations moved to the tail.
+    pub shelved_order: u64,
     /// A completion or unread reply remains visible until this conversation is opened.
     pub pending_attention: bool,
     /// Text waiting for the current one's 1.5 s dwell to pass.
     pub pending_text: Option<String>,
+    pub steps: Vec<SessionStep>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionStep { pub kind: String, pub status: String, pub title: String, pub text: String, pub signature: String }
 
 impl Session {
     pub fn key(&self) -> String {
@@ -784,6 +790,8 @@ pub enum KeyFace {
     Hub(HubFace),
     Quota(crate::quota::Quota),
     QuotaHub,
+    Step(SessionStep),
+    Back,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -829,16 +837,18 @@ pub enum KeyPressTarget {
     Hub,
     Empty,
     Disabled,
+    Back,
 }
 
 /// Resolve an action from the face actually shown, independent of later reordering.
 pub fn target_for_face(face: &KeyFace, quota_view: bool) -> KeyPressTarget {
+    if matches!(face, KeyFace::Back) { return KeyPressTarget::Back; }
     if quota_view { return KeyPressTarget::Disabled; }
     match face {
         KeyFace::Session(s) => KeyPressTarget::Session(s.key.clone()),
         KeyFace::Hub(_) => KeyPressTarget::Hub,
         KeyFace::Empty => KeyPressTarget::Empty,
-        KeyFace::Released | KeyFace::Quota(_) | KeyFace::QuotaHub => KeyPressTarget::Disabled,
+        KeyFace::Released | KeyFace::Quota(_) | KeyFace::QuotaHub | KeyFace::Step(_) | KeyFace::Back => KeyPressTarget::Disabled,
     }
 }
 
@@ -854,9 +864,12 @@ pub struct Core {
     pub agents: Vec<AgentDef>,
     pub sessions: Vec<Session>,
     order: Vec<String>,
+    next_shelved_order: u64,
     pub page: usize,
     pub quota_view: bool,
     pub quota_page: usize,
+    pub detail_key: Option<String>,
+    pub detail_page: usize,
     pub quotas: Vec<crate::quota::Quota>,
     pub in_control: bool,
     pub hardware: Hardware,
@@ -884,9 +897,12 @@ impl Core {
             agents,
             sessions: Vec::new(),
             order: Vec::new(),
+            next_shelved_order: 0,
             page: 0,
             quota_view: false,
             quota_page: 0,
+            detail_key: None,
+            detail_page: 0,
             quotas: Vec::new(),
             in_control,
             hardware: Hardware::Off,
@@ -1040,8 +1056,10 @@ impl Core {
                     pid: 0,
                     unread: 0,
                     archived: false,
+                    shelved_order: 0,
                     pending_attention: false,
                     pending_text: None,
+                    steps: Vec::new(),
                 });
                 self.sessions.len() - 1
             }
@@ -1073,6 +1091,39 @@ impl Core {
         }
         if let Some(title) = title {
             s.title = title;
+        }
+        if let Some(steps) = b.get("_steps").and_then(Value::as_array) {
+            for step in steps.iter().take(128) {
+                let Some(id) = str_at(step, &["id"]) else { continue };
+                let signature = format!("provider:{id}");
+                let value = SessionStep {
+                    kind: str_at(step, &["kind"]).unwrap_or("Update").to_string(),
+                    status: str_at(step, &["status"]).unwrap_or("").to_string(),
+                    title: str_at(step, &["title"]).unwrap_or("").to_string(),
+                    text: str_at(step, &["text"]).unwrap_or("").to_string(),
+                    signature: signature.clone(),
+                };
+                if let Some(existing) = s.steps.iter_mut().find(|item| item.signature == signature) { *existing = value; }
+                else { s.steps.push(value); }
+            }
+            if s.steps.len() > 128 { s.steps.drain(..s.steps.len() - 128); }
+        }
+        // Record meaningful observed updates once, not repeated local polls or streaming fragments.
+        let step_text = text.clone().unwrap_or_default();
+        let meaningful = event.as_deref() != Some("UserPromptSubmit")
+            && (activity == Activity::Tool || (!step_text.is_empty() && (activity != Activity::Streaming || old != Activity::Streaming)));
+        if meaningful && b.get("_steps").is_none() {
+            let kind = if activity == Activity::Tool { "Tool" } else { "Update" }.to_string();
+            let title = if activity == Activity::Tool && !tool_name.is_empty() { tool_name.to_string() } else { format!("{:?}", activity) };
+            let status = format!("{:?}", activity);
+            let identity = str_at(b, &["tool_use_id", "item_id", "message_id", "event_id"]).unwrap_or("");
+            let signature = if identity.is_empty() { format!("{kind}|{status}|{title}|{step_text}") } else { format!("event:{identity}") };
+            let step = SessionStep { kind, status, title, text: step_text, signature: signature.clone() };
+            if let Some(existing) = s.steps.iter_mut().find(|item| item.signature == signature) { *existing = step; }
+            else {
+                s.steps.push(step);
+                if s.steps.len() > 128 { s.steps.remove(0); }
+            }
         }
         if let Some(text) = text {
             if text != s.text && !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S && b.get("_text_at").is_none() {
@@ -1116,6 +1167,7 @@ impl Core {
         if (og != Group::Working && ng == Group::Working) || event.as_deref() == Some("UserPromptSubmit") {
             s.turn_started = t;
             s.archived = false;
+            s.shelved_order = 0;
             s.pending_attention = false;
         }
         if !s.archived && (activity == Activity::Done || s.unread > 0) {
@@ -1185,13 +1237,9 @@ impl Core {
         }
         for i in 0..KEY_COUNT {
             if let (Some(d), Some(KeyPressTarget::Session(key))) = (self.key_down[i], self.key_target[i].clone()) {
-                if !self.hold_fired[i] && t - d >= ARCHIVE_HOLD_S {
+                if !self.hold_fired[i] && t - d >= DETAIL_HOLD_S {
                     self.hold_fired[i] = true;
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == key) {
-                        s.archived = true;
-                        self.touch();
-                        self.notify("Archived until the conversation resumes work.");
-                    }
+                    self.open_session_steps(&key);
                 }
             }
         }
@@ -1240,13 +1288,14 @@ impl Core {
         v
     }
 
-    /// Capture the exact target and dismiss completed or unread inactive work on open.
+    /// Capture the exact target and shelve inactive work on open.
     pub fn acknowledge_open(&mut self, agent: &str, session: &str) -> Option<Session> {
         let s = self.sessions.iter_mut().find(|s| s.agent == agent && s.id == session)?;
         let target = s.clone();
-        let dismiss = !matches!(s.activity.group(), Group::Working | Group::Waiting)
-            && (s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done);
+        let dismiss = !matches!(s.activity.group(), Group::Working | Group::Waiting);
         if dismiss {
+            self.next_shelved_order = self.next_shelved_order.saturating_add(1);
+            s.shelved_order = self.next_shelved_order;
             s.archived = true;
             s.pending_attention = false;
             s.unread = 0;
@@ -1270,6 +1319,10 @@ impl Core {
             slots.resize(SESSION_KEYS_PER_PAGE, None);
         }
         slots.extend(old_idle.into_iter().map(Some));
+        let mut shelved: Vec<_> = self.order.iter().filter_map(|key| self.sessions.iter().find(|s| s.key() == *key && s.archived && self.agent_enabled(&s.agent))).collect();
+        shelved.sort_by_key(|s| s.shelved_order);
+        if !shelved.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE { slots.resize(SESSION_KEYS_PER_PAGE, None); }
+        slots.extend(shelved.into_iter().map(Some));
         slots
     }
 
@@ -1394,6 +1447,13 @@ impl Core {
             }
             return out;
         }
+        if let Some(key) = &self.detail_key {
+            if let Some(session) = self.sessions.iter().find(|s| s.key() == *key) {
+                for (i, step) in session.steps.iter().skip(self.detail_page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).enumerate() { out[i] = KeyFace::Step(step.clone()); }
+            }
+            out[HUB_KEY] = KeyFace::Back;
+            return out;
+        }
         if self.quota_view {
             for (row, entries) in self.quota_rows().into_iter().skip(self.quota_page * 2).take(2).enumerate() {
                 for (col, mut quota) in entries.into_iter().enumerate() {
@@ -1466,6 +1526,12 @@ impl Core {
 
     // ---- input (on-screen keypad, keyboard, physical keypad)
 
+    pub fn open_session_steps(&mut self, key: &str) {
+        if self.sessions.iter().any(|s| s.key() == key) {
+            self.detail_key = Some(key.to_string()); self.detail_page = 0; self.touch();
+        }
+    }
+
     pub fn key_down(&mut self, i: usize) {
         if i >= KEY_COUNT { return; }
         let faces = self.faces();
@@ -1495,17 +1561,14 @@ impl Core {
         let down = self.key_down[i].take();
         let target = self.key_target[i].take();
         if let (Some(d), Some(KeyPressTarget::Session(key))) = (down, target.as_ref()) {
-            if !self.hold_fired[i] && self.in_control && now() - d >= ARCHIVE_HOLD_S {
+            if !self.hold_fired[i] && self.in_control && now() - d >= DETAIL_HOLD_S {
                 self.hold_fired[i] = true;
-                if let Some(s) = self.sessions.iter_mut().find(|s| s.key() == *key) {
-                    s.archived = true;
-                    self.touch();
-                    self.notify("Archived until the conversation resumes work.");
-                }
+                self.open_session_steps(key);
             }
         }
         if down.is_none() || self.hold_fired[i] || !self.in_control { return; }
         match target {
+            Some(KeyPressTarget::Back) => { self.detail_key = None; self.detail_page = 0; self.touch(); }
             Some(KeyPressTarget::Hub) => {
                 let slots = self.keypad_slots();
                 if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| !s.archived && s.activity.group() == Group::Waiting)) {
@@ -1520,7 +1583,7 @@ impl Core {
                     }
                 }
             }
-            Some(KeyPressTarget::Empty) if self.settings.key_actions_enabled && !self.settings.empty_key_url.trim().is_empty() => {
+            Some(KeyPressTarget::Empty) if self.detail_key.is_none() && self.settings.key_actions_enabled && !self.settings.empty_key_url.trim().is_empty() => {
                 self.actions.push(Action::OpenUrl(self.settings.empty_key_url.clone()));
             }
             _ => {}
@@ -1530,7 +1593,7 @@ impl Core {
     pub fn hold_progress(&self, i: usize) -> f32 {
         if self.quota_view { return 0.0; }
         match self.key_down.get(i).copied().flatten() {
-            Some(d) if !self.hold_fired[i] => ((now() - d) / ARCHIVE_HOLD_S).clamp(0.0, 1.0) as f32,
+            Some(d) if !self.hold_fired[i] => ((now() - d) / DETAIL_HOLD_S).clamp(0.0, 1.0) as f32,
             _ => 0.0,
         }
     }
@@ -1562,6 +1625,14 @@ impl Core {
     }
 
     fn step(&mut self, next: bool) {
+            if let Some(key) = &self.detail_key {
+                let pages = self.sessions.iter().find(|s| s.key() == *key).map(|s| s.steps.len().div_ceil(SESSION_KEYS_PER_PAGE).max(1)).unwrap_or(1);
+                self.detail_page = if next { (self.detail_page + 1).min(pages - 1) } else { self.detail_page.saturating_sub(1) };
+                self.key_down = [None; KEY_COUNT];
+                self.key_target = std::array::from_fn(|_| None);
+                self.hold_fired = [false; KEY_COUNT];
+                self.touch(); return;
+            }
             let pages = self.pages();
             // A press started on another page must not act on the new page.
             self.key_down = [None; KEY_COUNT];
@@ -1641,8 +1712,10 @@ impl Core {
                 pid: 0,
                 unread: if *title == "data-pipeline" { 2 } else { 0 },
                 archived: false,
+                shelved_order: 0,
                 pending_attention: matches!(act, Activity::Done),
                 pending_text: None,
+                steps: Vec::new(),
             });
         }
         self.resort();
@@ -1867,7 +1940,7 @@ mod tests {
         assert_eq!(core.sessions[0].title, "Renamed");
         assert_eq!(core.sessions[0].unread, 3);
         assert!(core.visible().is_empty());
-        assert!(core.keypad_slots_at(now()).iter().all(|slot| slot.is_none()));
+        assert_eq!(core.keypad_slots_at(now())[SESSION_KEYS_PER_PAGE].unwrap().id, "archived", "acknowledged sessions remain shelved on the tail page");
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
@@ -1906,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_disappear_from_all_pages_and_return_to_normal_order_on_resume() {
+    fn shelved_sessions_follow_normal_pages_and_return_to_normal_order_on_resume() {
         let mut settings = Settings::default();
         settings.recency_minutes = 240;
         let mut core = Core::new(settings);
@@ -1922,13 +1995,17 @@ mod tests {
         assert_eq!(slots[0].unwrap().id, "active");
         assert!(slots[1..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none), "archives must not consume reserved page-one holes");
         assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
-        assert!(slots.iter().flatten().all(|session| session.id != "archived-waiting"), "archived sessions must be absent from every keypad page");
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "archived-waiting", "shelved work follows all ordinary tiles on the tail page");
         assert_eq!(core.pages(), 2);
         assert_eq!(core.waiting_count(), 0, "archived waiting sessions are absent from normal counts");
 
         core.page = 1;
         assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:old-idle"));
-        assert!(matches!(&core.faces()[1], KeyFace::Empty));
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
+
+        core.page = 1;
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
@@ -1940,7 +2017,48 @@ mod tests {
     }
 
     #[test]
-    fn archived_waiting_session_does_not_drive_hub_navigation() {
+    fn click_shelving_order_stays_after_normal_tiles_across_polls_and_activity_reordering() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        let mut core = Core::new(settings);
+        core.in_control = true;
+        add_test_session(&mut core, "normal-a", "thinking");
+        add_test_session(&mut core, "normal-b", "waiting_question");
+        add_test_session(&mut core, "shelved-a", "done");
+        add_test_session(&mut core, "shelved-b", "idle");
+        core.apply(Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"shelved-b", "state":"idle", "_unread":2}),
+        });
+
+        for id in ["shelved-a", "shelved-b"] {
+            let index = core.faces().iter().take(HUB_KEY).position(|face| {
+                matches!(face, KeyFace::Session(session) if session.key == format!("codex:{id}"))
+            }).expect("inactive conversation is available to click");
+            let target = target_for_face(&core.faces()[index], core.quota_view);
+            core.key_down_with_target(index, target);
+            core.key_up(index);
+        }
+        assert!(matches!(core.actions.as_slice(), [
+            Action::Open { agent: first_agent, session: first },
+            Action::Open { agent: second_agent, session: second },
+        ] if first_agent == "codex" && first == "shelved-a" && second_agent == "codex" && second == "shelved-b"));
+
+        // Ordinary activity changes reorder the visible tiles; delayed inactive polls update
+        // their metadata without changing the order in which the user shelved them.
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"normal-a", "state":"idle", "title":"now idle"}) });
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"normal-b", "state":"waiting_permission", "title":"now waiting"}) });
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"shelved-a", "state":"idle", "title":"refreshed A"}) });
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"shelved-b", "state":"idle", "title":"refreshed B", "_unread":3}) });
+
+        let slots = core.keypad_slots_at(now());
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "shelved-a");
+        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "shelved-b");
+        assert!(slots[..SESSION_KEYS_PER_PAGE].iter().flatten().all(|session| !session.archived), "all normal tiles stay ahead of the shelved tail");
+    }
+
+    #[test]
+    fn shelved_waiting_session_does_not_drive_hub_navigation() {
         let mut core = Core::new(Settings::default());
         core.in_control = true;
         add_test_session(&mut core, "active", "thinking");
@@ -1957,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn delayed_release_archives_captured_session_without_opening_it() {
+    fn long_hold_opens_captured_session_steps_without_opening_or_shelving_it() {
         let mut core = Core::new(Settings::default());
         core.in_control = true;
         add_test_session(&mut core, "first", "thinking");
@@ -1974,12 +2092,66 @@ mod tests {
         });
         assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:second"));
 
-        core.key_down[0] = Some(now() - ARCHIVE_HOLD_S - 0.1);
+        core.key_down[0] = Some(now() - DETAIL_HOLD_S - 0.1);
         core.tick();
-        assert!(core.sessions.iter().find(|s| s.id == "first").unwrap().archived);
+        assert_eq!(core.detail_key.as_deref(), Some("codex:first"));
+        assert!(!core.sessions.iter().find(|s| s.id == "first").unwrap().archived);
         assert!(!core.sessions.iter().find(|s| s.id == "second").unwrap().archived);
         core.key_up(0);
         assert!(core.actions.is_empty());
+    }
+
+    #[test]
+    fn step_stream_deduplicates_updates_and_bounds_history() {
+        let mut core = Core::new(Settings::default());
+        let payload = || Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"steps", "state":"thinking", "_steps":[
+                {"id":"turn-1", "kind":"Assistant", "status":"done", "title":"Answer", "text":"A stable answer"}
+            ]}),
+        };
+        core.apply(payload());
+        core.apply(payload());
+        let session = core.sessions.iter().find(|s| s.id == "steps").unwrap();
+        assert_eq!(session.steps.len(), 1, "repeated polling of the same provider step is a single tile");
+        assert_eq!(session.steps[0].text, "A stable answer");
+
+        let steps: Vec<_> = (0..128).map(|i| serde_json::json!({"id":format!("step-{i}"), "kind":"Tool", "title":format!("Tool {i}")})).collect();
+        core.apply(Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"steps", "state":"thinking", "_steps":steps}),
+        });
+        let session = core.sessions.iter().find(|s| s.id == "steps").unwrap();
+        assert_eq!(session.steps.len(), 128, "step history has a hard cap");
+        assert_eq!(session.steps.first().unwrap().signature, "provider:step-0", "the bounded history retains its oldest item when exactly at the cap");
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"steps", "state":"thinking", "_steps":[{"id":"step-128", "kind":"Tool"}]}) });
+        let session = core.sessions.iter().find(|s| s.id == "steps").unwrap();
+        assert_eq!(session.steps.len(), 128);
+        assert_eq!(session.steps.first().unwrap().signature, "provider:step-1", "the oldest step is evicted when a new step exceeds the cap");
+    }
+
+    #[test]
+    fn detail_paginates_eight_steps_and_back_returns_to_the_opening_page() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        add_test_session(&mut core, "many", "thinking");
+        let steps: Vec<_> = (0..10).map(|i| serde_json::json!({"id":format!("s{i}"), "kind":"Update", "title":format!("Step {i}")})).collect();
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"many", "state":"thinking", "_steps":steps}) });
+        core.page = 1;
+        core.open_session_steps("codex:many");
+        let faces = core.faces();
+        assert!(matches!(&faces[0], KeyFace::Step(step) if step.title == "Step 0"));
+        assert!(matches!(&faces[7], KeyFace::Step(step) if step.title == "Step 7"));
+        assert!(matches!(&faces[HUB_KEY], KeyFace::Back));
+        core.page_button(true, true);
+        core.page_button(true, false);
+        let faces = core.faces();
+        assert!(matches!(&faces[0], KeyFace::Step(step) if step.title == "Step 8"));
+        assert!(matches!(&faces[1], KeyFace::Step(step) if step.title == "Step 9"));
+        core.key_down(HUB_KEY);
+        core.key_up(HUB_KEY);
+        assert_eq!(core.detail_key, None);
+        assert_eq!(core.page, 1, "Back restores the prior session page");
     }
 
     #[test]
