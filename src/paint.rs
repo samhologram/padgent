@@ -154,6 +154,9 @@ pub struct KeyCx {
 }
 
 pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
+    let mut painter = p.clone();
+    if let KeyFace::Session(f) = face { painter.multiply_opacity(f.opacity); }
+    let p = &painter;
     let k = r.width();
     let rad = k * 0.2;
     let t = cx.t;
@@ -371,6 +374,13 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
         let badge = Rect::from_min_size(pos2(r.left() + k * 0.08, r.top() + k * 0.055), vec2(k * 0.52, k * 0.14));
         p.rect_filled(badge, CornerRadius::same((k * 0.055) as u8), Color32::from_rgb(255, 185, 35));
         p.text(badge.center(), Align2::CENTER_CENTER, format!("UNREAD {count}"), FontId::proportional(k * 0.078), Color32::from_rgb(35, 22, 0));
+    }
+    if f.scheduled {
+        let c = pos2(r.right() - k * 0.11, r.top() + k * 0.22);
+        let stroke = Stroke::new((k * 0.012).max(1.0), white(0.65));
+        p.circle_stroke(c, k * 0.045, stroke);
+        p.line_segment([c + vec2(0.0, -k * 0.026), c], stroke);
+        p.line_segment([c, c + vec2(k * 0.023, k * 0.012)], stroke);
     }
     if f.subagents > 0 {
         p.text(pos2(r.right() - k * 0.09, r.top() + k * 0.12), Align2::RIGHT_CENTER, format!("×{}", f.subagents), FontId::proportional(k * 0.075), white(0.75));

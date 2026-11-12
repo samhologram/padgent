@@ -19,18 +19,23 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   buttons; hold a key 0.6 s to show observed steps, one per key; use the page buttons and Back to return; hold both page buttons 1.5 s to hand the keypad
   back to Logi Options+. Each key's light follows the session's state (thinking, tool, writing,
   waiting for approval or an answer, done, error, compacting). Sessions idle for more than
-  30 minutes move to page 2 or later, leaving page 1 for active and recent sessions.
+  30 minutes move to page 2 or later, except acknowledged tiles kept as dim placeholders.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
-  session runs in (Terminal, iTerm2). Opening an inactive conversation moves it behind all
-  ordinary sessions, on page 2 or later; it returns when work resumes.
+  session runs in (Terminal, iTerm2). Opening an inactive conversation keeps its tile in
+  place at 45% intensity. New sessions use free slots, then replace dim tiles when needed;
+  replaced conversations remain accessible on later pages. Activity restores full intensity.
 - **Desktop activity:** follows the activity shown by desktop chats, including synchronized
   replies started elsewhere. Recognized assistant questions show a Question status.
+- **Scheduled runs:** recognizes local Claude Code scheduled sessions and Codex automation runs
+  from local app records, with a small clock marker on their tiles and in the notch.
+- **Codex Cloud tasks:** follows the first page of up to 20 tasks through the installed
+  Codex CLI and opens each task at its exact web URL.
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
   Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
-  Completed or unread conversations stay visible until opened, and return when work resumes.
-  Choose Never, Always, or When keypad disconnected in Menu bar and hand-over settings.
+  Completed or unread conversations stay bright until opened, then remain dimmed until work resumes.
+  Choose Never, Always, When keypad disconnected, or Quotas always, agents when disconnected in Menu bar and hand-over settings. The last option keeps quotas visible and shows agents when the keypad is physically disconnected.
 - **Settings:** colours, motion, key order, recent sessions, hand-over, launch at login, model
   roles for Claude Code (Haiku for the swarm, Sonnet for code, Opus for orchestration).
 
@@ -93,6 +98,11 @@ protocol). The physical keypad driver is experimental.
 Padgent is not affiliated with Logitech, Anthropic or OpenAI. Logitech, MX and
 Options+ are trademarks of Logitech; Claude is a trademark of Anthropic; Codex and ChatGPT are
 trademarks of OpenAI.
+
+## Architecture
+
+The [tracking architecture](docs/tracking-architecture.md) describes how app observations,
+session identity, source arbitration and tile placement fit together.
 
 ## License
 

@@ -120,7 +120,7 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
             .map(|c| {
                 c.visible()
                     .iter()
-                    .map(|s| serde_json::json!({ "agent": s.agent, "session": s.id, "title": s.title, "state": s.activity, "unread": s.unread, "text": s.text }))
+                    .map(|s| serde_json::json!({ "agent": s.agent, "session": s.id, "title": s.title, "state": s.activity, "unread": s.unread, "scheduled": s.scheduled, "text": s.text }))
                     .collect()
             })
             .unwrap_or_default();
@@ -128,7 +128,10 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
         return false;
     }
     if method == "GET" && (path == "/health" || path == "/") {
-        let health = serde_json::json!({"ok": true, "app": "padgent", "accessibilityTrusted": crate::watch::trusted()});
+        let scan = crate::local::scheduled_scan_health();
+        let health = serde_json::json!({"ok": true, "app": "padgent", "accessibilityTrusted": crate::watch::trusted(),
+            "claudeScheduledScan": {"scans":scan.scans, "directories":scan.directories, "files":scan.files,
+                "records":scan.records, "eligible":scan.eligible, "permissionDenied":scan.permission_denied, "otherErrors":scan.other_errors}});
         respond(&mut stream, 200, &health.to_string());
         return false;
     }
@@ -199,7 +202,9 @@ fn handle(mut stream: TcpStream, core: &Arc<Mutex<Core>>) -> bool {
         Ok(mut c) => {
             let known = c.agent(&agent).is_some();
             if known {
-                c.apply(Incoming { agent, event, body: json });
+                let mut observation = c.decode(Incoming { agent, event, body: json });
+                if matches!(segs.first(), Some(&"hook")) { observation.source = crate::observation::Source::Hook; }
+                c.observe(observation);
             }
             known
         }

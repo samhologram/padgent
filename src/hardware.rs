@@ -237,6 +237,11 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
         KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
         KeyFace::Hub(h) => render_hub(&mut pm, h, phase, font),
     }
+    if let KeyFace::Session(f) = face {
+        for pixel in pm.data_mut().chunks_exact_mut(4) {
+            for channel in &mut pixel[..3] { *channel = (*channel as f32 * f.opacity).round() as u8; }
+        }
+    }
     pm
 }
 
@@ -329,6 +334,12 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
             pm.fill_path(&PathBuilder::from_rect(rect), &paint, FillRule::Winding, Transform::identity(), None);
         }
         draw_text(pm, font, 9.0, 36.0 - text_width(font, 9.0, &label) / 2.0, 17.0, &label, Rgb(35, 22, 0), 1.0);
+    }
+    if f.scheduled {
+        let (x, y, r) = (k - 13.0, 24.0, 5.0);
+        let tint = color(Rgb(255, 255, 255), 0.65);
+        stroke_poly(pm, &arc_pts(x, y, r, 0.0, std::f32::consts::TAU), 1.2, tint);
+        stroke_poly(pm, &[(x, y - 3.0), (x, y), (x + 2.5, y + 1.5)], 1.2, tint);
     }
     // Badge and name under the light, then the state, then the live text,
     // unread count or last turn.
@@ -929,7 +940,7 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                         release(d);
                     }
                     connected_at = None;
-                    let observe = core.lock().map(|c| c.settings.island_visibility == crate::model::IslandVisibility::WhenDisconnected).unwrap_or(false);
+                    let observe = core.lock().map(|c| matches!(c.settings.island_visibility, crate::model::IslandVisibility::WhenDisconnected | crate::model::IslandVisibility::QuotasAlways)).unwrap_or(false);
                     if observe {
                         if api.is_none() { api = hidapi::HidApi::new().ok(); }
                         if last_scan.elapsed() > Duration::from_secs(2) {
@@ -1296,6 +1307,29 @@ mod tests {
             let j = jpeg(&pm);
             assert!(!j.is_empty() && j.len() <= MAX_SINGLE_JPEG, "jpeg {} bytes", j.len());
         }
+    }
+
+    #[test]
+    fn acknowledged_key_reduces_full_render_intensity() {
+        let font = load_font();
+        let mut core = crate::model::Core::new(crate::model::Settings::default());
+        core.in_control = true;
+        core.apply(crate::model::Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: serde_json::json!({"session":"acknowledged-render", "state":"idle", "text":"Finished response"}),
+        });
+        core.sessions[0].acknowledged = true;
+        let mut face = core.faces().iter().find_map(|f| match f {
+            KeyFace::Session(face) if face.opacity < 1.0 => Some(face.clone()),
+            _ => None,
+        }).expect("acknowledged demo session");
+        let dim = render_key(&KeyFace::Session(face.clone()), 10.0, &font);
+        face.opacity = 1.0;
+        let bright = render_key(&KeyFace::Session(face), 10.0, &font);
+        let sum = |pm: &Pixmap| -> u64 { pm.data().chunks_exact(4).flat_map(|p| p[..3].iter()).map(|&x| x as u64).sum() };
+        let ratio = sum(&dim) as f32 / sum(&bright) as f32;
+        assert!((ratio - crate::model::ACKNOWLEDGED_OPACITY).abs() < 0.015, "ratio {ratio}");
     }
 
     #[test]

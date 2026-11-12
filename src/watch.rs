@@ -2,8 +2,8 @@
 //! Accessibility: each open window is a conversation; a visible "Stop" button means a
 //! reply is being written; the last long text is its last message. Read-only.
 
-use crate::model::{Core, Incoming};
-use serde_json::json;
+use crate::model::{Activity, Core};
+use crate::observation::{Observation, Source};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -414,7 +414,9 @@ impl ReplyObservation {
 
 fn is_message_wrapper(label: &str) -> bool {
     let label = label.trim();
-    (label.starts_with("Message ") && label.contains(" of ")) || label == "Currently streaming message"
+    (label.starts_with("Message ") && label.contains(" of "))
+        || label.strip_prefix("Message ").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        || label == "Currently streaming message"
 }
 
 /// Extract the stable ID only from a Claude standard chat page, never a Code route.
@@ -425,9 +427,16 @@ fn claude_chat_id(url: &str) -> Option<String> {
     Some(id.to_string())
 }
 
+/// A desktop Code host session, as exposed by the active Claude web area.
+fn claude_code_id(url: &str) -> Option<String> {
+    let path = url.strip_prefix("https://claude.ai/epitaxy/")?;
+    let id = path.split(['/', '?', '#']).next()?;
+    crate::integrations::claude_continue_url(id).map(|_| id.to_string())
+}
+
 /// Keep the standard-chat web area when a window also contains host or utility webviews.
 fn select_claude_webarea(current: &mut Option<(String, String)>, url: &str, title: &str) {
-    if claude_chat_id(url).is_some() {
+    if claude_chat_id(url).is_some() || claude_code_id(url).is_some() {
         *current = Some((url.to_string(), title.to_string()));
     }
 }
@@ -588,15 +597,19 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             }
                             // Claude Desktop also hosts Code. Only a verified chat URL is a
                             // standard conversation; never infer it from the generic window title.
-                            let claude_chat = if agent == "claude-desktop" {
-                                match w.claude_webarea.as_ref().and_then(|(url, _)| claude_chat_id(url)) {
-                                    Some(id) => Some(id),
-                                    None => continue,
-                                }
+                            let route = if agent == "claude-desktop" {
+                                let Some((url, _)) = w.claude_webarea.as_ref() else { continue };
+                                if let Some(id) = claude_chat_id(url) { Some((false, id)) }
+                                else if let Some(id) = claude_code_id(url) { Some((true, id)) }
+                                else { continue }
                             } else { None };
-                            let raw = if claude_chat.is_some() { w.claude_webarea.as_ref().map(|(_, title)| title.trim()).unwrap_or_default() } else { w.title.trim() };
+                            let is_code = route.as_ref().is_some_and(|(code, _)| *code);
+                            let effective_agent = if is_code { "claude-code" } else { agent };
+                            if !core.lock().map(|c| c.agent_enabled(effective_agent)).unwrap_or(false) { continue; }
+                            let raw = if route.is_some() { w.claude_webarea.as_ref().map(|(_, title)| title.trim()).unwrap_or_default() } else { w.title.trim() };
                             let title = raw
                                 .trim_end_matches(" - ChatGPT")
+                                .trim_end_matches(" - Claude Code")
                                 .trim_end_matches(" - Claude")
                                 .trim();
                             let generating = w.generating || current_conversation_running(agent, title, &w.running_titles);
@@ -608,17 +621,12 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                                     continue;
                                 }
                             }
-                            if claude_chat.is_some() && (title.is_empty() || app_named) { continue; }
-                            let id = claude_chat.unwrap_or_else(|| if title.is_empty() { "current".to_string() } else { title.to_string() });
-                            // A Claude Code conversation in the Claude app already has its own key.
-                            let is_code = core
-                                .lock()
-                                .map(|c| c.sessions.iter().any(|s| s.agent == "claude-code" && s.title == id))
-                                .unwrap_or(false);
-                            if is_code {
-                                continue;
-                            }
-                            let key = (agent.to_string(), id.clone());
+                            if route.is_some() && (title.is_empty() || app_named) { continue; }
+                            let id = if let Some((true, host)) = route.as_ref() {
+                                let resolved = crate::local::claude_session_for_host(host).unwrap_or_else(|| host.clone());
+                                resolved
+                            } else { route.as_ref().map(|(_, id)| id.clone()).unwrap_or_else(|| if title.is_empty() { "current".to_string() } else { title.to_string() }) };
+                            let key = (effective_agent.to_string(), id.clone());
                             let prev = last.get(&key).cloned();
                             let state = if generating {
                                 "streaming"
@@ -637,17 +645,26 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
                             }
                             let changed = prev.as_ref() != Some(&(generating, question, text.clone(), title.to_string()));
                             if !changed {
+                                if is_code {
+                                    let source = if generating || question { Source::DesktopLive } else { Source::DesktopInactive };
+                                    let mut obs = Observation::new(effective_agent, &id, source, crate::model::now());
+                                    if let Some((true, host)) = route.as_ref() { obs.aliases.push(host.clone()); }
+                                    if let Ok(mut c) = core.lock() { c.observe(obs); }
+                                }
                                 continue;
                             }
                             last.insert(key, (generating, question, text.clone(), title.to_string()));
                             let fallback = core.lock().ok().and_then(|c| c.agent(agent).map(|a| a.name.clone())).unwrap_or_default();
                             let shown = if title.is_empty() { fallback.as_str() } else { title };
                             if let Ok(mut c) = core.lock() {
-                                c.apply(Incoming {
-                                    agent: agent.to_string(),
-                                    event: None,
-                                    body: json!({ "session": id, "state": state, "title": shown, "text": text, "_app": bundle }),
-                                });
+                                let source = if is_code && (generating || question) { Source::DesktopLive } else { Source::DesktopInactive };
+                                let mut obs = Observation::new(effective_agent, &id, source, crate::model::now());
+                                obs.activity = Activity::parse(state);
+                                obs.title = Some(shown.to_string());
+                                obs.text = Some(text.clone());
+                                if !is_code { obs.app = Some(bundle.to_string()); }
+                                if let Some((true, host)) = route.as_ref() { obs.aliases.push(host.clone()); }
+                                c.observe(obs);
                             }
                             wake();
                         }
@@ -663,6 +680,18 @@ pub fn start(core: Arc<Mutex<Core>>, wake: Arc<dyn Fn() + Send + Sync>) {
 #[cfg(test)]
 mod tests {
     use super::{claude_chat_id, current_conversation_running, message_child_start, recent_message_start, running_title, select_claude_webarea, ReplyObservation};
+
+    #[test]
+    fn code_route_and_message_wrappers_are_scoped() {
+        use super::{claude_code_id, is_message_wrapper};
+        assert_eq!(claude_code_id("https://claude.ai/epitaxy/local_abc-123?x=1").as_deref(), Some("local_abc-123"));
+        assert!(claude_code_id("https://claude.ai/chat/local_abc").is_none());
+        assert!(claude_code_id("https://claude.ai/epitaxy/settings").is_none());
+        assert!(claude_code_id("https://evil.example/epitaxy/local_abc").is_none());
+        assert!(claude_code_id("https://claude.ai/epitaxy/local_bad%20id").is_none());
+        assert!(is_message_wrapper("Message 6"));
+        assert!(!is_message_wrapper("Message composer"));
+    }
 
     #[test]
     fn only_a_finished_latest_assistant_question_waits() {

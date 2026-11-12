@@ -4,6 +4,9 @@
 use crate::colour::{self, Rgb};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use crate::observation::{Observation, ObservationEvent, ObservationKind};
+#[cfg(test)] use crate::observation::Source;
+use crate::tracking::SourcePolicy;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -297,7 +300,7 @@ pub struct AgentDef {
     pub builtin: bool,
 }
 
-fn hook_events() -> BTreeMap<String, String> {
+pub(crate) fn hook_events() -> BTreeMap<String, String> {
     [
         ("SessionStart", "starting"),
         ("UserPromptSubmit", "thinking"),
@@ -354,7 +357,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
         "Live state from Claude Code hooks: thinking, tools, approvals, done.",
     );
     claude.models = default_model_roles();
-    let mut codex = mk("codex", "Codex", "CX", 270.0, "Terminal", "Live state from Codex hooks, shown as GPT-style status dots with the last message.");
+    let mut codex = mk("codex", "Codex", "CX", 270.0, "Terminal", "Local records and Cloud task status, shown as GPT-style status dots with the last message.");
     codex.style = "dots".into();
     let mut chatgpt = mk("chatgpt", "ChatGPT", "GP", 150.0, "ChatGPT", "Active and recent conversations in the ChatGPT app, shown as status dots with the last message.");
     chatgpt.style = "dots".into();
@@ -530,7 +533,13 @@ pub enum Motion {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum IslandVisibility { Never, Always, WhenDisconnected }
+pub enum IslandVisibility {
+    Never,
+    Always,
+    WhenDisconnected,
+    #[serde(alias = "quotasOnly")]
+    QuotasAlways,
+}
 
 impl Default for IslandVisibility {
     fn default() -> Self { Self::Always }
@@ -725,6 +734,7 @@ pub struct Session {
     pub subagent_at: f64,
     /// Desktop app (bundle id) showing this conversation, for opening it exactly.
     pub app_bundle: String,
+    pub open_url: Option<String>,
     /// Terminal device and program the agent runs in (from the hook's X-TTY / X-Term).
     pub tty: String,
     pub term: String,
@@ -732,10 +742,12 @@ pub struct Session {
     pub pid: i32,
     /// Replies not yet read in the agent's own app (Codex read receipts).
     pub unread: u32,
-    /// Shelved on later keypad pages until a new turn or resumed work.
-    pub archived: bool,
-    /// Monotonic local ordering of conversations moved to the tail.
-    pub shelved_order: u64,
+    /// Proven scheduled origin, retained across partial updates.
+    pub scheduled: bool,
+    /// Opened while inactive; remains visible at reduced intensity until work resumes.
+    pub acknowledged: bool,
+    /// Time of the user action, independent of provider update timestamps.
+    pub acknowledged_at: Option<f64>,
     /// A completion or unread reply remains visible until this conversation is opened.
     pub pending_attention: bool,
     /// Text waiting for the current one's 1.5 s dwell to pass.
@@ -743,7 +755,7 @@ pub struct Session {
     pub steps: Vec<SessionStep>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SessionStep { pub kind: String, pub status: String, pub title: String, pub text: String, pub signature: String }
 
 impl Session {
@@ -758,16 +770,6 @@ pub struct Incoming {
     pub agent: String,
     pub event: Option<String>,
     pub body: Value,
-}
-
-fn str_at<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str)).filter(|s| !s.trim().is_empty())
-}
-
-fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    let clean: String = line.replace("**", "").replace('`', "");
-    clean.chars().take(max).collect()
 }
 
 // ---------------------------------------------------------------- takeover
@@ -794,9 +796,12 @@ pub enum KeyFace {
     Back,
 }
 
+pub const ACKNOWLEDGED_OPACITY: f32 = 0.45;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionFace {
     pub key: String,
+    pub opacity: f32,
     pub badge: String,
     pub agent_name: String,
     pub title: String,
@@ -809,6 +814,7 @@ pub struct SessionFace {
     pub subagents: u32,
     pub dots: bool,
     pub unread: u32,
+    pub scheduled: bool,
     /// The last message whatever its age (shown dim on the tile).
     pub last_message: String,
     /// When the session last did something (for "last turn 33 min ago").
@@ -864,7 +870,12 @@ pub struct Core {
     pub agents: Vec<AgentDef>,
     pub sessions: Vec<Session>,
     order: Vec<String>,
-    next_shelved_order: u64,
+    // Stable physical positions, reconciled lazily whenever the keypad mapping is read.
+    layout: std::cell::RefCell<crate::layout::KeypadLayout>,
+    pub island_layout: std::cell::RefCell<crate::layout::IslandLayout>,
+    source_policy: SourcePolicy,
+    aliases: std::collections::HashMap<(String, String), String>,
+    suppressed_local: std::collections::HashMap<(String, String), Observation>,
     pub page: usize,
     pub quota_view: bool,
     pub quota_page: usize,
@@ -897,7 +908,11 @@ impl Core {
             agents,
             sessions: Vec::new(),
             order: Vec::new(),
-            next_shelved_order: 0,
+            layout: std::cell::RefCell::new(crate::layout::KeypadLayout::default()),
+            island_layout: std::cell::RefCell::new(crate::layout::IslandLayout::default()),
+            source_policy: SourcePolicy::default(),
+            aliases: std::collections::HashMap::new(),
+            suppressed_local: std::collections::HashMap::new(),
             page: 0,
             quota_view: false,
             quota_page: 0,
@@ -924,9 +939,67 @@ impl Core {
         self.agents.iter().find(|a| a.id == id)
     }
 
+    fn reconcile_alias(&mut self, agent: &str, host: &str, session: &str) {
+        if host == session { return; }
+        let prior = self.aliases.get(&(agent.to_string(), host.to_string())).cloned();
+        if let Some(prior) = prior {
+            if prior != session && prior != host { self.reconcile_alias(agent, &prior, session); }
+        }
+        for ((owner, _), canonical) in &mut self.aliases {
+            if owner == agent && canonical == host { *canonical = session.to_string(); }
+        }
+        self.aliases.insert((agent.to_string(), host.to_string()), session.to_string());
+        if agent == "claude-code" { self.source_policy.remap(host, session); }
+        if let Some(mut pending) = self.suppressed_local.remove(&(agent.to_string(), host.to_string())) {
+            pending.session = session.to_string();
+            self.suppressed_local.insert((agent.to_string(), session.to_string()), pending);
+        }
+        let Some(source) = self.sessions.iter().position(|s| s.agent == agent && s.id == host) else { return };
+        let target = self.sessions.iter().position(|s| s.agent == agent && s.id == session);
+        if let Some(target) = target {
+            let old = self.sessions.remove(source);
+            let target = if source < target { target - 1 } else { target };
+            let existing = &mut self.sessions[target];
+            existing.scheduled |= old.scheduled;
+            if existing.activity.group() != Group::Working {
+                existing.acknowledged |= old.acknowledged;
+                existing.acknowledged_at = match (existing.acknowledged_at, old.acknowledged_at) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            } else {
+                existing.acknowledged = false;
+                existing.acknowledged_at = None;
+            }
+            existing.pending_attention |= old.pending_attention;
+            existing.unread = existing.unread.max(old.unread);
+        } else {
+            self.sessions[source].id = session.to_string();
+        }
+        let old_key = format!("{agent}:{host}");
+        let new_key = format!("{agent}:{session}");
+        self.layout.borrow_mut().remap(&old_key, &new_key);
+        self.island_layout.borrow_mut().remap(&old_key, &new_key);
+        if self.detail_key.as_deref() == Some(old_key.as_str()) {
+            self.detail_key = Some(new_key.clone());
+        }
+        for target in &mut self.key_target {
+            if let Some(KeyPressTarget::Session(key)) = target {
+                if *key == old_key { *key = new_key.clone(); }
+            }
+        }
+        if self.order.contains(&new_key) {
+            self.order.retain(|key| key != &old_key);
+        } else {
+            for key in &mut self.order {
+                if *key == old_key { *key = new_key.clone(); }
+            }
+        }
+    }
+
     /// Desktop apps to follow: (agent id, bundle id, electron).
     pub fn watched_apps(&self) -> Vec<(String, String, bool)> {
-        self.agents
+        let mut apps: Vec<_> = self.agents
             .iter()
             .filter(|a| self.agent_enabled(&a.id))
             .filter_map(|a| {
@@ -938,7 +1011,11 @@ impl Core {
                 let electron = a.electron || b.contains("claude") || b.contains("antigravity");
                 (!b.is_empty()).then(|| (a.id.clone(), b, electron))
             })
-            .collect()
+            .collect();
+        if self.agent_enabled("claude-code") && !apps.iter().any(|(agent, _, _)| agent == "claude-desktop") {
+            apps.push(("claude-desktop".into(), "com.anthropic.claudefordesktop".into(), true));
+        }
+        apps
     }
 
     pub fn agent_enabled(&self, id: &str) -> bool {
@@ -957,77 +1034,66 @@ impl Core {
 
     // ---- intake
 
-    pub fn apply(&mut self, inc: Incoming) {
-        let t = now();
-        let agent_id = inc.agent.trim().to_string();
-        let def = self.agent(&agent_id).cloned();
-        let b = &inc.body;
-        let sid = str_at(b, &["session_id", "session", "sessionId", "thread_id", "conversation_id", "id"])
-            .unwrap_or("default")
-            .to_string();
-        let event = inc
-            .event
-            .clone()
-            .or_else(|| str_at(b, &["hook_event_name", "event"]).map(str::to_string));
+    pub fn decode(&self, inc: Incoming) -> Observation {
+        let def = self.agent(inc.agent.trim());
+        crate::observation::decode_incoming(inc, def, now())
+    }
 
-        // Work out the new state.
-        let tool_name = str_at(b, &["tool_name", "tool"]).unwrap_or("");
-        let mut activity = str_at(b, &["state", "activity", "status"]).and_then(Activity::parse);
-        if activity.is_none() {
-            if let Some(ev) = &event {
-                let mapped = def
-                    .as_ref()
-                    .and_then(|d| d.events.get(ev))
-                    .cloned()
-                    .or_else(|| hook_events().get(ev).cloned());
-                activity = mapped.as_deref().and_then(Activity::parse).or_else(|| Activity::parse(ev));
+    #[cfg(test)]
+    pub fn apply(&mut self, inc: Incoming) { let obs = self.decode(inc); self.observe(obs); }
+
+    pub fn observe(&mut self, mut obs: Observation) {
+        obs.text = obs.text.map(|text| crate::observation::first_line(&text, 240));
+        obs.title = obs.title.map(|title| crate::observation::first_line(&title, 60));
+        let agent_id = obs.agent.trim().to_string();
+        if let Some(canonical) = self.aliases.get(&(agent_id.clone(), obs.session.clone())) { obs.session = canonical.clone(); }
+        if obs.kind == ObservationKind::Discovery {
+            // Prefer an already tracked exact alias; an untracked alias does not change
+            // the host identity before its normal producer establishes the link.
+            if let Some(existing) = obs.aliases.iter().find_map(|alias| {
+                let canonical = self.aliases.get(&(agent_id.clone(), alias.clone())).unwrap_or(alias);
+                self.sessions.iter().any(|s| s.agent == agent_id && s.id == *canonical).then(|| canonical.clone())
+            }) {
+                let host = std::mem::replace(&mut obs.session, existing);
+                obs.aliases = vec![host];
+            } else {
+                obs.aliases.clear();
             }
         }
-        if event.as_deref() == Some("Notification") {
-            // SessionRecord.resolve: a notification about input, a question or an
-            // elicitation waits for an answer; anything else waits for approval.
-            let msg = [str_at(b, &["message"]), str_at(b, &["notification_type", "type"])]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase();
-            activity = Some(if ["input", "question", "elicitation"].iter().any(|w| msg.contains(w)) {
-                Activity::WaitingQuestion
-            } else {
-                Activity::WaitingPermission
-            });
+        if !self.source_policy.observe(&agent_id, &obs.session, obs.source, obs.observed_at) { return; }
+        for alias in obs.aliases.clone() { self.reconcile_alias(&agent_id, &alias, &obs.session); }
+        if let Some(canonical) = self.aliases.get(&(agent_id.clone(), obs.session.clone())) { obs.session = canonical.clone(); }
+        let sid = obs.session.clone();
+        let t = obs.observed_at;
+        if obs.kind == ObservationKind::Heartbeat {
+            if !self.source_policy.heartbeat_needed(&agent_id, &sid, obs.source, t) { return; }
+            let Some(mut pending) = self.suppressed_local.remove(&(agent_id.clone(), sid.clone())) else { return };
+            pending.observed_at = t;
+            obs = pending;
         }
-        if event.as_deref() == Some("PreToolUse") && tool_name == "AskUserQuestion" {
-            activity = Some(Activity::WaitingQuestion);
+        if obs.kind == ObservationKind::Discovery {
+            if let Some(existing) = self.sessions.iter_mut().find(|s| s.agent == agent_id && s.id == sid) {
+                if obs.scheduled && !existing.scheduled { existing.scheduled = true; self.revision += 1; }
+                return;
+            }
         }
-        let Some(activity) = activity else { return };
-
-        // Live text.
-        let text = str_at(b, &["text", "message", "last_assistant_message", "summary"])
-            .map(|s| first_line(s, 240))
-            .or_else(|| {
-                if activity == Activity::Tool {
-                    let input = b.get("tool_input").cloned().unwrap_or(Value::Null);
-                    let detail = str_at(&input, &["command", "file_path", "pattern", "url", "query", "description", "path"])
-                        .map(|s| first_line(s, 200))
-                        .unwrap_or_default();
-                    Some(if detail.is_empty() { tool_name.to_string() } else { format!("{tool_name} {detail}") })
-                } else {
-                    str_at(b, &["prompt"]).map(|s| first_line(s, 240))
+        let recorded_at = if obs.kind == ObservationKind::Discovery {
+            obs.recorded_at.filter(|at| at.is_finite() && *at > 0.0 && *at <= t)
+        } else { None };
+        let snapshot = obs.clone();
+        let Some(activity) = obs.activity else {
+            if obs.scheduled {
+                if let Some(s) = self.sessions.iter_mut().find(|s| s.agent == agent_id && s.id == sid) {
+                    if !s.scheduled { s.scheduled = true; self.revision += 1; }
                 }
-            });
-        let title = str_at(b, &["title", "name"])
-            .map(|s| first_line(s, 60))
-            .or_else(|| {
-                str_at(b, &["cwd", "workspace", "project"]).map(|p| {
-                    std::path::Path::new(p)
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.to_string())
-                })
-            });
-
+            }
+            return;
+        };
+        let def = self.agent(&agent_id).cloned();
+        let event = obs.event;
+        let mut text = obs.text;
+        let title = obs.title;
+        let tool_name = obs.tool_name.as_deref().unwrap_or("");
         let idx = self.sessions.iter().position(|s| s.agent == agent_id && s.id == sid);
         let new_session = idx.is_none();
         let idx = match idx {
@@ -1045,18 +1111,20 @@ impl Core {
                     tool: None,
                     text: String::new(),
                     text_at: t,
-                    since: t,
-                    updated: t,
-                    turn_started: t,
+                    since: recorded_at.unwrap_or(t),
+                    updated: recorded_at.unwrap_or(t),
+                    turn_started: recorded_at.unwrap_or(t),
                     subagents: 0,
                     subagent_at: t,
                     app_bundle: String::new(),
+                    open_url: None,
                     tty: String::new(),
                     term: String::new(),
                     pid: 0,
                     unread: 0,
-                    archived: false,
-                    shelved_order: 0,
+                    scheduled: false,
+                    acknowledged: false,
+                    acknowledged_at: None,
                     pending_attention: false,
                     pending_text: None,
                     steps: Vec::new(),
@@ -1065,58 +1133,50 @@ impl Core {
             }
         };
         let s = &mut self.sessions[idx];
+        s.scheduled |= obs.scheduled;
         let old = s.activity;
+        let incoming_activity = activity;
+        let activity = self.source_policy.activity(&agent_id, &sid, obs.source, t, old, activity);
+        let suppressed = incoming_activity != activity;
+        self.source_policy.record_local(&agent_id, &sid, obs.source, suppressed);
+        if suppressed { text = None; }
+        if agent_id == "claude-code" && obs.source == crate::observation::Source::LocalSnapshot {
+            let key = (agent_id.clone(), sid.clone());
+            if incoming_activity != activity { self.suppressed_local.insert(key, snapshot); }
+            else { self.suppressed_local.remove(&key); }
+        }
         // Read-receipt changes do not turn an already idle completed Codex thread into
         // a newly completed turn. Its local record can repeat the same final message.
         let activity = if old == Activity::Idle && activity == Activity::Done && event.is_none()
-            && b.get("_unread").is_some() && text.as_deref() == Some(s.text.as_str())
-            && b.get("_text_at").and_then(Value::as_f64).is_some_and(|at| at > 0.0 && at <= s.text_at)
+            && obs.unread.is_some() && text.as_deref() == Some(s.text.as_str())
+            && obs.text_at.is_some_and(|at| at > 0.0 && at <= s.text_at)
         { old } else { activity };
         // An old local record keeps its real age when first discovered after app launch.
         let first_idle_time = if new_session && activity.group() == Group::Idle {
-            b.get("_text_at").and_then(Value::as_f64).filter(|at| *at > 0.0 && *at <= t)
+            obs.text_at.filter(|at| *at > 0.0 && *at <= t)
         } else { None };
-        if let Some(v) = str_at(b, &["_app"]) {
-            s.app_bundle = v.to_string();
-        }
-        if let Some(v) = str_at(b, &["_tty"]) {
-            let v = v.trim();
-            s.tty = if v.starts_with("/dev/") { v.to_string() } else { format!("/dev/{v}") };
-        }
-        if let Some(v) = str_at(b, &["_pid"]).and_then(|v| v.trim().parse::<i32>().ok()) {
-            s.pid = v;
-        }
-        if let Some(v) = str_at(b, &["_term"]) {
-            s.term = v.to_string();
-        }
-        if let Some(title) = title {
-            s.title = title;
-        }
-        if let Some(steps) = b.get("_steps").and_then(Value::as_array) {
-            for step in steps.iter().take(128) {
-                let Some(id) = str_at(step, &["id"]) else { continue };
-                let signature = format!("provider:{id}");
-                let value = SessionStep {
-                    kind: str_at(step, &["kind"]).unwrap_or("Update").to_string(),
-                    status: str_at(step, &["status"]).unwrap_or("").to_string(),
-                    title: str_at(step, &["title"]).unwrap_or("").to_string(),
-                    text: str_at(step, &["text"]).unwrap_or("").to_string(),
-                    signature: signature.clone(),
-                };
-                if let Some(existing) = s.steps.iter_mut().find(|item| item.signature == signature) { *existing = value; }
-                else { s.steps.push(value); }
+        if let Some(v) = obs.app { s.app_bundle = v; }
+        if let Some(v) = obs.open_url { s.open_url = Some(v); }
+        if let Some(v) = obs.tty { let v = v.trim(); s.tty = if v.starts_with("/dev/") { v.to_string() } else { format!("/dev/{v}") }; }
+        if let Some(v) = obs.pid { s.pid = v; }
+        if let Some(v) = obs.term { s.term = v; }
+        if let Some(title) = title { s.title = title; }
+        if let Some(steps) = &obs.steps {
+            for value in steps.iter().take(128) {
+                if let Some(existing) = s.steps.iter_mut().find(|item| item.signature == value.signature) { *existing = value.clone(); }
+                else { s.steps.push(value.clone()); }
             }
             if s.steps.len() > 128 { s.steps.drain(..s.steps.len() - 128); }
         }
         // Record meaningful observed updates once, not repeated local polls or streaming fragments.
         let step_text = text.clone().unwrap_or_default();
-        let meaningful = event.as_deref() != Some("UserPromptSubmit")
+        let meaningful = event != Some(ObservationEvent::TurnStarted)
             && (activity == Activity::Tool || (!step_text.is_empty() && (activity != Activity::Streaming || old != Activity::Streaming)));
-        if meaningful && b.get("_steps").is_none() {
+        if meaningful && !suppressed && obs.steps.is_none() {
             let kind = if activity == Activity::Tool { "Tool" } else { "Update" }.to_string();
             let title = if activity == Activity::Tool && !tool_name.is_empty() { tool_name.to_string() } else { format!("{:?}", activity) };
             let status = format!("{:?}", activity);
-            let identity = str_at(b, &["tool_use_id", "item_id", "message_id", "event_id"]).unwrap_or("");
+            let identity = obs.step_id.as_deref().unwrap_or("");
             let signature = if identity.is_empty() { format!("{kind}|{status}|{title}|{step_text}") } else { format!("event:{identity}") };
             let step = SessionStep { kind, status, title, text: step_text, signature: signature.clone() };
             if let Some(existing) = s.steps.iter_mut().find(|item| item.signature == signature) { *existing = step; }
@@ -1126,17 +1186,17 @@ impl Core {
             }
         }
         if let Some(text) = text {
-            if text != s.text && !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S && b.get("_text_at").is_none() {
+            if text != s.text && !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S && obs.text_at.is_none() {
                 // The current text hasn't had its 1.5 s yet: show the new one after it.
                 s.pending_text = Some(text);
             } else if text != s.text {
                 s.pending_text = None;
                 s.text = text;
                 // A message the agent's records date (Codex) keeps its own time.
-                s.text_at = b.get("_text_at").and_then(Value::as_f64).filter(|v| *v > 0.0).unwrap_or(t);
+                s.text_at = obs.text_at.filter(|v| *v > 0.0).unwrap_or(t);
             }
         }
-        if b.get("_clear_text").and_then(Value::as_bool) == Some(true) {
+        if obs.clear_text && !suppressed {
             // A new live step without words yet: drop the previous step's text (after its dwell).
             if !s.text.is_empty() && t - s.text_at < TEXT_DWELL_S {
                 s.pending_text = Some(String::new());
@@ -1145,17 +1205,17 @@ impl Core {
                 s.text_at = t;
             }
         }
-        if let Some(n) = b.get("_unread").and_then(Value::as_u64) {
-            s.unread = n.min(999) as u32;
+        if let Some(n) = obs.unread {
+            s.unread = n.min(999);
         }
-        if activity == Activity::Tool {
+        if activity == Activity::Tool && !suppressed {
             s.tool = Some(ToolKind::from_tool_name(tool_name));
             if s.tool == Some(ToolKind::Delegate) {
                 s.subagents += 1;
                 s.subagent_at = t;
             }
         }
-        if event.as_deref() == Some("SubagentStop") {
+        if event == Some(ObservationEvent::SubagentStopped) {
             s.subagents = s.subagents.saturating_sub(1);
             s.subagent_at = t;
         }
@@ -1164,17 +1224,19 @@ impl Core {
         }
         let og = old.group();
         let ng = activity.group();
-        if (og != Group::Working && ng == Group::Working) || event.as_deref() == Some("UserPromptSubmit") {
+        if (og != Group::Working && ng == Group::Working) || event == Some(ObservationEvent::TurnStarted) {
             s.turn_started = t;
-            s.archived = false;
-            s.shelved_order = 0;
+            s.acknowledged = false;
+            s.acknowledged_at = None;
             s.pending_attention = false;
         }
-        if !s.archived && (activity == Activity::Done || s.unread > 0) {
+        if s.acknowledged { s.unread = 0; }
+        if !s.acknowledged && (activity == Activity::Done || s.unread > 0) {
             s.pending_attention = true;
         }
         s.activity = activity;
-        s.updated = t;
+        s.updated = recorded_at.unwrap_or(t);
+        if let Some(recorded_at) = recorded_at { s.since = recorded_at; s.turn_started = recorded_at; }
         let turn_change = og != ng && (ng == Group::Waiting || og == Group::Working || ng == Group::Working || ng == Group::Done);
         if self.settings.reorder_on == ReorderOn::All || turn_change || !self.order.contains(&self.sessions[idx].key()) {
             self.resort();
@@ -1227,7 +1289,9 @@ impl Core {
             }
         }
         let before = self.sessions.len();
-        self.sessions.retain(|s| s.archived || s.pending_attention || t - s.updated < REMOVE_AFTER_S);
+        let recency = (self.settings.recency_minutes as f64 * 60.0).min(REMOVE_AFTER_S);
+        self.sessions.retain(|s| s.pending_attention || t - s.updated < REMOVE_AFTER_S
+            || (s.acknowledged && s.acknowledged_at.is_some_and(|at| t - at < if s.scheduled { REMOVE_AFTER_S } else { recency })));
         if self.sessions.len() != before {
             changed = true;
         }
@@ -1261,18 +1325,19 @@ impl Core {
     pub fn island_visible(&self) -> bool {
         match self.settings.island_visibility {
             IslandVisibility::Never => false,
-            IslandVisibility::Always => true,
+            IslandVisibility::Always | IslandVisibility::QuotasAlways => true,
             IslandVisibility::WhenDisconnected => self.keypad_connected == Some(false),
         }
+    }
+
+    pub fn island_quotas_only(&self) -> bool {
+        self.settings.island_visibility == IslandVisibility::QuotasAlways && self.keypad_connected != Some(false)
     }
 
     pub fn visible(&self) -> Vec<&Session> {
         let t = now();
         let recency = self.settings.recency_minutes as f64 * 60.0;
-        // Working and waiting sessions always keep a key; others only while recent.
-        let recent = |s: &&Session| {
-            !s.archived && (s.pending_attention || s.unread > 0 || matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || t - s.updated < recency)
-        };
+        let recent = |s: &&Session| crate::tracking::session_visible(s, t, recency);
         let mut v: Vec<&Session> = self
             .order
             .iter()
@@ -1288,15 +1353,14 @@ impl Core {
         v
     }
 
-    /// Capture the exact target and shelve inactive work on open.
+    /// Capture the exact target and acknowledge inactive work on open.
     pub fn acknowledge_open(&mut self, agent: &str, session: &str) -> Option<Session> {
         let s = self.sessions.iter_mut().find(|s| s.agent == agent && s.id == session)?;
         let target = s.clone();
         let dismiss = !matches!(s.activity.group(), Group::Working | Group::Waiting);
         if dismiss {
-            self.next_shelved_order = self.next_shelved_order.saturating_add(1);
-            s.shelved_order = self.next_shelved_order;
-            s.archived = true;
+            s.acknowledged = true;
+            s.acknowledged_at = Some(now());
             s.pending_attention = false;
             s.unread = 0;
             self.touch();
@@ -1312,18 +1376,10 @@ impl Core {
 
     fn keypad_slots_at(&self, t: f64) -> Vec<Option<&Session>> {
         let (recent, old_idle): (Vec<_>, Vec<_>) = self.visible().into_iter().partition(|s| {
-            s.pending_attention || s.unread > 0 || s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
+            s.acknowledged || s.pending_attention || s.unread > 0 || s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
         });
-        let mut slots: Vec<Option<&Session>> = recent.into_iter().map(Some).collect();
-        if !old_idle.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE {
-            slots.resize(SESSION_KEYS_PER_PAGE, None);
-        }
-        slots.extend(old_idle.into_iter().map(Some));
-        let mut shelved: Vec<_> = self.order.iter().filter_map(|key| self.sessions.iter().find(|s| s.key() == *key && s.archived && self.agent_enabled(&s.agent))).collect();
-        shelved.sort_by_key(|s| s.shelved_order);
-        if !shelved.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE { slots.resize(SESSION_KEYS_PER_PAGE, None); }
-        slots.extend(shelved.into_iter().map(Some));
-        slots
+        let positions = self.layout.borrow_mut().project(&recent, &old_idle);
+        positions.iter().map(|slot| slot.as_ref().and_then(|key| self.sessions.iter().find(|s| s.key() == *key))).collect()
     }
 
     pub fn pages(&self) -> usize {
@@ -1331,7 +1387,7 @@ impl Core {
     }
 
     pub fn waiting_count(&self) -> usize {
-        self.visible().iter().filter(|s| s.activity.group() == Group::Waiting).count()
+        self.visible().iter().filter(|s| !s.acknowledged && s.activity.group() == Group::Waiting).count()
     }
 
     /// After this long with every session idle, the keypad dims and redraws at 10 fps.
@@ -1439,6 +1495,18 @@ impl Core {
 
     // ---- keypad faces
 
+    pub fn quota_faces(&self, page: usize) -> [KeyFace; KEY_COUNT] {
+        let mut out = std::array::from_fn(|_| KeyFace::Empty);
+        for (row, entries) in self.quota_rows().into_iter().skip(page * 2).take(2).enumerate() {
+            for (col, mut quota) in entries.into_iter().enumerate() {
+                quota.remaining = crate::quota::displayed_remaining(&quota, now() as i64);
+                out[row * 3 + col] = KeyFace::Quota(quota);
+            }
+        }
+        out[HUB_KEY] = KeyFace::QuotaHub;
+        out
+    }
+
     pub fn faces(&self) -> [KeyFace; KEY_COUNT] {
         let mut out: [KeyFace; KEY_COUNT] = std::array::from_fn(|_| KeyFace::Empty);
         if !self.in_control {
@@ -1455,14 +1523,7 @@ impl Core {
             return out;
         }
         if self.quota_view {
-            for (row, entries) in self.quota_rows().into_iter().skip(self.quota_page * 2).take(2).enumerate() {
-                for (col, mut quota) in entries.into_iter().enumerate() {
-                    quota.remaining = crate::quota::displayed_remaining(&quota, now() as i64);
-                    out[row * 3 + col] = KeyFace::Quota(quota);
-                }
-            }
-            out[HUB_KEY] = KeyFace::QuotaHub;
-            return out;
+            return self.quota_faces(self.quota_page);
         }
         let t = now();
         let speed = self.settings.text_speed.max(1.0) as f64;
@@ -1474,6 +1535,7 @@ impl Core {
             let def = self.agent(&s.agent);
             SessionFace {
                 key: s.key(),
+                opacity: if s.acknowledged { ACKNOWLEDGED_OPACITY } else { 1.0 },
                 badge: def.map(|d| d.badge.clone()).unwrap_or_else(|| badge_from_name(&s.agent)),
                 agent_name: def.map(|d| d.name.clone()).unwrap_or_else(|| s.agent.clone()),
                 title: s.title.clone(),
@@ -1486,6 +1548,7 @@ impl Core {
                 subagents: s.subagents,
                 dots: def.map(|d| d.style == "dots").unwrap_or(false),
                 unread: s.unread,
+                scheduled: s.scheduled,
                 last_message: s.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string(),
                 last_turn: s.updated,
                 agent_colour: colour::rotate(colour::hex_u32(0xd9a441), self.hue_of(&s.agent) - colour::REFERENCE_HUE),
@@ -1496,7 +1559,7 @@ impl Core {
         for (i, slot) in self.keypad_slots().iter().skip(page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).enumerate() {
             if let Some(s) = slot { out[i] = KeyFace::Session(face_of(s)); }
         }
-        let count = |g: Group| vis.iter().filter(|s| s.activity.group() == g).count();
+        let count = |g: Group| vis.iter().filter(|s| !s.acknowledged && s.activity.group() == g).count();
         out[HUB_KEY] = KeyFace::Hub(HubFace {
             waiting: count(Group::Waiting),
             working: count(Group::Working),
@@ -1571,7 +1634,7 @@ impl Core {
             Some(KeyPressTarget::Back) => { self.detail_key = None; self.detail_page = 0; self.touch(); }
             Some(KeyPressTarget::Hub) => {
                 let slots = self.keypad_slots();
-                if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| !s.archived && s.activity.group() == Group::Waiting)) {
+                if let Some(pos) = slots.iter().position(|s| s.is_some_and(|s| !s.acknowledged && s.activity.group() == Group::Waiting)) {
                     self.page = pos / SESSION_KEYS_PER_PAGE;
                 } else { self.actions.push(Action::ShowWindow); }
                 self.touch();
@@ -1688,7 +1751,6 @@ impl Core {
             ("zcode", "data-pipeline", Activity::Done, None, "All 214 checks passed."),
             ("kimi-code", "infra", Activity::Compacting, None, "Compacting the conversation"),
             ("codex", "auth-service", Activity::WaitingQuestion, None, "Use OAuth device flow or PKCE?"),
-            ("claude-code", "mobile-app", Activity::Idle, None, "Shipped the onboarding fix."),
             ("claude-code", "scripts", Activity::Error, None, "Build failed: OPENAI_KEY is not set"),
         ];
         self.sessions.clear();
@@ -1707,13 +1769,15 @@ impl Core {
                 subagents: if n == 0 { 2 } else { 0 },
                 subagent_at: t,
                 app_bundle: String::new(),
+                open_url: None,
                 tty: String::new(),
                 term: String::new(),
                 pid: 0,
-                unread: if *title == "data-pipeline" { 2 } else { 0 },
-                archived: false,
-                shelved_order: 0,
-                pending_attention: matches!(act, Activity::Done),
+                unread: 0,
+                scheduled: n == 0,
+                acknowledged: n == 4,
+                acknowledged_at: (n == 4).then_some(t),
+                pending_attention: matches!(act, Activity::Done) && n != 4,
                 pending_text: None,
                 steps: Vec::new(),
             });
@@ -1741,6 +1805,114 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn desktop_code_watch_and_identity_reconciliation() {
+        use super::*;
+        let mut core = Core::new(Settings::default());
+        core.settings.disabled_agents.push("claude-desktop".into());
+        assert!(core.watched_apps().iter().any(|(a, _, _)| a == "claude-desktop"));
+        core.settings.disabled_agents.push("claude-code".into());
+        assert!(!core.watched_apps().iter().any(|(a, _, _)| a == "claude-desktop"));
+        core.settings.disabled_agents.clear();
+        core.apply(Incoming { agent: "claude-code".into(), event: None, body: serde_json::json!({"session":"local_abc", "state":"idle"}) });
+        core.sessions[0].acknowledged = true;
+        core.sessions[0].pending_attention = true;
+        core.detail_key = Some("claude-code:local_abc".into());
+        core.key_target[0] = Some(KeyPressTarget::Session("claude-code:local_abc".into()));
+        core.reconcile_alias("claude-code", "local_abc", "real-id");
+        assert_eq!(core.sessions.len(), 1);
+        assert_eq!(core.sessions[0].id, "real-id");
+        assert!(core.sessions[0].acknowledged && core.sessions[0].pending_attention);
+        assert_eq!(core.detail_key.as_deref(), Some("claude-code:real-id"));
+        assert_eq!(core.key_target[0], Some(KeyPressTarget::Session("claude-code:real-id".into())));
+    }
+
+    #[test]
+    fn alias_collision_deduplicates_slot_shelf_detail_and_captured_key_target() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        let mut host = Observation::new("claude-code", "host", Source::Other, now());
+        host.activity = Some(Activity::Idle);
+        core.observe(host);
+        let mut exact = Observation::new("claude-code", "exact", Source::Other, now());
+        exact.activity = Some(Activity::Idle);
+        core.observe(exact);
+        let _ = core.keypad_slots();
+        core.acknowledge_open("claude-code", "host");
+        let slots = core.keypad_slots();
+        let host_slot = slots.iter().position(|slot| slot.is_some_and(|session| session.id == "host")).unwrap();
+        core.page = host_slot / SESSION_KEYS_PER_PAGE;
+        let physical_key = host_slot % SESSION_KEYS_PER_PAGE;
+        core.key_down(physical_key);
+        core.detail_key = Some("claude-code:host".into());
+
+        let mut resolved = Observation::new("claude-code", "exact", Source::Other, now());
+        resolved.aliases.push("host".into());
+        resolved.activity = Some(Activity::Idle);
+        core.observe(resolved);
+
+        assert_eq!(core.sessions.iter().filter(|s| s.agent == "claude-code").count(), 1);
+        assert_eq!(core.sessions.iter().find(|s| s.agent == "claude-code").unwrap().id, "exact");
+        assert!(core.sessions.iter().find(|s| s.agent == "claude-code").unwrap().acknowledged);
+        assert_eq!(core.detail_key.as_deref(), Some("claude-code:exact"));
+        let slots = core.keypad_slots();
+        assert_eq!(slots.iter().filter(|slot| slot.is_some_and(|session| session.id == "exact")).count(), 1);
+        assert!(!slots.iter().flatten().any(|session| session.id == "host"));
+
+        core.key_up(physical_key);
+        assert!(core.actions.iter().any(|action| matches!(action, Action::Open { agent, session } if agent == "claude-code" && session == "exact")), "the held key must resolve to the canonical session after alias reconciliation");
+    }
+
+    #[test]
+    fn alias_reconciliation_keeps_a_working_canonical_target_bright() {
+        let mut core = Core::new(Settings::default());
+        let mut host = Observation::new("claude-code", "host-id", Source::Other, now());
+        host.activity = Some(Activity::Idle);
+        core.observe(host);
+        core.sessions.iter_mut().find(|s| s.id == "host-id").unwrap().acknowledged = true;
+        core.sessions.iter_mut().find(|s| s.id == "host-id").unwrap().acknowledged_at = Some(now());
+
+        let mut canonical = Observation::new("claude-code", "cli-id", Source::Other, now());
+        canonical.activity = Some(Activity::Thinking);
+        core.observe(canonical);
+        core.sessions.iter_mut().find(|s| s.id == "cli-id").unwrap().acknowledged = true;
+        core.sessions.iter_mut().find(|s| s.id == "cli-id").unwrap().acknowledged_at = Some(now());
+
+        let mut resolved = Observation::new("claude-code", "cli-id", Source::Other, now());
+        resolved.aliases.push("host-id".into());
+        resolved.activity = Some(Activity::Thinking);
+        core.observe(resolved);
+
+        assert_eq!(core.sessions.len(), 1);
+        let session = &core.sessions[0];
+        assert_eq!(session.id, "cli-id");
+        assert_eq!(session.activity, Activity::Thinking);
+        assert!(!session.acknowledged);
+        assert_eq!(session.acknowledged_at, None);
+        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "claude-code:cli-id" && face.opacity == 1.0));
+    }
+
+    #[test]
+    fn desktop_live_lease_protects_state_and_expires() {
+        use super::*;
+        let mut core = Core::new(Settings::default());
+        let apply = |core: &mut Core, state: &str, local: bool| core.apply(Incoming {
+            agent: "claude-code".into(), event: None,
+            body: serde_json::json!({"session":"s", "state":state, "_local_snapshot":local}),
+        });
+        apply(&mut core, "streaming", false);
+        core.source_policy.observe("claude-code", "s", Source::DesktopLive, now());
+        core.sessions[0].acknowledged = true;
+        apply(&mut core, "idle", true);
+        assert_eq!(core.sessions[0].activity, Activity::Streaming);
+        assert!(core.sessions[0].acknowledged);
+        apply(&mut core, "waitingQuestion", false);
+        apply(&mut core, "thinking", true);
+        assert_eq!(core.sessions[0].activity, Activity::WaitingQuestion);
+        core.source_policy.observe("claude-code", "s", Source::DesktopInactive, now());
+        apply(&mut core, "idle", true);
+        assert_eq!(core.sessions[0].activity, Activity::Idle);
+    }
     use super::*;
 
     fn add_test_session(core: &mut Core, id: &str, state: &str) {
@@ -1776,6 +1948,12 @@ mod tests {
         assert!(stored.get("islandEnabled").is_none());
         let restored: Settings = serde_json::from_value(stored).unwrap();
         assert_eq!(restored.island_visibility, IslandVisibility::WhenDisconnected);
+        settings.island_visibility = IslandVisibility::QuotasAlways;
+        let stored = serde_json::to_value(&settings).unwrap();
+        assert_eq!(stored["islandVisibility"], "quotasAlways");
+        let legacy: Settings = serde_json::from_value(serde_json::json!({"islandVisibility": "quotasOnly"})).unwrap();
+        assert_eq!(legacy.island_visibility, IslandVisibility::QuotasAlways);
+        assert_eq!(serde_json::from_value::<Settings>(stored).unwrap().island_visibility, IslandVisibility::QuotasAlways);
     }
 
     #[test]
@@ -1783,6 +1961,9 @@ mod tests {
         let cases = [
             (IslandVisibility::Never, None, Hardware::NoKeypad, false, false),
             (IslandVisibility::Always, Some(false), Hardware::NoKeypad, false, true),
+            (IslandVisibility::QuotasAlways, None, Hardware::Off, false, true),
+            (IslandVisibility::QuotasAlways, Some(true), Hardware::Connected, false, true),
+            (IslandVisibility::QuotasAlways, Some(false), Hardware::NoKeypad, false, true),
             (IslandVisibility::WhenDisconnected, None, Hardware::Off, false, false),
             // Connected means physically present even while Options+ still has control.
             (IslandVisibility::WhenDisconnected, Some(true), Hardware::Connected, false, false),
@@ -1913,73 +2094,101 @@ mod tests {
         assert_eq!(target, KeyPressTarget::Session("codex:first".into()));
         core.key_down_with_target(0, target);
 
-        // Reordering moves the waiting session into the first position before key-up.
+        // Acknowledgement keeps the captured inactive tile in place; a new session uses a free key.
         let first = core.sessions.iter_mut().find(|s| s.id == "first").unwrap();
         first.activity = Activity::Idle;
-        first.archived = true;
+        first.acknowledged = true;
         let second = core.sessions.iter_mut().find(|s| s.id == "second").unwrap();
         second.activity = Activity::WaitingQuestion;
         core.resort();
-        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:second"));
+        add_test_session(&mut core, "third", "thinking");
+        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:first" && face.opacity == ACKNOWLEDGED_OPACITY));
+        assert!(matches!(&core.faces()[2], KeyFace::Session(face) if face.key == "codex:third"));
 
         core.key_up(0);
         assert!(matches!(core.actions.as_slice(), [Action::Open { agent, session }] if agent == "codex" && session == "first"));
     }
 
     #[test]
-    fn archived_idle_session_stays_hidden_for_read_receipts_and_title_updates() {
+    fn acknowledged_idle_session_stays_dimmed_in_place_through_stale_updates() {
         let mut core = Core::new(Settings::default());
+        core.in_control = true;
         add_test_session(&mut core, "archived", "idle");
-        core.sessions[0].archived = true;
+        let original_slot = core.keypad_slots().iter().position(|slot| slot.is_some_and(|s| s.id == "archived")).unwrap();
+        core.sessions[0].acknowledged = true;
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"archived", "state":"idle", "title":"Renamed", "_unread":3}),
         });
-        assert!(core.sessions[0].archived);
+        assert!(core.sessions[0].acknowledged);
         assert_eq!(core.sessions[0].title, "Renamed");
-        assert_eq!(core.sessions[0].unread, 3);
-        assert!(core.visible().is_empty());
-        assert_eq!(core.keypad_slots_at(now())[SESSION_KEYS_PER_PAGE].unwrap().id, "archived", "acknowledged sessions remain shelved on the tail page");
+        assert_eq!(core.sessions[0].unread, 0, "an acknowledged session does not become unread again from a stale poll");
+        assert_eq!(core.visible()[0].id, "archived");
+        let slots = core.keypad_slots_at(now());
+        assert_eq!(slots[original_slot].unwrap().id, "archived", "acknowledged sessions keep their physical slot");
+        assert!(matches!(&core.faces()[original_slot], KeyFace::Session(face) if face.opacity == ACKNOWLEDGED_OPACITY));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"archived", "state":"thinking"}),
         });
-        assert!(!core.sessions[0].archived);
+        assert!(!core.sessions[0].acknowledged);
         assert_eq!(core.visible()[0].id, "archived");
+        assert!(matches!(&core.faces()[original_slot], KeyFace::Session(face) if face.opacity == 1.0));
     }
 
     #[test]
-    fn archived_work_stays_hidden_until_new_turn_or_user_prompt_event() {
+    fn acknowledged_work_stays_dimmed_until_new_turn_or_user_prompt_event() {
         let mut core = Core::new(Settings::default());
+        core.in_control = true;
         add_test_session(&mut core, "archived", "thinking");
-        core.sessions[0].archived = true;
+        core.sessions[0].acknowledged = true;
+        let key = core.keypad_slots().iter().position(|slot| slot.is_some_and(|s| s.id == "archived")).unwrap();
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"archived", "state":"streaming", "title":"Still running"}),
         });
-        assert!(core.sessions[0].archived);
-        assert!(core.visible().is_empty());
+        assert!(core.sessions[0].acknowledged);
+        assert_eq!(core.visible()[0].id, "archived");
+        assert!(matches!(&core.faces()[key], KeyFace::Session(face) if face.opacity == ACKNOWLEDGED_OPACITY));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"archived", "state":"idle"}),
         });
-        assert!(core.sessions[0].archived);
-        assert!(core.visible().is_empty());
+        assert!(core.sessions[0].acknowledged);
+        assert_eq!(core.visible()[0].id, "archived");
 
         core.apply(Incoming {
             agent: "codex".into(), event: Some("UserPromptSubmit".into()),
             body: serde_json::json!({"session":"archived"}),
         });
-        assert!(!core.sessions[0].archived);
+        assert!(!core.sessions[0].acknowledged);
         assert_eq!(core.visible()[0].id, "archived");
+        assert!(matches!(&core.faces()[key], KeyFace::Session(face) if face.opacity == 1.0));
     }
 
     #[test]
-    fn shelved_sessions_follow_normal_pages_and_return_to_normal_order_on_resume() {
+    fn scheduled_metadata_is_latched_without_reactivating_or_moving_session() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        add_test_session(&mut core, "scheduled", "idle");
+        core.sessions[0].acknowledged = true;
+        let old_updated = core.sessions[0].updated;
+        core.apply(Incoming { agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"scheduled", "_scheduled":true}) });
+        assert!(core.sessions[0].scheduled);
+        assert!(core.sessions[0].acknowledged);
+        assert_eq!(core.sessions[0].updated, old_updated);
+        core.apply(Incoming { agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"scheduled", "state":"idle", "_scheduled":false}) });
+        assert!(core.sessions[0].scheduled);
+    }
+
+    #[test]
+    fn acknowledged_sessions_keep_their_page_one_slot_and_resume_at_full_brightness() {
         let mut settings = Settings::default();
         settings.recency_minutes = 240;
         let mut core = Core::new(settings);
@@ -1988,36 +2197,33 @@ mod tests {
         add_test_session(&mut core, "old-idle", "idle");
         add_test_session(&mut core, "archived-waiting", "waiting_question");
         core.sessions.iter_mut().find(|s| s.id == "old-idle").unwrap().since = now() - IDLE_SECOND_PAGE_AFTER_S - 60.0;
-        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().archived = true;
+        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().acknowledged = true;
         core.resort();
 
         let slots = core.keypad_slots_at(now());
         assert_eq!(slots[0].unwrap().id, "active");
-        assert!(slots[1..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none), "archives must not consume reserved page-one holes");
+        assert_eq!(slots[1].unwrap().id, "archived-waiting", "acknowledgement keeps the existing first-page slot");
         assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "old-idle");
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "archived-waiting", "shelved work follows all ordinary tiles on the tail page");
         assert_eq!(core.pages(), 2);
         assert_eq!(core.waiting_count(), 0, "archived waiting sessions are absent from normal counts");
 
         core.page = 1;
         assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:old-idle"));
-        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
-
-        core.page = 1;
-        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting"));
 
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"archived-waiting", "state":"thinking"}),
         });
-        assert!(!core.sessions.iter().find(|s| s.id == "archived-waiting").unwrap().archived);
+        assert!(!core.sessions.iter().find(|s| s.id == "archived-waiting").unwrap().acknowledged);
         assert_eq!(core.visible()[0].id, "archived-waiting", "resumed work returns to the ordinary recent ordering");
-        assert_eq!(core.keypad_slots_at(now())[0].unwrap().id, "archived-waiting");
+        assert_eq!(core.keypad_slots_at(now())[0].unwrap().id, "active");
+        assert_eq!(core.keypad_slots_at(now())[1].unwrap().id, "archived-waiting");
+        core.page = 0;
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == "codex:archived-waiting" && face.opacity == 1.0));
     }
 
     #[test]
-    fn click_shelving_order_stays_after_normal_tiles_across_polls_and_activity_reordering() {
+    fn acknowledging_inactive_sessions_keeps_slots_stable_across_polls_and_reordering() {
         let mut settings = Settings::default();
         settings.recency_minutes = 240;
         let mut core = Core::new(settings);
@@ -2030,6 +2236,8 @@ mod tests {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"shelved-b", "state":"idle", "_unread":2}),
         });
+
+        let before: Vec<_> = core.keypad_slots_at(now()).iter().map(|s| s.map(|s| s.key())).collect();
 
         for id in ["shelved-a", "shelved-b"] {
             let index = core.faces().iter().take(HUB_KEY).position(|face| {
@@ -2044,17 +2252,20 @@ mod tests {
             Action::Open { agent: second_agent, session: second },
         ] if first_agent == "codex" && first == "shelved-a" && second_agent == "codex" && second == "shelved-b"));
 
-        // Ordinary activity changes reorder the visible tiles; delayed inactive polls update
-        // their metadata without changing the order in which the user shelved them.
+        // Activity and metadata updates preserve these physical positions.
         core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"normal-a", "state":"idle", "title":"now idle"}) });
         core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"normal-b", "state":"waiting_permission", "title":"now waiting"}) });
         core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"shelved-a", "state":"idle", "title":"refreshed A"}) });
         core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"shelved-b", "state":"idle", "title":"refreshed B", "_unread":3}) });
 
         let slots = core.keypad_slots_at(now());
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "shelved-a");
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE + 1].unwrap().id, "shelved-b");
-        assert!(slots[..SESSION_KEYS_PER_PAGE].iter().flatten().all(|session| !session.archived), "all normal tiles stay ahead of the shelved tail");
+        for i in 0..before.len() {
+            assert_eq!(slots[i].map(|s| s.key()), before[i], "slot {i} moved");
+        }
+        for id in ["shelved-a", "shelved-b"] {
+            let slot = slots.iter().position(|s| s.is_some_and(|s| s.id == id)).unwrap();
+            assert!(matches!(&core.faces()[slot], KeyFace::Session(face) if face.opacity == ACKNOWLEDGED_OPACITY));
+        }
     }
 
     #[test]
@@ -2063,7 +2274,7 @@ mod tests {
         core.in_control = true;
         add_test_session(&mut core, "active", "thinking");
         add_test_session(&mut core, "archived-waiting", "waiting_question");
-        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().archived = true;
+        core.sessions.iter_mut().find(|s| s.id == "archived-waiting").unwrap().acknowledged = true;
         core.resort();
 
         assert_eq!(core.waiting_count(), 0);
@@ -2085,18 +2296,18 @@ mod tests {
         assert_eq!(target, KeyPressTarget::Session("codex:first".into()));
         core.key_down_with_target(0, target);
 
-        // A later turn reorders the other session into this physical key's current slot.
+        // Activity updates do not displace the pressed session.
         core.apply(Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"second", "state":"waiting_question"}),
         });
-        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:second"));
+        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == "codex:first"));
 
         core.key_down[0] = Some(now() - DETAIL_HOLD_S - 0.1);
         core.tick();
         assert_eq!(core.detail_key.as_deref(), Some("codex:first"));
-        assert!(!core.sessions.iter().find(|s| s.id == "first").unwrap().archived);
-        assert!(!core.sessions.iter().find(|s| s.id == "second").unwrap().archived);
+        assert!(!core.sessions.iter().find(|s| s.id == "first").unwrap().acknowledged);
+        assert!(!core.sessions.iter().find(|s| s.id == "second").unwrap().acknowledged);
         core.key_up(0);
         assert!(core.actions.is_empty());
     }
@@ -2152,6 +2363,82 @@ mod tests {
         core.key_up(HUB_KEY);
         assert_eq!(core.detail_key, None);
         assert_eq!(core.page, 1, "Back restores the prior session page");
+    }
+
+    #[test]
+    fn keypad_slots_keep_holes_and_reuse_them_without_moving_neighbours() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for i in 0..(SESSION_KEYS_PER_PAGE + 3) {
+            add_test_session(&mut core, &format!("session-{i}"), "idle");
+        }
+        let before: Vec<_> = core.keypad_slots().iter().map(|s| s.map(|s| s.key())).collect();
+        let removed = before[1].clone().unwrap();
+        let removed_id = removed.strip_prefix("codex:").unwrap();
+        core.key_down(1);
+        core.acknowledge_open("codex", removed_id);
+        let after: Vec<_> = core.keypad_slots().iter().map(|s| s.map(|s| s.key())).collect();
+        assert_eq!(after[1].as_deref(), Some(removed.as_str()), "acknowledgement keeps the key in place until another active session needs it");
+        let face = &core.faces()[1];
+        assert!(matches!(face, KeyFace::Session(face) if face.key == removed && face.opacity == ACKNOWLEDGED_OPACITY));
+        for i in 0..before.len() {
+            if i != 1 { assert_eq!(after[i], before[i], "slot {i} moved"); }
+        }
+        add_test_session(&mut core, "new", "thinking");
+        assert_eq!(core.keypad_slots()[1].unwrap().id, "new");
+        assert!(core.keypad_slots().iter().enumerate().any(|(i, s)| i >= SESSION_KEYS_PER_PAGE && s.is_some_and(|session| session.key() == removed)), "the displaced acknowledged tile remains retrievable later");
+        core.key_up(1);
+        assert!(matches!(core.actions.as_slice(), [Action::Open { agent, session }] if agent == "codex" && session == removed_id), "a key held across acknowledged-slot replacement still opens its captured target");
+
+        // A resumed session takes the next ordinary hole, leaving the others fixed.
+        let another = before[3].clone().unwrap();
+        core.acknowledge_open("codex", another.strip_prefix("codex:").unwrap());
+        let _ = core.keypad_slots();
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session": removed_id, "state": "thinking"}) });
+        let resumed = core.keypad_slots();
+        assert_eq!(resumed[3].unwrap().key(), removed);
+        assert!(matches!(&core.faces()[3], KeyFace::Session(face) if face.key == removed && face.opacity == 1.0));
+        assert_eq!(resumed[SESSION_KEYS_PER_PAGE].unwrap().key(), before[SESSION_KEYS_PER_PAGE].clone().unwrap());
+    }
+
+    #[test]
+    fn acknowledgements_stay_put_and_resume_restores_full_brightness() {
+        let mut core = Core::new(Settings::default());
+        for id in ["a", "b", "c"] { add_test_session(&mut core, id, "idle"); }
+        let initial: Vec<_> = core.keypad_slots().iter().map(|s| s.unwrap().id.clone()).collect();
+        let a = &initial[0];
+        let b = &initial[1];
+        let c = &initial[2];
+        core.acknowledge_open("codex", a);
+        assert_eq!(core.keypad_slots()[0].unwrap().id, *a);
+        core.acknowledge_open("codex", b);
+        assert_eq!(core.keypad_slots()[1].unwrap().id, *b);
+        core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session": a, "state": "thinking"}) });
+        assert_eq!(core.keypad_slots()[0].unwrap().id, *a);
+        assert!(matches!(&core.faces()[0], KeyFace::Session(face) if face.key == format!("codex:{a}") && face.opacity == 1.0));
+        core.acknowledge_open("codex", c);
+        let slots = core.keypad_slots();
+        let b_pos = slots.iter().position(|s| s.is_some_and(|s| s.id == *b)).unwrap();
+        let c_pos = slots.iter().position(|s| s.is_some_and(|s| s.id == *c)).unwrap();
+        assert_eq!((b_pos, c_pos), (1, 2));
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.opacity == ACKNOWLEDGED_OPACITY));
+        assert!(matches!(&core.faces()[2], KeyFace::Session(face) if face.opacity == ACKNOWLEDGED_OPACITY));
+    }
+
+    #[test]
+    fn old_idle_moves_out_of_first_page_without_compacting_others() {
+        let mut settings = Settings::default();
+        settings.recency_minutes = 240;
+        let mut core = Core::new(settings);
+        for id in ["one", "two", "three"] { add_test_session(&mut core, id, "idle"); }
+        let before: Vec<_> = core.keypad_slots().iter().map(|s| s.map(|s| s.key())).collect();
+        let key = before[1].as_ref().unwrap();
+        core.sessions.iter_mut().find(|s| s.key() == *key).unwrap().since = now() - IDLE_SECOND_PAGE_AFTER_S - 1.0;
+        let after = core.keypad_slots();
+        assert!(after[1].is_none());
+        assert_eq!(after[0].unwrap().key(), before[0].clone().unwrap());
+        assert_eq!(after[2].unwrap().key(), before[2].clone().unwrap());
+        assert_eq!(after[SESSION_KEYS_PER_PAGE].unwrap().key(), *key);
     }
 
     #[test]
@@ -2400,16 +2687,18 @@ mod tests {
     }
 
     #[test]
-    fn archived_session_returns_when_work_resumes() {
+    fn acknowledged_session_stays_visible_dimmed_and_brightens_when_work_resumes() {
         let mut c = Core::new(Settings::default());
         c.in_control = true;
         c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"idle","title":"A"}) });
         assert_eq!(c.visible().len(), 1);
         let key = c.visible()[0].key();
-        c.sessions[0].archived = true;
-        assert_eq!(c.visible().len(), 0);
+        c.sessions[0].acknowledged = true;
+        assert_eq!(c.visible().len(), 1);
+        assert!(matches!(&c.faces()[0], KeyFace::Session(face) if face.key == key && face.opacity == ACKNOWLEDGED_OPACITY));
         std::thread::sleep(std::time::Duration::from_millis(5));
         c.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":"a","state":"thinking"}) });
         assert_eq!(c.visible()[0].key(), key);
+        assert!(matches!(&c.faces()[0], KeyFace::Session(face) if face.key == key && face.opacity == 1.0));
     }
 }

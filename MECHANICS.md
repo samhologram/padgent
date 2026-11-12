@@ -8,8 +8,11 @@ per-agent preferences remain in the existing AgentPad configuration directory fo
 
 Sessions can come from local agent records, hooks, or desktop apps followed through macOS
 Accessibility. The application displays each session’s activity, age and latest message.
-Tapping a key opens its conversation or terminal. Inactive conversations move to the end,
-on page 2 or later, in the order opened; resumed work returns them to the active pages.
+Tapping a key opens its conversation or terminal. Inactive conversations are acknowledged
+and stay in place at 45% intensity, including their text. New or resumed sessions use free
+first-page slots, then replace acknowledged tiles if needed, leaving bright neighbours
+fixed. Replaced tiles remain accessible on later pages. Resumed activity restores full
+intensity.
 Holding a key for 0.6 seconds opens its observed steps, one per key. Back occupies the
 bottom-right key. The two page buttons navigate conversation or step pages.
 The local ordering resets when Padgent restarts. Holding both page buttons for 1.5 seconds

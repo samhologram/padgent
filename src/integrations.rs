@@ -14,6 +14,12 @@ pub fn open_exact(agent: Option<&AgentDef>, s: &crate::model::Session) {
         "open {}:{} app={:?} pid={} tty={:?} term={:?}",
         s.agent, s.id, s.app_bundle, s.pid, s.tty, s.term
     ));
+    if s.agent == "codex" {
+        if let Some(url) = s.open_url.as_deref().filter(|url| crate::cloud::trusted_task_url(&s.id, url)) {
+            let _ = Command::new("/usr/bin/open").arg(url).spawn();
+            return;
+        }
+    }
     // A Codex thread: codex://threads/<id> (CodexAppLink.openURL 0x1006174d0).
     if s.agent == "codex" {
         if let Some(url) = codex_thread_url(&s.id) {
@@ -71,6 +77,13 @@ pub fn open_exact(agent: Option<&AgentDef>, s: &crate::model::Session) {
             if let Some(pid) = crate::mac::pid_for_bundle("com.anthropic.claudefordesktop") {
                 crate::mac::bring_forward(pid);
             }
+            return;
+        }
+    }
+    // Desktop-only Code sessions use the validated host ID as their session ID.
+    if s.agent == "claude-code" {
+        if let Some(url) = claude_continue_url(&s.id) {
+            let _ = Command::new("/usr/bin/open").arg(url).spawn();
             return;
         }
     }

@@ -1,6 +1,7 @@
 //! Padgent — an open-source keypad and menu bar for agent sessions.
 
 mod colour;
+mod cloud;
 mod field;
 mod hardware;
 mod local;
@@ -8,6 +9,9 @@ mod icon;
 mod integrations;
 mod mac;
 mod model;
+mod observation;
+mod tracking;
+mod layout;
 mod paint;
 mod quota;
 mod server;
@@ -64,6 +68,8 @@ struct IslandAgent {
     since: f64,
     orb: colour::Rgb,
     glow: colour::Rgb,
+    scheduled: bool,
+    opacity: f32,
 }
 
 struct IslandQuota { provider: String, session: Option<f64>, weekly: Option<f64>, colour: colour::Rgb }
@@ -95,14 +101,16 @@ fn island_quotas(c: &Core) -> Vec<IslandQuota> {
 }
 
 fn island_agents(c: &Core) -> Vec<IslandAgent> {
+    if c.island_quotas_only() { return Vec::new(); }
     let mut sessions: Vec<_> = c.visible().into_iter()
-        .filter(|s| matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || s.pending_attention || s.unread > 0).collect();
-    sessions.sort_by_key(|s| if s.activity.group() == Group::Waiting { 0 } else if s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done { 1 } else { 2 });
+        .filter(|s| s.acknowledged || matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || s.pending_attention || s.unread > 0).collect();
+    sessions.sort_by_key(|s| if s.acknowledged { 3 } else if s.activity.group() == Group::Waiting { 0 } else if s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done { 1 } else { 2 });
+    let sessions = c.island_layout.borrow_mut().project(&sessions);
     sessions.into_iter().map(|s| {
         let name = c.agents.iter().find(|a| a.id == s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
         let (orb, glow) = c.colours(s);
         IslandAgent { agent: s.agent.clone(), session: s.id.clone(), name, title: s.title.clone(),
-            activity: s.activity, tool: s.tool, since: s.since, orb, glow }
+            activity: s.activity, tool: s.tool, since: s.since, orb, glow, scheduled: s.scheduled, opacity: if s.acknowledged { model::ACKNOWLEDGED_OPACITY } else { 1.0 } }
     }).collect()
 }
 
@@ -121,6 +129,8 @@ struct App {
     popup_focused: bool,
     popup_keys: [bool; KEY_COUNT],
     popup_pages: [bool; 2],
+    island_quota_page: usize,
+    island_quota_buttons: [bool; 2],
     screenshot: Option<String>,
     screenshot_menu_bar: bool,
     screenshot_island: bool,
@@ -289,6 +299,7 @@ impl App {
             }
             watch::start(core.clone(), wake.clone());
             local::start(core.clone(), wake.clone());
+            cloud::start(core.clone(), wake.clone());
             quota::start(core.clone(), wake.clone());
             tray = tray::Tray::new();
             let clicks = tray_clicks.clone();
@@ -377,6 +388,8 @@ impl App {
             popup_focused: false,
             popup_keys: [false; KEY_COUNT],
             popup_pages: [false; 2],
+            island_quota_page: 0,
+            island_quota_buttons: [false; 2],
             screenshot,
             screenshot_menu_bar,
             screenshot_island,
@@ -462,8 +475,8 @@ impl App {
     }
 
     fn island(&mut self, ctx: &egui::Context) {
-        let (enabled, active, quotas, brightness, reduced) = match self.core.lock() {
-            Ok(c) => (c.island_visible(),
+        let (enabled, quotas_only, active, quotas, brightness, reduced) = match self.core.lock() {
+            Ok(c) => (c.island_visible(), c.island_quotas_only(),
                 island_agents(&c), island_quotas(&c),
                 c.settings.brightness, c.settings.motion == Motion::Reduced),
             Err(_) => return,
@@ -524,7 +537,8 @@ impl App {
         if matches!(action, IslandAction::Expand | IslandAction::Quotas) {
             ctx.request_repaint();
             if matches!(action, IslandAction::Quotas) {
-                if let Ok(mut c) = self.core.lock() { c.quota_view = true; c.quota_page = 0; }
+                if quotas_only { self.island_quota_page = 0; }
+                else if let Ok(mut c) = self.core.lock() { c.quota_view = true; c.quota_page = 0; }
             }
             if self.popup_open && self.popup_from_island && matches!(action, IslandAction::Expand) {
                 self.popup_open = false;
@@ -570,7 +584,7 @@ impl App {
             let tile = Rect::from_min_size(pos2(left, rect.top() + 3.0 + expansion * 0.5), vec2(72.0, h - 6.0));
             let id = egui::Id::unique(("island-session", &agent.agent, &agent.session));
             let response = ui.interact(tile, id, Sense::click_and_drag())
-                .on_hover_text(format!("{} · {} — hold for steps", agent.name, agent.title));
+                .on_hover_text(format!("{} · {}{} — hold for steps", agent.name, agent.title, if agent.scheduled { " · Scheduled run" } else { "" }));
             // Keep the press bound to this session even when the displayed order changes.
             // A pointer leaving the tile cancels it until release.
             let state_id = id.with("hold");
@@ -591,10 +605,21 @@ impl App {
             } else {
                 ui.ctx().data_mut(|d| d.remove::<(f64, bool, bool)>(state_id));
             }
+            let mut tile_painter = p.clone();
+            tile_painter.multiply_opacity(agent.opacity);
+            let p = &tile_painter;
             p.rect_filled(tile, CornerRadius::same(9), Color32::from_rgb(20, 22, 29));
             paint::compact_field(&p, tile, agent.activity, agent.tool, agent.since, agent.orb, agent.glow, brightness, reduced, now);
             if response.hovered() { p.rect_filled(tile, CornerRadius::same(9), white(0.09)); }
-            let text_rect = tile.shrink2(vec2(7.0, 1.0));
+            let mut text_rect = tile.shrink2(vec2(7.0, 1.0));
+            if agent.scheduled {
+                let c = pos2(tile.right() - 7.0, tile.center().y);
+                let stroke = Stroke::new(1.0, white(0.65));
+                p.circle_stroke(c, 3.5, stroke);
+                p.line_segment([c + vec2(0.0, -2.0), c], stroke);
+                p.line_segment([c, c + vec2(1.8, 1.0)], stroke);
+                text_rect.max.x -= 8.0;
+            }
             let label = if agent.title.trim().is_empty() { &agent.name } else { &agent.title };
             let font = FontId::proportional(11.0);
             let text_p = p.with_clip_rect(text_rect);
@@ -660,12 +685,15 @@ impl App {
             let full = ui.max_rect();
             let corners = if self.popup_from_island { CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 } } else { CornerRadius::same(14) };
             p.rect_filled(full, corners, if self.popup_from_island { Color32::BLACK } else { Color32::from_rgb(29, 31, 39) });
-            let (faces, waiting, brightness, reduced, glyphs, dimmed, held) = {
+            let quotas_only = self.popup_from_island && self.core.lock().map(|c| c.island_quotas_only()).unwrap_or(false);
+            let (faces, waiting, brightness, reduced, glyphs, dimmed, held, quota_pages) = {
                 let Ok(mut c) = self.core.lock() else { return };
                 c.tick();
                 if c.settings.demo_mode { c.demo_tick(); }
-                (c.faces(), c32(c.waiting_colour()), c.settings.brightness, c.settings.motion == Motion::Reduced,
-                    c.settings.key_glyphs, c.dimmed(), [c.page_held(false), c.page_held(true)])
+                let pages = c.quota_pages();
+                self.island_quota_page = self.island_quota_page.min(pages - 1);
+                (if quotas_only { c.quota_faces(self.island_quota_page) } else { c.faces() }, c32(c.waiting_colour()), c.settings.brightness, c.settings.motion == Motion::Reduced,
+                    c.settings.key_glyphs, c.dimmed(), [c.page_held(false), c.page_held(true)], pages)
             };
             let t = model::now();
             let factor = full.width() / 400.0;
@@ -694,15 +722,23 @@ impl App {
                 page_down[i] = resp.is_pointer_button_down_on();
                 paint::page_button(&p, r, if i == 0 { "‹" } else { "›" }, held[i], resp.hovered());
             }
-            if let Ok(mut c) = self.core.lock() {
+            if quotas_only {
+                for i in 0..2 {
+                    if page_down[i] && !self.island_quota_buttons[i] {
+                        if i == 0 { self.island_quota_page = self.island_quota_page.saturating_sub(1); }
+                        else { self.island_quota_page = (self.island_quota_page + 1).min(quota_pages - 1); }
+                    }
+                }
+            } else if let Ok(mut c) = self.core.lock() {
                 for i in 0..KEY_COUNT {
                     if down[i] && !self.popup_keys[i] { c.key_down(i); }
                     if !down[i] && self.popup_keys[i] { c.key_up(i); }
                 }
                 for i in 0..2 { if page_down[i] != self.popup_pages[i] { c.page_button(i == 1, page_down[i]); } }
             }
-            self.popup_keys = down;
-            self.popup_pages = page_down;
+            self.island_quota_buttons = if quotas_only { page_down } else { [false; 2] };
+            self.popup_keys = if quotas_only { [false; KEY_COUNT] } else { down };
+            self.popup_pages = if quotas_only { [false; 2] } else { page_down };
             let r = Rect::from_min_size(full.min + vec2(12.0, 436.0) * factor, vec2(376.0, 30.0) * factor);
             if ui.put(r, egui::Button::new(RichText::new("Open Padgent & Settings…").size(14.0 * factor))).clicked() {
                 self.popup_open = false;
@@ -722,6 +758,7 @@ impl App {
         }
         self.popup_keys = [false; KEY_COUNT];
         self.popup_pages = [false; 2];
+        self.island_quota_buttons = [false; 2];
     }
 
     fn sidebar(&mut self, ui: &mut Ui, rect: Rect) {
@@ -1532,12 +1569,14 @@ impl App {
                 });
                 hint(ui, "Dot shows a terracotta dot on the menu bar icon. Dot and count adds the number of waiting sessions next to it. The menu previews every session with its state and last message.");
                 if ui.button("Preview menu-bar keypad").clicked() { preview = true; }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Notch island");
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::Never, "Never");
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::Always, "Always");
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::WhenDisconnected, "When keypad disconnected");
+                    ui.selectable_value(&mut s.island_visibility, IslandVisibility::QuotasAlways, "Quotas always, agents when disconnected");
                 });
+                hint(ui, "Quotas always keeps quotas visible; agents appear when the keypad is disconnected. While connection is unknown, only quotas appear.");
                 hint(ui, "Click a conversation to open it, or hold it for 0.6 s to view its steps. Click a quota to see usage, or the island background to unfold the keypad.");
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
@@ -1849,7 +1888,33 @@ mod island_tests {
     }
 
     #[test]
-    fn compact_island_filters_inactive_archived_and_disabled_sessions_and_keeps_ids() {
+    fn quotas_only_hides_active_agents_and_sizes_wings_for_quota_values() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "working", "thinking");
+        core.quotas.push(quota("Codex", "Session", Some(74.0), Some(chrono::Utc::now().to_rfc3339()), None));
+        assert_eq!(island_agents(&core).len(), 1);
+        core.settings.island_visibility = IslandVisibility::QuotasAlways;
+        for presence in [None, Some(true)] {
+            core.keypad_connected = presence;
+            assert!(core.island_quotas_only());
+            assert!(island_agents(&core).is_empty());
+        }
+        let active = island_agents(&core);
+        let quotas = island_quotas(&core);
+        assert!(active.is_empty());
+        assert_eq!(quotas.len(), 1);
+        assert_eq!(island_wings(&active, &quotas, 180.0), (6.0, 48.0));
+        assert!(matches!(&core.quota_faces(0)[0], model::KeyFace::Quota(q) if q.remaining == Some(74.0)));
+        assert!(!core.quota_view);
+        assert_eq!(core.quota_page, 0);
+        core.keypad_connected = Some(false);
+        assert!(!core.island_quotas_only());
+        assert_eq!(island_agents(&core).len(), 1);
+        assert_eq!(island_quotas(&core).len(), 1);
+    }
+
+    #[test]
+    fn compact_island_keeps_acknowledged_tiles_dimmed_and_filters_disabled_sessions() {
         let mut settings = Settings::default();
         settings.disabled_agents.push("disabled-agent".into());
         let mut core = Core::new(settings);
@@ -1859,19 +1924,75 @@ mod island_tests {
         add_session(&mut core, "codex", "idle", "idle");
         add_session(&mut core, "codex", "archived", "thinking");
         add_session(&mut core, "disabled-agent", "disabled", "waiting_question");
-        core.sessions.iter_mut().find(|s| s.id == "archived").unwrap().archived = true;
+        core.sessions.iter_mut().find(|s| s.id == "archived").unwrap().acknowledged = true;
 
         let active = island_agents(&core);
-        assert_eq!(active.len(), 3);
+        assert_eq!(active.len(), 4);
         assert!(active.iter().all(|item| item.agent == "codex"));
         assert!(active.iter().all(|item| matches!(item.activity.group(), Group::Waiting | Group::Working)));
-        assert!(!active.iter().any(|item| ["idle", "archived", "disabled"].contains(&item.session.as_str())));
+        assert!(!active.iter().any(|item| ["idle", "disabled"].contains(&item.session.as_str())));
+        assert!(active.iter().any(|item| item.session == "archived" && item.opacity == model::ACKNOWLEDGED_OPACITY));
 
         // The renderer displays the first two, so waits must occupy both compact slots first.
         assert_eq!(active.iter().take(2).filter(|item| item.activity.group() == Group::Waiting).count(), 2);
         assert!(active.iter().any(|item| item.agent == "codex" && item.session == "working-1" && item.title == "title-working-1"));
         assert!(active.iter().any(|item| item.agent == "codex" && item.session == "waiting-1" && item.title == "title-waiting-1"));
         assert!(active.iter().any(|item| item.agent == "codex" && item.session == "waiting-2" && item.title == "title-waiting-2"));
+    }
+
+    #[test]
+    fn compact_island_keeps_the_same_two_session_order_when_one_is_acknowledged() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "working", "thinking");
+        add_session(&mut core, "codex", "finished", "done");
+        let before = island_agents(&core);
+        assert_eq!(before.len(), 2);
+        let before_ids: Vec<_> = before.iter().map(|item| item.session.as_str()).collect();
+        assert!(core.acknowledge_open("codex", "finished").is_some());
+        let after = island_agents(&core);
+        let after_ids: Vec<_> = after.iter().map(|item| item.session.as_str()).collect();
+        assert_eq!(after_ids, before_ids, "acknowledgement must not reorder either compact tile");
+        assert_eq!(after.iter().find(|item| item.session == "finished").unwrap().opacity, model::ACKNOWLEDGED_OPACITY);
+        assert_eq!(after.iter().find(|item| item.session == "working").unwrap().opacity, 1.0);
+    }
+
+    #[test]
+    fn compact_island_keeps_acknowledged_slot_with_three_candidates_until_new_work_arrives() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "waiting", "waiting_question");
+        add_session(&mut core, "codex", "finished", "done");
+        add_session(&mut core, "codex", "unseen-working", "thinking");
+        add_session(&mut core, "codex", "working", "thinking");
+
+        let before: Vec<_> = island_agents(&core).into_iter().take(2)
+            .map(|item| (item.session, item.opacity)).collect();
+        assert_eq!(before.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), ["waiting", "finished"]);
+        assert!(core.acknowledge_open("codex", "finished").is_some());
+        let after_ack: Vec<_> = island_agents(&core).into_iter().take(2)
+            .map(|item| (item.session, item.opacity)).collect();
+        assert_eq!(after_ack[0].0, before[0].0, "the other compact tile stays in its slot");
+        assert_eq!(after_ack[1].0, before[1].0, "clicking does not push an acknowledged tile out of the compact view");
+        assert_eq!(after_ack[1].1, model::ACKNOWLEDGED_OPACITY);
+
+        add_session(&mut core, "codex", "unseen-working", "waiting_permission");
+        let after_transition: Vec<_> = island_agents(&core).into_iter().take(2)
+            .map(|item| (item.session, item.opacity)).collect();
+        assert_eq!(after_transition[0].0, "waiting", "the normal compact tile stays fixed when an unseen candidate gains attention");
+        assert_eq!(after_transition[1].0, "unseen-working", "an existing unseen candidate with new attention can reuse the dim slot");
+
+        let mut arrival = Core::new(Settings::default());
+        add_session(&mut arrival, "codex", "waiting", "waiting_question");
+        add_session(&mut arrival, "codex", "finished", "done");
+        add_session(&mut arrival, "codex", "working", "thinking");
+        let before_arrival: Vec<_> = island_agents(&arrival).into_iter().take(2)
+            .map(|item| (item.session, item.opacity)).collect();
+        assert!(arrival.acknowledge_open("codex", "finished").is_some());
+        add_session(&mut arrival, "codex", "new-waiting", "waiting_permission");
+        let after_new: Vec<_> = island_agents(&arrival).into_iter().take(2)
+            .map(|item| (item.session, item.opacity)).collect();
+        assert_eq!(before_arrival[0].0, after_new[0].0, "the normal compact neighbor stays in its position");
+        assert_eq!(after_new[0].0, "waiting", "the normal tile never shifts when the dim slot is reused");
+        assert_eq!(after_new[1].0, "new-waiting", "new waiting work can replace a dim compact tile");
     }
 
     fn quota(provider: &str, window: &str, remaining: Option<f64>, updated: Option<String>, reset: Option<i64>) -> quota::Quota {
@@ -1910,7 +2031,7 @@ mod island_tests {
     }
 
     #[test]
-    fn completed_session_survives_decay_and_expiry_until_open_then_is_shelved_after_normal_tiles() {
+    fn completed_session_survives_decay_and_open_keeps_it_dimmed_within_recency() {
         let mut core = Core::new(Settings::default());
         add_session(&mut core, "codex", "finished", "done");
         let t = model::now();
@@ -1927,12 +2048,12 @@ mod island_tests {
 
         let captured = core.acknowledge_open("codex", "finished").expect("the exact session is still available to open");
         assert_eq!(captured.id, "finished");
-        assert!(core.sessions[0].archived);
+        assert!(core.sessions[0].acknowledged);
         assert!(!core.sessions[0].pending_attention);
-        assert!(core.visible().is_empty());
-        core.page = 1;
-        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:finished"));
-        assert!(island_agents(&core).is_empty());
+        assert_eq!(core.sessions[0].updated, t - model::REMOVE_AFTER_S - 5.0, "click time does not rewrite provider activity time");
+        assert!(core.visible().iter().any(|s| s.id == "finished"));
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:finished" && face.opacity == model::ACKNOWLEDGED_OPACITY));
+        assert!(island_agents(&core).iter().any(|s| s.session == "finished" && s.opacity == model::ACKNOWLEDGED_OPACITY));
     }
 
     #[test]
@@ -1954,29 +2075,29 @@ mod island_tests {
         assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:reply"));
 
         core.acknowledge_open("codex", "reply").unwrap();
-        assert!(core.sessions[0].archived);
+        assert!(core.sessions[0].acknowledged);
         assert_eq!(core.sessions[0].unread, 0);
-        assert!(core.visible().is_empty());
-        assert!(island_agents(&core).is_empty());
+        assert_eq!(core.visible().len(), 1, "acknowledgement starts a fresh bounded recency interval");
+        assert!(island_agents(&core).iter().any(|s| s.session == "reply" && s.opacity == model::ACKNOWLEDGED_OPACITY));
 
         // A delayed title/read-receipt poll cannot restore the acknowledged inactive item.
         core.apply(model::Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"reply", "state":"idle", "title":"stale title", "_unread":4}),
         });
-        assert!(core.sessions[0].archived);
-        assert!(core.visible().is_empty());
-        core.page = 1;
-        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:reply"), "read inactive work remains reachable on the shelved tail page");
-        assert!(island_agents(&core).is_empty());
+        assert!(core.sessions[0].acknowledged);
+        assert_eq!(core.visible().len(), 1);
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:reply" && face.opacity == model::ACKNOWLEDGED_OPACITY));
+        assert!(island_agents(&core).iter().any(|s| s.session == "reply" && s.opacity == model::ACKNOWLEDGED_OPACITY));
 
         // A genuinely active update reopens the record and restores it to both views.
         core.apply(model::Incoming {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"reply", "state":"thinking", "title":"resumed"}),
         });
-        assert!(!core.sessions[0].archived);
-        assert!(core.sessions[0].pending_attention, "the unread count remains until a read/open acknowledgement");
+        assert!(!core.sessions[0].acknowledged);
+        assert!(!core.sessions[0].pending_attention, "acknowledgement already cleared the stale unread badge");
+        assert_eq!(core.sessions[0].unread, 0);
         assert!(core.visible().iter().any(|s| s.id == "reply"));
         assert!(island_agents(&core).iter().any(|s| s.agent == "codex" && s.session == "reply"));
     }
@@ -1986,7 +2107,7 @@ mod island_tests {
         let mut core = Core::new(Settings::default());
         add_session(&mut core, "codex", "working", "thinking");
         assert!(core.acknowledge_open("codex", "working").is_some());
-        assert!(!core.sessions[0].archived);
+        assert!(!core.sessions[0].acknowledged);
         assert!(!core.sessions[0].pending_attention);
         assert!(core.visible().iter().any(|s| s.id == "working"));
         assert!(island_agents(&core).iter().any(|s| s.session == "working"));
@@ -2006,12 +2127,12 @@ mod island_tests {
             agent: "codex".into(), event: None,
             body: serde_json::json!({"session":"other", "state":"waiting_question"}),
         });
-        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:other"));
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:finished"));
 
         core.key_up(0);
         assert!(matches!(core.actions.as_slice(), [model::Action::Open { agent, session }] if agent == "codex" && session == "finished"));
-        assert!(core.sessions.iter().find(|s| s.id == "finished").unwrap().archived);
-        assert!(!core.sessions.iter().find(|s| s.id == "other").unwrap().archived);
-        assert!(island_agents(&core).iter().all(|s| s.session != "finished"));
+        assert!(core.sessions.iter().find(|s| s.id == "finished").unwrap().acknowledged);
+        assert!(!core.sessions.iter().find(|s| s.id == "other").unwrap().acknowledged);
+        assert!(island_agents(&core).iter().any(|s| s.session == "finished" && s.opacity == model::ACKNOWLEDGED_OPACITY));
     }
 }
