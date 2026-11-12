@@ -24,8 +24,20 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   session runs in (Terminal, iTerm2).
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
+- **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
+  Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
+  Turn it on or off in Menu bar and hand-over settings.
 - **Settings:** colours, motion, key order, recent sessions, hand-over, launch at login, model
   roles for Claude Code (Haiku for the swarm, Sonnet for code, Opus for orchestration).
+
+## Notch
+
+Active conversations stay on the left; remaining session and weekly quotas stay on the right.
+Click a conversation to open it, a percentage to view usage, or the black background to unfold the keypad from the notch.
+
+![Padgent notch in compact mode](docs/images/padgent-notch-compact.png)
+
+![Padgent notch with the keypad expanded](docs/images/padgent-notch-expanded.png)
 
 ## Build
 

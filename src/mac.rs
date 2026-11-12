@@ -79,6 +79,38 @@ mod imp {
         (0.0, 24.0)
     }
 
+    /// The notched display, falling back to the primary display. Coordinates are in
+    /// winit's top-left logical screen space, relative to the primary screen.
+    pub fn island_geometry() -> (f32, f32, f32, f32) {
+        use objc2_app_kit::NSScreen;
+        let Some(mtm) = MainThreadMarker::new() else { return (0.0, 0.0, 0.0, 28.0) };
+        let screens = NSScreen::screens(mtm);
+        let Some(primary) = screens.firstObject() else { return (0.0, 0.0, 0.0, 28.0) };
+        let primary_top = primary.frame().origin.y + primary.frame().size.height;
+        let screen = screens.iter().find(|s| s.safeAreaInsets().top > 0.0).unwrap_or(primary);
+        let frame = screen.frame();
+        let inset = screen.safeAreaInsets().top;
+        let left = screen.auxiliaryTopLeftArea();
+        let right = screen.auxiliaryTopRightArea();
+        let notch = if inset > 0.0 { (right.origin.x - (left.origin.x + left.size.width)).max(0.0) } else { 0.0 };
+        let center = if notch > 0.0 { (left.origin.x + left.size.width + right.origin.x) / 2.0 } else { frame.origin.x + frame.size.width / 2.0 };
+        let x = center - 200.0;
+        let y = primary_top - frame.origin.y - frame.size.height;
+        (x as f32, y as f32, notch as f32, if inset > 0.0 { inset as f32 } else { 28.0 })
+    }
+
+    /// Promote the overlay above the menu bar and allow it in full-screen spaces.
+    pub fn configure_island_window() {
+        use objc2_app_kit::{NSStatusWindowLevel, NSWindowCollectionBehavior};
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        for window in NSApplication::sharedApplication(mtm).windows().iter() {
+            if window.title().to_string() == "Padgent Island" {
+                window.setLevel(NSStatusWindowLevel + 1);
+                window.setCollectionBehavior(NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::FullScreenAuxiliary);
+            }
+        }
+    }
+
     // ---- Bringing an app forward ----
 
     use std::ffi::c_void;
@@ -224,6 +256,8 @@ mod imp {
         None
     }
     pub fn show_app() {}
+    pub fn island_geometry() -> (f32, f32, f32, f32) { (0.0, 0.0, 0.0, 28.0) }
+    pub fn configure_island_window() {}
     pub fn tray_popup_position(rect: tray_icon::Rect, width: f32, _height: f32) -> (f32, f32) {
         (rect.position.x as f32 + rect.size.width as f32 / 2.0 - width / 2.0,
             rect.position.y as f32 + rect.size.height as f32)

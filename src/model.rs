@@ -551,6 +551,7 @@ pub struct Settings {
     pub state_colours: BTreeMap<String, String>,
     pub waiting_hue: f32,
     pub menu_indicator: MenuIndicator,
+    pub island_enabled: bool,
     pub motion: Motion,
     pub demo_mode: bool,
     pub drive_physical_keypad: bool,
@@ -592,6 +593,7 @@ impl Default for Settings {
             .collect(),
             waiting_hue: colour::REFERENCE_WAITING_HUE,
             menu_indicator: MenuIndicator::DotAndCount,
+            island_enabled: true,
             motion: Motion::Full,
             demo_mode: false,
             // Take the keypad from Logi Options+ when the app opens, as the original does.
@@ -1626,6 +1628,21 @@ mod tests {
             provider: provider.into(), window: window.into(), remaining: Some(remaining), reset: None,
             reset_text: Some("Reset unknown".into()), updated: Some("2026-11-11T15:30:00Z".into()), source: "test".into(),
         }
+    }
+
+    #[test]
+    fn island_setting_defaults_on_for_old_configs_and_persists_changes() {
+        // Settings predates this field, so old config files must keep the feature enabled.
+        let old: Settings = serde_json::from_str(r#"{"format":"agentpad.settings","version":1}"#).unwrap();
+        assert!(old.island_enabled);
+        assert!(Settings::default().island_enabled);
+
+        let mut changed = old;
+        changed.island_enabled = false;
+        let saved = serde_json::to_value(&changed).unwrap();
+        assert_eq!(saved["islandEnabled"], false);
+        let restored: Settings = serde_json::from_value(saved).unwrap();
+        assert!(!restored.island_enabled);
     }
 
     #[test]

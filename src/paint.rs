@@ -284,6 +284,21 @@ fn paint_field(p: &Painter, r: Rect, fp: &crate::field::Field, orb: Color32, glo
     }
 }
 
+/// Draw the same animated light field used by a keypad key inside a compact clipped tile.
+pub fn compact_field(p: &Painter, r: Rect, activity: Activity, tool: Option<crate::model::ToolKind>, since: f64,
+    orb: crate::colour::Rgb, glow_colour: crate::colour::Rgb, brightness: f32, reduced: bool, now: f64) {
+    let phase = if reduced { 0.0 } else { (now % 1000.0) as f32 };
+    let mut fp = crate::field::params(activity, tool, phase, (now - since).max(0.0) as f32, reduced)
+        .scaled(crate::field::ANIM_SCALE);
+    let dim = brightness.clamp(0.0, 1.0);
+    fp.ci *= dim; fp.hi *= dim; fp.floor *= dim; fp.ri *= dim; fp.r2i *= dim;
+    fp.l1.3 *= dim; fp.l2.3 *= dim; fp.ripple *= dim; fp.grain *= dim;
+    let side = r.width().max(70.0);
+    let square = Rect::from_center_size(pos2(r.center().x, r.center().y + side * 0.24), vec2(side, side));
+    let clip = p.with_clip_rect(r.shrink(1.0));
+    paint_field(&clip, square, &fp, with_alpha(c32(orb), brightness), with_alpha(c32(glow_colour), brightness), phase);
+}
+
 fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     let k = r.width();
     let t = cx.t;

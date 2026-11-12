@@ -1,6 +1,6 @@
 [package]
 name = "padgent"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Native macOS menu-bar app showing AI agent sessions on the Logitech MX Creative Keypad"
 license = "MIT"

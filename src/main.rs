@@ -54,6 +54,47 @@ fn travel_pos(tr: ((f32, f32), (f32, f32), f64), now: f64) -> (f32, f32) {
     (fx + (tx - fx) * e, fy + (ty - fy) * e)
 }
 
+struct IslandAgent {
+    agent: String,
+    session: String,
+    name: String,
+    title: String,
+    activity: model::Activity,
+    tool: Option<model::ToolKind>,
+    since: f64,
+    orb: colour::Rgb,
+    glow: colour::Rgb,
+}
+
+struct IslandQuota { provider: String, session: Option<f64>, weekly: Option<f64>, colour: colour::Rgb }
+
+enum IslandAction { None, Expand, Quotas, Open(String, String) }
+
+fn island_quotas(c: &Core) -> Vec<IslandQuota> {
+    c.quota_rows().into_iter().filter_map(|row| {
+        let provider = row.first()?.provider.clone();
+        let value = |window: &str| row.iter().find(|q| q.window == window)
+            .and_then(|q| quota::displayed_remaining(q, model::now() as i64))
+            .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
+        let (session, weekly) = (value("Session"), value("Weekly"));
+        let agent = if provider.eq_ignore_ascii_case("Claude") { "claude-code" } else if provider.eq_ignore_ascii_case("Codex") { "codex" } else { provider.as_str() };
+        let colour = colour::rotate(colour::hex_u32(0xd9a441), c.hue_of(agent) - colour::REFERENCE_HUE);
+        (session.is_some() || weekly.is_some()).then_some(IslandQuota { provider, session, weekly, colour })
+    }).collect()
+}
+
+fn island_agents(c: &Core) -> Vec<IslandAgent> {
+    let mut sessions: Vec<_> = c.visible().into_iter()
+        .filter(|s| matches!(s.activity.group(), Group::Working | Group::Waiting)).collect();
+    sessions.sort_by_key(|s| if s.activity.group() == Group::Waiting { 0 } else { 1 });
+    sessions.into_iter().map(|s| {
+        let name = c.agents.iter().find(|a| a.id == s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
+        let (orb, glow) = c.colours(s);
+        IslandAgent { agent: s.agent.clone(), session: s.id.clone(), name, title: s.title.clone(),
+            activity: s.activity, tool: s.tool, since: s.since, orb, glow }
+    }).collect()
+}
+
 struct App {
     travels: std::collections::HashMap<String, ((f32, f32), (f32, f32), f64)>,
     core: Arc<Mutex<Core>>,
@@ -62,12 +103,17 @@ struct App {
     menu_events: Arc<Mutex<Vec<String>>>,
     tray_clicks: Arc<Mutex<Vec<tray_icon::Rect>>>,
     popup_open: bool,
+    popup_from_island: bool,
+    island_geometry: Option<(f32, f32, f32, f32)>,
+    island_progress: f32,
     popup_position: egui::Pos2,
     popup_focused: bool,
     popup_keys: [bool; KEY_COUNT],
     popup_pages: [bool; 2],
     screenshot: Option<String>,
     screenshot_menu_bar: bool,
+    screenshot_island: bool,
+    screenshot_island_expanded: bool,
     frames: u32,
     shot_done: Arc<AtomicBool>,
     shot_failed: Arc<AtomicBool>,
@@ -167,7 +213,7 @@ fn hint(ui: &mut Ui, text: &str) {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<String>, screenshot_menu_bar: bool, shot_failed: Arc<AtomicBool>) -> App {
+    fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<String>, screenshot_menu_bar: bool, screenshot_island: bool, screenshot_island_expanded: bool, shot_failed: Arc<AtomicBool>) -> App {
         setup_style(&cc.egui_ctx);
         let mut settings = Settings::load();
         let demo = screenshot.is_some();
@@ -181,6 +227,12 @@ impl App {
         }
         if demo {
             core.in_control = true;
+        }
+        if screenshot_island {
+            for (provider, window, remaining) in [("Codex", "Weekly", 72.0), ("Claude", "Session", 55.0), ("Claude", "Weekly", 40.0)] {
+                core.quotas.push(quota::Quota { provider: provider.into(), window: window.into(), remaining: Some(remaining),
+                    reset: None, reset_text: None, updated: Some(quota::observed_now()), source: "Demo".into() });
+            }
         }
         let core = Arc::new(Mutex::new(core));
         let ctx = cc.egui_ctx.clone();
@@ -286,13 +338,18 @@ impl App {
             tray,
             menu_events,
             tray_clicks,
-            popup_open: screenshot_menu_bar,
+            popup_open: screenshot_menu_bar || screenshot_island_expanded,
+            popup_from_island: screenshot_island_expanded,
+            island_geometry: None,
+            island_progress: 0.0,
             popup_position: pos2(0.0, 24.0),
             popup_focused: false,
             popup_keys: [false; KEY_COUNT],
             popup_pages: [false; 2],
             screenshot,
             screenshot_menu_bar,
+            screenshot_island,
+            screenshot_island_expanded,
             frames: 0,
             shot_done: Arc::new(AtomicBool::new(false)),
             shot_failed,
@@ -355,6 +412,7 @@ impl App {
 
     fn open_popup(&mut self, rect: tray_icon::Rect) {
         self.popup_open = true;
+        self.popup_from_island = false;
         let (x, y) = mac::tray_popup_position(rect, 400.0, 480.0);
         self.popup_position = pos2(x, y);
         self.popup_focused = false;
@@ -362,11 +420,152 @@ impl App {
         mac::show_app();
     }
 
+    fn island(&mut self, ctx: &egui::Context) {
+        let (enabled, active, quotas, brightness, reduced) = match self.core.lock() {
+            Ok(c) => (c.settings.island_enabled,
+                island_agents(&c), island_quotas(&c),
+                c.settings.brightness, c.settings.motion == Motion::Reduced),
+            Err(_) => return,
+        };
+        if !enabled && self.popup_from_island { self.popup_open = false; }
+        if !enabled || (active.is_empty() && quotas.is_empty() && !(self.popup_open && self.popup_from_island) && self.island_progress <= 0.0) {
+            self.island_geometry = None;
+            return;
+        }
+        let geometry = mac::island_geometry();
+        let (x, y, notch, height) = geometry;
+        let h = height.clamp(28.0, 40.0);
+        let left_width = 6.0 + active.len().min(2) as f32 * 76.0;
+        let quota_count: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
+        let right_width = 6.0 + quota_count as f32 * 42.0;
+        let width = (notch + 2.0 * (left_width.max(right_width) + 6.0)).max(400.0);
+        let expanded = self.popup_open && self.popup_from_island;
+        let window_h = h + if expanded || self.island_progress > 0.0 { 484.0 } else { 4.0 };
+        let island_x = x - (width - 400.0) / 2.0;
+        let builder = egui::ViewportBuilder::default().with_title("Padgent Island")
+            .with_inner_size([width, window_h]).with_position(pos2(island_x, y))
+            .with_transparent(true).with_decorations(false).with_resizable(false)
+            .with_active(false).with_always_on_top();
+        let changed = self.island_geometry != Some(geometry);
+        self.island_geometry = Some(geometry);
+        let mut action = IslandAction::None;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("agent-island"), builder, |ui, _| {
+            if changed {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(island_x, y)));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(width, window_h)));
+            }
+            action = Self::island_contents(ui, &active, &quotas, brightness, reduced, notch, h);
+            let progress = if reduced { if expanded { 1.0 } else { 0.0 } } else {
+                ui.ctx().animate_bool_with_time(egui::Id::unique("island-body"), expanded, 0.22)
+            };
+            self.island_progress = progress;
+            self.island_body(ui, ctx, notch, h, progress);
+        });
+        mac::configure_island_window();
+        if let IslandAction::Open(agent, session) = &action {
+            let agents = self.core.lock().map(|c| c.agents.clone()).unwrap_or_default();
+            self.open_exact(&agents, agent, session);
+        }
+        if matches!(action, IslandAction::Expand | IslandAction::Quotas) {
+            ctx.request_repaint();
+            if matches!(action, IslandAction::Quotas) {
+                if let Ok(mut c) = self.core.lock() { c.quota_view = true; c.quota_page = 0; }
+            }
+            if self.popup_open && self.popup_from_island && matches!(action, IslandAction::Expand) {
+                self.popup_open = false;
+            } else {
+                self.popup_open = true;
+                self.popup_from_island = true;
+                self.popup_focused = false;
+                mac::show_app();
+                ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of("agent-island"), egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
+    fn island_body(&mut self, ui: &mut Ui, root: &egui::Context, notch: f32, h: f32, progress: f32) {
+        if progress <= 0.0 { return; }
+        let full = ui.max_rect();
+        let body = Rect::from_min_size(pos2(full.center().x - 200.0, full.top() + h), vec2(400.0, 480.0));
+        let width = notch.clamp(40.0, 400.0) + (400.0 - notch.clamp(40.0, 400.0)) * progress;
+        let reveal = Rect::from_min_size(pos2(full.center().x - width / 2.0, body.top()), vec2(width, 480.0 * progress));
+        ui.painter().rect_filled(reveal, CornerRadius::same(14), Color32::BLACK);
+        if self.popup_open && self.popup_from_island {
+            let mut child = ui.new_child(UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::LEFT)));
+            child.set_clip_rect(reveal.intersect(body));
+            self.popup_contents(&mut child, root);
+        }
+    }
+
+    fn island_contents(ui: &mut Ui, active: &[IslandAgent], quotas: &[IslandQuota], brightness: f32, reduced: bool, notch: f32, h: f32) -> IslandAction {
+        let rect = ui.max_rect();
+        let p = ui.painter().clone();
+        let gap = notch;
+        let count = active.len().min(2);
+        let quota_count: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
+        let left_width = 6.0 + count as f32 * 76.0;
+        let right_width = if quota_count == 0 { 6.0 } else { 6.0 + quota_count as f32 * 42.0 };
+        let left_edge = rect.center().x - gap / 2.0 - left_width;
+        let right_edge = rect.center().x + gap / 2.0 + right_width;
+        let hit = Rect::from_min_max(pos2(left_edge - 6.0, rect.top()), pos2(right_edge + 6.0, rect.top() + h + 2.0));
+        let expansion = if reduced { 0.0 } else { ui.ctx().animate_bool_with_time(egui::Id::unique("island-hover"), ui.rect_contains_pointer(hit), 0.22) };
+        let pill = Rect::from_min_max(pos2(left_edge - expansion * 6.0, rect.top()), pos2(right_edge + expansion * 6.0, rect.top() + h + expansion * 2.0));
+        p.rect_filled(pill, CornerRadius::same(14), Color32::BLACK);
+        let background = ui.interact(pill, egui::Id::unique("island-expand"), Sense::click()).on_hover_text("Open keypad");
+        let mut action = if background.clicked() { IslandAction::Expand } else { IslandAction::None };
+        let now = model::now();
+        for (i, agent) in active.iter().take(2).enumerate() {
+            let left = rect.center().x - gap / 2.0 - 76.0 - i as f32 * 76.0;
+            let tile = Rect::from_min_size(pos2(left, rect.top() + 3.0 + expansion * 0.5), vec2(72.0, h - 6.0));
+            let response = ui.interact(tile, egui::Id::unique(("island-session", &agent.agent, &agent.session)), Sense::click())
+                .on_hover_text(format!("{} · {}", agent.name, agent.title));
+            p.rect_filled(tile, CornerRadius::same(9), Color32::from_rgb(20, 22, 29));
+            paint::compact_field(&p, tile, agent.activity, agent.tool, agent.since, agent.orb, agent.glow, brightness, reduced, now);
+            if response.hovered() { p.rect_filled(tile, CornerRadius::same(9), white(0.09)); }
+            let text_rect = tile.shrink2(vec2(7.0, 1.0));
+            let label = if agent.title.trim().is_empty() { &agent.name } else { &agent.title };
+            let font = FontId::proportional(11.0);
+            let text_p = p.with_clip_rect(text_rect);
+            if reduced {
+                let mut job = egui::text::LayoutJob::simple_singleline(label.clone(), font, white(0.96));
+                job.wrap.max_width = text_rect.width();
+                job.wrap.max_rows = 1;
+                job.wrap.overflow_character = Some('…');
+                let galley = p.layout_job(job);
+                text_p.galley(pos2(text_rect.left(), text_rect.center().y - galley.size().y / 2.0), galley, white(0.96));
+            } else {
+                let galley = p.layout_no_wrap(label.clone(), font, white(0.96));
+                let overflow = (galley.size().x - text_rect.width()).max(0.0);
+                let offset = if overflow > 0.0 { let period = overflow as f64 / 20.0 + 2.0; ((now % period - 1.0).max(0.0) * 20.0).min(overflow as f64) as f32 } else { 0.0 };
+                text_p.galley(pos2(text_rect.left() - offset, text_rect.center().y - galley.size().y / 2.0), galley, white(0.96));
+            }
+            if response.clicked() { action = IslandAction::Open(agent.agent.clone(), agent.session.clone()); }
+        }
+        let mut quota_x = rect.center().x + gap / 2.0 + 6.0;
+        for quota in quotas.iter().take(2) {
+            for (window, value) in [("Session", quota.session), ("Weekly", quota.weekly)] {
+                let Some(value) = value else { continue };
+                let card = Rect::from_min_size(pos2(quota_x, rect.top() + 3.0 + expansion * 0.5), vec2(40.0, h - 6.0));
+                quota_x += 42.0;
+                let response = ui.interact(card, egui::Id::unique(("island-quota", &quota.provider, window)), Sense::click())
+                    .on_hover_text(format!("{} · {} · {:.0}% remaining", quota.provider, window, value));
+                if response.hovered() { p.rect_filled(card, CornerRadius::same(8), white(0.10)); }
+                p.text(card.center(), Align2::CENTER_CENTER, format!("{value:.0}%"), FontId::proportional(11.0), c32(quota.colour));
+                if response.clicked() { action = IslandAction::Quotas; }
+            }
+        }
+
+        action
+    }
+
     fn popup(&mut self, ctx: &egui::Context) {
         let builder = egui::ViewportBuilder::default().with_title("Padgent keypad")
             .with_inner_size([400.0, 480.0]).with_position(self.popup_position)
             .with_resizable(false).with_decorations(false).with_always_on_top();
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("tray-keypad"), builder, |ui, _| {
+            if self.popup_from_island && !self.popup_focused {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             self.popup_contents(ui, ctx);
         });
         if !self.popup_open { self.cancel_popup_inputs(); }
@@ -384,7 +583,7 @@ impl App {
             if !self.popup_open { return; }
             let p = ui.painter().clone();
             let full = ui.max_rect();
-            p.rect_filled(full, CornerRadius::same(14), Color32::from_rgb(29, 31, 39));
+            p.rect_filled(full, CornerRadius::same(14), if self.popup_from_island { Color32::BLACK } else { Color32::from_rgb(29, 31, 39) });
             let (faces, waiting, brightness, reduced, glyphs, dimmed, held) = {
                 let Ok(mut c) = self.core.lock() else { return };
                 c.tick();
@@ -1256,6 +1455,8 @@ impl App {
                 });
                 hint(ui, "Dot shows a terracotta dot on the menu bar icon. Dot and count adds the number of waiting sessions next to it. The menu previews every session with its state and last message.");
                 if ui.button("Preview menu-bar keypad").clicked() { preview = true; }
+                ui.checkbox(&mut s.island_enabled, "Show active agents around the camera notch");
+                hint(ui, "Click a conversation to open it, a quota to see usage, or the island background to unfold the keypad. The island responds gently to hover.");
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
                     if integrations::set_launch_at_login(login).is_ok() {
@@ -1380,8 +1581,10 @@ impl eframe::App for App {
                 self.open_popup(rect);
             }
         }
+        if self.screenshot.is_none() { self.island(ctx); }
         if !self.screenshot_menu_bar {
-            if self.popup_open { self.popup(ctx); } else { self.cancel_popup_inputs(); }
+            if self.popup_open && !self.popup_from_island { self.popup(ctx); }
+            else if !self.popup_open { self.cancel_popup_inputs(); }
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1429,6 +1632,16 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if self.screenshot_island {
+            if let Ok(c) = self.core.lock() {
+                Self::island_contents(ui, &island_agents(&c), &island_quotas(&c), c.settings.brightness, c.settings.motion == Motion::Reduced, 180.0, 32.0);
+            }
+            if self.screenshot_island_expanded {
+                let ctx = ui.ctx().clone();
+                self.island_body(ui, &ctx, 180.0, 32.0, 1.0);
+            }
+            return;
+        }
         if self.screenshot_menu_bar {
             let ctx = ui.ctx().clone();
             self.popup_contents(ui, &ctx);
@@ -1484,7 +1697,11 @@ fn main() -> eframe::Result {
     }
     let menu_screenshot = args.iter().position(|a| a == "--screenshot-menu-bar").and_then(|i| args.get(i + 1).cloned());
     let screenshot_menu_bar = menu_screenshot.is_some();
-    let screenshot = menu_screenshot.or_else(|| args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned()));
+    let expanded_screenshot = args.iter().position(|a| a == "--screenshot-island-expanded").and_then(|i| args.get(i + 1).cloned());
+    let screenshot_island_expanded = expanded_screenshot.is_some();
+    let island_screenshot = expanded_screenshot.or_else(|| args.iter().position(|a| a == "--screenshot-island").and_then(|i| args.get(i + 1).cloned()));
+    let screenshot_island = island_screenshot.is_some();
+    let screenshot = menu_screenshot.or(island_screenshot).or_else(|| args.iter().position(|a| a == "--screenshot").and_then(|i| args.get(i + 1).cloned()));
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Padgent")
@@ -1494,7 +1711,10 @@ fn main() -> eframe::Result {
         .with_fullsize_content_view(true)
         .with_title_shown(false)
         .with_titlebar_shown(false);
-    if screenshot_menu_bar {
+    if screenshot_island {
+        viewport = egui::ViewportBuilder::default().with_title("Padgent Island preview")
+            .with_inner_size([500.0, if screenshot_island_expanded { 516.0 } else { 36.0 }]).with_resizable(false).with_decorations(false).with_transparent(true);
+    } else if screenshot_menu_bar {
         viewport = egui::ViewportBuilder::default().with_title("Padgent keypad")
             .with_inner_size([400.0, 480.0]).with_resizable(false).with_decorations(false);
     }
@@ -1518,7 +1738,81 @@ fn main() -> eframe::Result {
     let shot = screenshot.clone();
     let shot_failed = Arc::new(AtomicBool::new(false));
     let app_shot_failed = shot_failed.clone();
-    let result = eframe::run_native("Padgent", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, screenshot_menu_bar, app_shot_failed)))));
+    let result = eframe::run_native("Padgent", options, Box::new(move |cc| Ok(Box::new(App::new(cc, shot, screenshot_menu_bar, screenshot_island, screenshot_island_expanded, app_shot_failed)))));
     if shot_failed.load(Ordering::SeqCst) { std::process::exit(1); }
     result
+}
+
+#[cfg(test)]
+mod island_tests {
+    use super::*;
+
+    fn add_session(core: &mut Core, agent: &str, id: &str, state: &str) {
+        core.apply(model::Incoming {
+            agent: agent.into(),
+            event: None,
+            body: serde_json::json!({"session": id, "state": state, "title": format!("title-{id}")}),
+        });
+    }
+
+    #[test]
+    fn compact_island_filters_inactive_archived_and_disabled_sessions_and_keeps_ids() {
+        let mut settings = Settings::default();
+        settings.disabled_agents.push("disabled-agent".into());
+        let mut core = Core::new(settings);
+        add_session(&mut core, "codex", "working-1", "thinking");
+        add_session(&mut core, "codex", "waiting-1", "waiting_permission");
+        add_session(&mut core, "codex", "waiting-2", "waiting_question");
+        add_session(&mut core, "codex", "idle", "idle");
+        add_session(&mut core, "codex", "archived", "thinking");
+        add_session(&mut core, "disabled-agent", "disabled", "waiting_question");
+        core.sessions.iter_mut().find(|s| s.id == "archived").unwrap().archived = true;
+
+        let active = island_agents(&core);
+        assert_eq!(active.len(), 3);
+        assert!(active.iter().all(|item| item.agent == "codex"));
+        assert!(active.iter().all(|item| matches!(item.activity.group(), Group::Waiting | Group::Working)));
+        assert!(!active.iter().any(|item| ["idle", "archived", "disabled"].contains(&item.session.as_str())));
+
+        // The renderer displays the first two, so waits must occupy both compact slots first.
+        assert_eq!(active.iter().take(2).filter(|item| item.activity.group() == Group::Waiting).count(), 2);
+        assert!(active.iter().any(|item| item.agent == "codex" && item.session == "working-1" && item.title == "title-working-1"));
+        assert!(active.iter().any(|item| item.agent == "codex" && item.session == "waiting-1" && item.title == "title-waiting-1"));
+        assert!(active.iter().any(|item| item.agent == "codex" && item.session == "waiting-2" && item.title == "title-waiting-2"));
+    }
+
+    fn quota(provider: &str, window: &str, remaining: Option<f64>, updated: Option<String>, reset: Option<i64>) -> quota::Quota {
+        quota::Quota {
+            provider: provider.into(), window: window.into(), remaining, reset,
+            reset_text: None, updated, source: "test".into(),
+        }
+    }
+
+    #[test]
+    fn compact_island_shows_only_fresh_observed_session_and_weekly_quota_values() {
+        let mut core = Core::new(Settings::default());
+        let now = chrono::Utc::now();
+        core.quotas = vec![
+            quota("Codex", "Session", Some(74.0), Some(now.to_rfc3339()), None),
+            quota("Codex", "Weekly", Some(31.0), Some(now.to_rfc3339()), Some(now.timestamp() - 1)),
+            quota("Codex", "Monthly", Some(88.0), Some(now.to_rfc3339()), None),
+            quota("Claude", "Weekly", None, Some(now.to_rfc3339()), None),
+        ];
+
+        let rows = island_quotas(&core);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].provider, "Codex");
+        assert_eq!(rows[0].session, Some(74.0));
+        assert_eq!(rows[0].weekly, None);
+    }
+
+    #[test]
+    fn compact_island_hides_quota_rows_without_fresh_remaining_values() {
+        let mut core = Core::new(Settings::default());
+        core.quotas = vec![
+            quota("Codex", "Session", Some(50.0), Some("2020-01-01T00:00:00Z".into()), None),
+            quota("Codex", "Weekly", None, Some(chrono::Utc::now().to_rfc3339()), None),
+        ];
+        assert!(island_quotas(&core).is_empty());
+    }
 }
