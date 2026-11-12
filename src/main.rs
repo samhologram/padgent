@@ -451,7 +451,8 @@ impl App {
         let right_width = 6.0 + quota_count as f32 * 42.0;
         let width = (notch + 2.0 * (left_width.max(right_width) + 6.0)).max(400.0);
         let expanded = self.popup_open && self.popup_from_island;
-        let window_h = h + if expanded || self.island_progress > 0.0 { 484.0 } else { 4.0 };
+        let body_width = notch + left_width + right_width + 12.0;
+        let window_h = h + if expanded || self.island_progress > 0.0 { body_width * 1.2 + 4.0 } else { 4.0 };
         let island_x = x - (width - 400.0) / 2.0;
         let builder = egui::ViewportBuilder::default().with_title("Padgent Island")
             .with_inner_size([width, window_h]).with_position(pos2(island_x, y))
@@ -465,12 +466,13 @@ impl App {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(island_x, y)));
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(width, window_h)));
             }
-            action = Self::island_contents(ui, &active, &quotas, brightness, reduced, notch, h);
             let progress = if reduced { if expanded { 1.0 } else { 0.0 } } else {
                 ui.ctx().animate_bool_with_time(egui::Id::unique("island-body"), expanded, 0.22)
             };
             self.island_progress = progress;
-            self.island_body(ui, ctx, notch, h, progress);
+            let (next_action, pill) = Self::island_contents(ui, &active, &quotas, brightness, reduced, notch, h, progress > 0.0);
+            action = next_action;
+            self.island_body(ui, ctx, pill, h, progress);
         });
         mac::configure_island_window();
         if let IslandAction::Open(agent, session) = &action {
@@ -494,13 +496,11 @@ impl App {
         }
     }
 
-    fn island_body(&mut self, ui: &mut Ui, root: &egui::Context, notch: f32, h: f32, progress: f32) {
+    fn island_body(&mut self, ui: &mut Ui, root: &egui::Context, pill: Rect, h: f32, progress: f32) {
         if progress <= 0.0 { return; }
-        let full = ui.max_rect();
-        let body = Rect::from_min_size(pos2(full.center().x - 200.0, full.top() + h), vec2(400.0, 480.0));
-        let width = notch.clamp(40.0, 400.0) + (400.0 - notch.clamp(40.0, 400.0)) * progress;
-        let reveal = Rect::from_min_size(pos2(full.center().x - width / 2.0, body.top()), vec2(width, 480.0 * progress));
-        ui.painter().rect_filled(reveal, CornerRadius::same(14), Color32::BLACK);
+        let body = Rect::from_min_size(pos2(pill.left(), pill.top() + h), vec2(pill.width(), pill.width() * 1.2));
+        let reveal = Rect::from_min_size(body.min, vec2(body.width(), body.height() * progress));
+        ui.painter().rect_filled(reveal, CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }, Color32::BLACK);
         if self.popup_open && self.popup_from_island {
             let mut child = ui.new_child(UiBuilder::new().max_rect(body).layout(egui::Layout::top_down(egui::Align::LEFT)));
             child.set_clip_rect(reveal.intersect(body));
@@ -508,7 +508,7 @@ impl App {
         }
     }
 
-    fn island_contents(ui: &mut Ui, active: &[IslandAgent], quotas: &[IslandQuota], brightness: f32, reduced: bool, notch: f32, h: f32) -> IslandAction {
+    fn island_contents(ui: &mut Ui, active: &[IslandAgent], quotas: &[IslandQuota], brightness: f32, reduced: bool, notch: f32, h: f32, expanded: bool) -> (IslandAction, Rect) {
         let rect = ui.max_rect();
         let p = ui.painter().clone();
         let gap = notch;
@@ -521,7 +521,8 @@ impl App {
         let hit = Rect::from_min_max(pos2(left_edge - 6.0, rect.top()), pos2(right_edge + 6.0, rect.top() + h + 2.0));
         let expansion = if reduced { 0.0 } else { ui.ctx().animate_bool_with_time(egui::Id::unique("island-hover"), ui.rect_contains_pointer(hit), 0.22) };
         let pill = Rect::from_min_max(pos2(left_edge - expansion * 6.0, rect.top()), pos2(right_edge + expansion * 6.0, rect.top() + h + expansion * 2.0));
-        p.rect_filled(pill, CornerRadius::same(14), Color32::BLACK);
+        let corners = if expanded { CornerRadius::ZERO } else { CornerRadius::same(14) };
+        p.rect_filled(pill, corners, Color32::BLACK);
         let background = ui.interact(pill, egui::Id::unique("island-expand"), Sense::click()).on_hover_text("Open keypad");
         let mut action = if background.clicked() { IslandAction::Expand } else { IslandAction::None };
         let now = model::now();
@@ -566,7 +567,7 @@ impl App {
             }
         }
 
-        action
+        (action, pill)
     }
 
     fn popup(&mut self, ctx: &egui::Context) {
@@ -594,7 +595,8 @@ impl App {
             if !self.popup_open { return; }
             let p = ui.painter().clone();
             let full = ui.max_rect();
-            p.rect_filled(full, CornerRadius::same(14), if self.popup_from_island { Color32::BLACK } else { Color32::from_rgb(29, 31, 39) });
+            let corners = if self.popup_from_island { CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 } } else { CornerRadius::same(14) };
+            p.rect_filled(full, corners, if self.popup_from_island { Color32::BLACK } else { Color32::from_rgb(29, 31, 39) });
             let (faces, waiting, brightness, reduced, glyphs, dimmed, held) = {
                 let Ok(mut c) = self.core.lock() else { return };
                 c.tick();
@@ -603,9 +605,10 @@ impl App {
                     c.settings.key_glyphs, c.dimmed(), [c.page_held(false), c.page_held(true)])
             };
             let t = model::now();
-            let dev = Rect::from_min_size(full.min + vec2(12.0, 12.0), vec2(376.0, 414.0));
-            let grid_min = dev.min + vec2(16.0, 16.0);
-            let scale = 344.0 / 434.0;
+            let factor = full.width() / 400.0;
+            let dev = Rect::from_min_size(full.min + vec2(12.0, 12.0) * factor, vec2(376.0, 414.0) * factor);
+            let grid_min = dev.min + vec2(16.0, 16.0) * factor;
+            let scale = (344.0 / 434.0) * factor;
             let size = model::KEY_SIZE as f32 * scale;
             let pitch = model::PITCH as f32 * scale;
             let mut down = [false; KEY_COUNT];
@@ -623,7 +626,7 @@ impl App {
             }
             let mut page_down = [false; 2];
             for i in 0..2 {
-                let r = Rect::from_min_size(pos2(dev.left() + 78.0 + i as f32 * 128.0, dev.bottom() - 42.0), vec2(92.0, 30.0));
+                let r = Rect::from_min_size(pos2(dev.left() + (78.0 + i as f32 * 128.0) * factor, dev.bottom() - 42.0 * factor), vec2(92.0, 30.0) * factor);
                 let resp = ui.interact(r, egui::Id::unique(("tray-page", i)), Sense::click_and_drag());
                 page_down[i] = resp.is_pointer_button_down_on();
                 paint::page_button(&p, r, if i == 0 { "‹" } else { "›" }, held[i], resp.hovered());
@@ -637,8 +640,8 @@ impl App {
             }
             self.popup_keys = down;
             self.popup_pages = page_down;
-            let r = Rect::from_min_size(full.min + vec2(12.0, 436.0), vec2(376.0, 30.0));
-            if ui.put(r, egui::Button::new("Open Padgent & Settings…")).clicked() {
+            let r = Rect::from_min_size(full.min + vec2(12.0, 436.0) * factor, vec2(376.0, 30.0) * factor);
+            if ui.put(r, egui::Button::new(RichText::new("Open Padgent & Settings…").size(14.0 * factor))).clicked() {
                 self.popup_open = false;
                 mac::log("tray keypad dismissed for full app");
                 self.page = Page::Keypad;
@@ -1592,10 +1595,14 @@ impl eframe::App for App {
                 self.open_popup(rect);
             }
         }
-        if self.screenshot.is_none() { self.island(ctx); }
-        if !self.screenshot_menu_bar {
-            if self.popup_open && !self.popup_from_island { self.popup(ctx); }
-            else if !self.popup_open { self.cancel_popup_inputs(); }
+        // Immediate child windows share this context's texture atlas. A hidden root
+        // still needs a paint pass so atlas updates reach the GPU for those windows.
+        if self.screenshot.is_none() {
+            let needs_children = self.popup_open || self.core.lock().map(|c|
+                c.settings.island_enabled && (!island_agents(&c).is_empty() || !island_quotas(&c).is_empty())
+            ).unwrap_or(false);
+            if needs_children { ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden); }
+            if !self.popup_open { self.cancel_popup_inputs(); }
         }
         if ctx.input(|i| i.viewport().close_requested()) && self.screenshot.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1643,13 +1650,20 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        if self.screenshot.is_none() {
+            let ctx = ui.ctx().clone();
+            self.island(&ctx);
+            if self.popup_open && !self.popup_from_island { self.popup(&ctx); }
+            if !self.popup_open { self.cancel_popup_inputs(); }
+            if !ctx.input(|i| i.viewport().visible().unwrap_or(true)) { return; }
+        }
         if self.screenshot_island {
-            if let Ok(c) = self.core.lock() {
-                Self::island_contents(ui, &island_agents(&c), &island_quotas(&c), c.settings.brightness, c.settings.motion == Motion::Reduced, 180.0, 32.0);
-            }
-            if self.screenshot_island_expanded {
+            let pill = self.core.lock().ok().map(|c| {
+                Self::island_contents(ui, &island_agents(&c), &island_quotas(&c), c.settings.brightness, c.settings.motion == Motion::Reduced, 180.0, 32.0, self.screenshot_island_expanded).1
+            });
+            if let (true, Some(pill)) = (self.screenshot_island_expanded, pill) {
                 let ctx = ui.ctx().clone();
-                self.island_body(ui, &ctx, 180.0, 32.0, 1.0);
+                self.island_body(ui, &ctx, pill, 32.0, 1.0);
             }
             return;
         }
@@ -1724,7 +1738,7 @@ fn main() -> eframe::Result {
         .with_titlebar_shown(false);
     if screenshot_island {
         viewport = egui::ViewportBuilder::default().with_title("Padgent Island preview")
-            .with_inner_size([500.0, if screenshot_island_expanded { 516.0 } else { 36.0 }]).with_resizable(false).with_decorations(false).with_transparent(true);
+            .with_inner_size([500.0, if screenshot_island_expanded { 600.0 } else { 36.0 }]).with_resizable(false).with_decorations(false).with_transparent(true);
     } else if screenshot_menu_bar {
         viewport = egui::ViewportBuilder::default().with_title("Padgent keypad")
             .with_inner_size([400.0, 480.0]).with_resizable(false).with_decorations(false);
