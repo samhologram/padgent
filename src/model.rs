@@ -714,6 +714,8 @@ pub struct Session {
     pub unread: u32,
     /// Locally hidden until a new turn or resumed work.
     pub archived: bool,
+    /// A completion or unread reply remains visible until this conversation is opened.
+    pub pending_attention: bool,
     /// Text waiting for the current one's 1.5 s dwell to pass.
     pub pending_text: Option<String>,
 }
@@ -1016,6 +1018,7 @@ impl Core {
                     pid: 0,
                     unread: 0,
                     archived: false,
+                    pending_attention: false,
                     pending_text: None,
                 });
                 self.sessions.len() - 1
@@ -1091,6 +1094,10 @@ impl Core {
         if (og != Group::Working && ng == Group::Working) || event.as_deref() == Some("UserPromptSubmit") {
             s.turn_started = t;
             s.archived = false;
+            s.pending_attention = false;
+        }
+        if !s.archived && (activity == Activity::Done || s.unread > 0) {
+            s.pending_attention = true;
         }
         s.activity = activity;
         s.updated = t;
@@ -1146,7 +1153,7 @@ impl Core {
             }
         }
         let before = self.sessions.len();
-        self.sessions.retain(|s| s.archived || t - s.updated < REMOVE_AFTER_S);
+        self.sessions.retain(|s| s.archived || s.pending_attention || t - s.updated < REMOVE_AFTER_S);
         if self.sessions.len() != before {
             changed = true;
         }
@@ -1186,7 +1193,7 @@ impl Core {
         let recency = self.settings.recency_minutes as f64 * 60.0;
         // Working and waiting sessions always keep a key; others only while recent.
         let recent = |s: &&Session| {
-            !s.archived && (matches!(s.activity.group(), Group::Working | Group::Waiting) || t - s.updated < recency)
+            !s.archived && (s.pending_attention || s.unread > 0 || matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || t - s.updated < recency)
         };
         let mut v: Vec<&Session> = self
             .order
@@ -1203,6 +1210,21 @@ impl Core {
         v
     }
 
+    /// Capture the exact target and dismiss completed or unread inactive work on open.
+    pub fn acknowledge_open(&mut self, agent: &str, session: &str) -> Option<Session> {
+        let s = self.sessions.iter_mut().find(|s| s.agent == agent && s.id == session)?;
+        let target = s.clone();
+        let dismiss = !matches!(s.activity.group(), Group::Working | Group::Waiting)
+            && (s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done);
+        if dismiss {
+            s.archived = true;
+            s.pending_attention = false;
+            s.unread = 0;
+            self.touch();
+        }
+        Some(target)
+    }
+
     /// All keypad slots, including empty slots reserved on the first page. Keep this as the
     /// single mapping for drawing, key presses and the hub's waiting-session shortcut.
     fn keypad_slots(&self) -> Vec<Option<&Session>> {
@@ -1211,7 +1233,7 @@ impl Core {
 
     fn keypad_slots_at(&self, t: f64) -> Vec<Option<&Session>> {
         let (recent, old_idle): (Vec<_>, Vec<_>) = self.visible().into_iter().partition(|s| {
-            s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
+            s.pending_attention || s.unread > 0 || s.activity.group() != Group::Idle || t - s.since <= IDLE_SECOND_PAGE_AFTER_S
         });
         let mut slots: Vec<Option<&Session>> = recent.into_iter().map(Some).collect();
         if !old_idle.is_empty() && slots.len() < SESSION_KEYS_PER_PAGE {
@@ -1462,8 +1484,10 @@ impl Core {
                 self.touch();
             }
             Some(KeyPressTarget::Session(key)) if self.settings.key_actions_enabled => {
-                if let Some(s) = self.sessions.iter().find(|s| s.key() == key) {
-                    self.actions.push(Action::Open { agent: s.agent.clone(), session: s.id.clone() });
+                if let Some((agent, session)) = self.sessions.iter().find(|s| s.key() == key).map(|s| (s.agent.clone(), s.id.clone())) {
+                    if self.acknowledge_open(&agent, &session).is_some() {
+                        self.actions.push(Action::Open { agent, session });
+                    }
                 }
             }
             Some(KeyPressTarget::Empty) if self.settings.key_actions_enabled && !self.settings.empty_key_url.trim().is_empty() => {
@@ -1587,6 +1611,7 @@ impl Core {
                 pid: 0,
                 unread: if *title == "data-pipeline" { 2 } else { 0 },
                 archived: false,
+                pending_attention: matches!(act, Activity::Done),
                 pending_text: None,
             });
         }
@@ -1997,8 +2022,7 @@ mod tests {
         assert_eq!(core.sessions[0].unread, 2);
 
         let slots = core.keypad_slots_at(now());
-        assert!(slots[..SESSION_KEYS_PER_PAGE].iter().all(Option::is_none));
-        assert_eq!(slots[SESSION_KEYS_PER_PAGE].unwrap().id, "local-old");
+        assert_eq!(slots[0].unwrap().id, "local-old", "unread inactive work stays in the recent first-page slots");
     }
 
     #[test]

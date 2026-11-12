@@ -85,8 +85,8 @@ fn island_quotas(c: &Core) -> Vec<IslandQuota> {
 
 fn island_agents(c: &Core) -> Vec<IslandAgent> {
     let mut sessions: Vec<_> = c.visible().into_iter()
-        .filter(|s| matches!(s.activity.group(), Group::Working | Group::Waiting)).collect();
-    sessions.sort_by_key(|s| if s.activity.group() == Group::Waiting { 0 } else { 1 });
+        .filter(|s| matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || s.pending_attention || s.unread > 0).collect();
+    sessions.sort_by_key(|s| if s.activity.group() == Group::Waiting { 0 } else if s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done { 1 } else { 2 });
     sessions.into_iter().map(|s| {
         let name = c.agents.iter().find(|a| a.id == s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
         let (orb, glow) = c.colours(s);
@@ -295,15 +295,16 @@ impl App {
                 }
                 if let Some(key) = id.strip_prefix("open:") {
                     // Open now: this runs on the main thread even while the window is hidden.
-                    let found = mc.lock().ok().and_then(|c| {
+                    let found = mc.lock().ok().and_then(|mut c| {
                         let (agent, session) = key.split_once(':')?;
-                        let s = c.sessions.iter().find(|s| s.agent == agent && s.id == session)?.clone();
+                        let s = c.acknowledge_open(agent, session)?;
                         Some((c.agents.iter().find(|a| a.id == s.agent).cloned(), s))
                     });
                     match found {
                         Some((def, s)) => integrations::open_exact(def.as_ref(), &s),
                         None => mac::log(&format!("menu: no session for {key}")),
                     }
+                    w2();
                     return;
                 }
                 if id == "toggle" {
@@ -373,7 +374,7 @@ impl App {
             match a {
                 Action::Open { agent, session } => {
                     mac::log(&format!("click: open {agent}:{session}"));
-                    self.open_exact(&agents, &agent, &session)
+                    self.open_target(&agents, &agent, &session)
                 }
                 Action::OpenUrl(u) => integrations::open_url(&u),
                 Action::ShowWindow => {
@@ -402,6 +403,16 @@ impl App {
     }
 
     fn open_exact(&self, agents: &[AgentDef], agent: &str, session: &str) {
+        let found = self.core.lock().ok().and_then(|mut c| c.acknowledge_open(agent, session));
+        let def = agents.iter().find(|d| d.id == agent);
+        match found {
+            Some(s) => integrations::open_exact(def, &s),
+            None => integrations::open_session(def, session),
+        }
+    }
+
+    // Hardware and keypad presses already acknowledged their captured target on release.
+    fn open_target(&self, agents: &[AgentDef], agent: &str, session: &str) {
         let found = self.core.lock().ok().and_then(|c| c.sessions.iter().find(|s| s.agent == agent && s.id == session).cloned());
         let def = agents.iter().find(|d| d.id == agent);
         match found {
@@ -1814,5 +1825,109 @@ mod island_tests {
             quota("Codex", "Weekly", None, Some(chrono::Utc::now().to_rfc3339()), None),
         ];
         assert!(island_quotas(&core).is_empty());
+    }
+
+    #[test]
+    fn completed_session_survives_decay_and_expiry_until_open_then_hides_everywhere() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "finished", "done");
+        let t = model::now();
+        let finished = core.sessions.iter_mut().find(|s| s.id == "finished").unwrap();
+        finished.since = t - model::DONE_DECAY_S - 5.0;
+        finished.updated = t - model::REMOVE_AFTER_S - 5.0;
+
+        core.tick();
+        assert_eq!(core.sessions[0].activity, model::Activity::Idle);
+        assert!(core.sessions[0].pending_attention);
+        assert!(core.visible().iter().any(|s| s.id == "finished"));
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:finished"));
+        assert_eq!(island_agents(&core).iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["finished"]);
+
+        let captured = core.acknowledge_open("codex", "finished").expect("the exact session is still available to open");
+        assert_eq!(captured.id, "finished");
+        assert!(core.sessions[0].archived);
+        assert!(!core.sessions[0].pending_attention);
+        assert!(core.visible().is_empty());
+        assert!(core.faces().iter().all(|face| !matches!(face, model::KeyFace::Session(_))));
+        assert!(island_agents(&core).is_empty());
+    }
+
+    #[test]
+    fn unread_inactive_survives_expiry_open_hides_stale_polls_and_work_resumes_it() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "reply", "idle");
+        core.apply(model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"reply", "state":"idle", "_unread":4}),
+        });
+        let t = model::now();
+        core.sessions.iter_mut().find(|s| s.id == "reply").unwrap().updated = t - model::REMOVE_AFTER_S - 10.0;
+
+        core.tick();
+        assert_eq!(core.sessions.len(), 1, "pending unread keeps an otherwise expired record");
+        assert!(core.sessions[0].pending_attention);
+        assert_eq!(core.sessions[0].unread, 4);
+        assert_eq!(island_agents(&core).iter().map(|s| s.session.as_str()).collect::<Vec<_>>(), ["reply"]);
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:reply"));
+
+        core.acknowledge_open("codex", "reply").unwrap();
+        assert!(core.sessions[0].archived);
+        assert_eq!(core.sessions[0].unread, 0);
+        assert!(core.visible().is_empty());
+        assert!(island_agents(&core).is_empty());
+
+        // A delayed title/read-receipt poll cannot restore the acknowledged inactive item.
+        core.apply(model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"reply", "state":"idle", "title":"stale title", "_unread":4}),
+        });
+        assert!(core.sessions[0].archived);
+        assert!(core.visible().is_empty());
+        assert!(core.faces().iter().all(|face| !matches!(face, model::KeyFace::Session(_))));
+        assert!(island_agents(&core).is_empty());
+
+        // A genuinely active update reopens the record and restores it to both views.
+        core.apply(model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"reply", "state":"thinking", "title":"resumed"}),
+        });
+        assert!(!core.sessions[0].archived);
+        assert!(core.sessions[0].pending_attention, "the unread count remains until a read/open acknowledgement");
+        assert!(core.visible().iter().any(|s| s.id == "reply"));
+        assert!(island_agents(&core).iter().any(|s| s.agent == "codex" && s.session == "reply"));
+    }
+
+    #[test]
+    fn opening_working_session_does_not_archive_or_remove_it() {
+        let mut core = Core::new(Settings::default());
+        add_session(&mut core, "codex", "working", "thinking");
+        assert!(core.acknowledge_open("codex", "working").is_some());
+        assert!(!core.sessions[0].archived);
+        assert!(!core.sessions[0].pending_attention);
+        assert!(core.visible().iter().any(|s| s.id == "working"));
+        assert!(island_agents(&core).iter().any(|s| s.session == "working"));
+    }
+
+    #[test]
+    fn captured_completed_tile_is_acknowledged_after_reorder_without_opening_new_slot() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        add_session(&mut core, "codex", "finished", "done");
+        add_session(&mut core, "codex", "other", "idle");
+
+        let target = model::target_for_face(&core.faces()[0], core.quota_view);
+        assert_eq!(target, model::KeyPressTarget::Session("codex:finished".into()));
+        core.key_down_with_target(0, target);
+        core.apply(model::Incoming {
+            agent: "codex".into(), event: None,
+            body: serde_json::json!({"session":"other", "state":"waiting_question"}),
+        });
+        assert!(matches!(&core.faces()[0], model::KeyFace::Session(face) if face.key == "codex:other"));
+
+        core.key_up(0);
+        assert!(matches!(core.actions.as_slice(), [model::Action::Open { agent, session }] if agent == "codex" && session == "finished"));
+        assert!(core.sessions.iter().find(|s| s.id == "finished").unwrap().archived);
+        assert!(!core.sessions.iter().find(|s| s.id == "other").unwrap().archived);
+        assert!(island_agents(&core).iter().all(|s| s.session != "finished"));
     }
 }

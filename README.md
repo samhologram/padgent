@@ -26,6 +26,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
   Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
+  Completed or unread conversations stay visible until opened, and return when work resumes.
   Turn it on or off in Menu bar and hand-over settings.
 - **Settings:** colours, motion, key order, recent sessions, hand-over, launch at login, model
   roles for Claude Code (Haiku for the swarm, Sonnet for code, Opus for orchestration).
