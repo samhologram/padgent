@@ -42,6 +42,11 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   Claude cloud-only scheduled runs and ChatGPT Dots unread messages are not tracked yet.
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
+- **Display API and MCP:** apps and agents can reserve individual keys or the whole 3×3
+  keypad, use Padgent's native animations, or compose custom gradients, text and shapes.
+  Clear individual keys or the entire leased keypad, then release to restore native content.
+  Both interfaces use the same display controller and renderers as the app.
+  See the [display API guide](docs/display-api.md) for examples and MCP setup.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
   Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
   Completed or unread conversations stay bright until opened, then remain dimmed until work resumes.
@@ -89,6 +94,10 @@ On first use macOS asks you to allow Padgent in **Accessibility** (to follow des
 
 States: `starting`, `idle`, `thinking`, `tool`, `streaming`, `waitingPermission`,
 `waitingQuestion`, `done`, `error`, `compacting`, `offline`.
+
+For direct display control, use `http://127.0.0.1:47800/v1/display` or connect an MCP
+client to `http://127.0.0.1:47800/mcp` with Streamable HTTP. A display lease returns the
+keys to their current native content when released or expired; it does not stop agent tracking.
 
 ## Agent files
 

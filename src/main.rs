@@ -1,5 +1,7 @@
 //! Padgent — an open-source keypad and menu bar for agent sessions.
 
+mod display;
+mod mcp;
 mod colour;
 mod cloud;
 mod field;
@@ -835,7 +837,15 @@ impl App {
             Hardware::Driving => "Padgent has the keypad. Each key is one session in its agent's colour; the hub key counts what is waiting.".to_string(),
             Hardware::Problem(e) => e.clone(),
         };
-        p.text(rect.min + vec2(4.0, 44.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.5), white(0.55));
+        let external = self.core.lock().ok().and_then(|c| c.display.summary(model::now()));
+        let status_clip = Rect::from_min_max(rect.min + vec2(4.0, 34.0), pos2(if external.is_some() { rect.right() - 155.0 } else { rect.right() }, rect.top() + 58.0));
+        p.with_clip_rect(status_clip).text(rect.min + vec2(4.0, 44.0), Align2::LEFT_CENTER, external.as_deref().unwrap_or(&sub), FontId::proportional(12.5), white(0.65));
+        if external.is_some() {
+            let release_rect = Rect::from_min_size(pos2(rect.right() - 145.0, rect.top() + 40.0), vec2(140.0, 26.0));
+            if ui.put(release_rect, egui::Button::new("Release external")).clicked() {
+                if let Ok(mut c) = self.core.lock() { c.release_display(); }
+            }
+        }
         let btn_rect = Rect::from_min_size(pos2(rect.right() - 340.0, rect.top() + 4.0), vec2(200.0, 32.0));
         let label = if in_control { "Give Keypad to Options+" } else { "Take Over Keypad" };
         if ui.put(btn_rect, egui::Button::new(label).corner_radius(16)).clicked() {
@@ -1817,6 +1827,17 @@ impl eframe::App for App {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().collect();
+    // An isolated local fixture for API clients, without the app's settings, watchers or keypad.
+    if let Some(i) = args.iter().position(|a| a == "--serve-demo") {
+        let port = args.get(i + 1).and_then(|s| s.parse::<u16>().ok()).filter(|p| *p > 0).unwrap_or_else(|| { eprintln!("--serve-demo requires a port"); std::process::exit(2) });
+        let mut core = Core::new(Settings::default());
+        core.agents = model::builtin_agents();
+        core.load_demo(); core.in_control = true;
+        let core = Arc::new(Mutex::new(core));
+        server::start(core.clone(), port, Arc::new(|| {}));
+        if core.lock().map(|c| !c.server_status.starts_with("Listening")).unwrap_or(true) { eprintln!("Could not bind demo server"); std::process::exit(1); }
+        loop { std::thread::park(); }
+    }
     // `--icon <file.png> [size]` draws the app icon (used when packaging Padgent.app).
     if let Some(i) = args.iter().position(|a| a == "--icon") {
         let path = args.get(i + 1).cloned().unwrap_or_else(|| "icon.png".into());

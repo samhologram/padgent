@@ -231,6 +231,7 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
         KeyFace::Back => { p.text(r.center(), Align2::CENTER_CENTER, "← Back", FontId::proportional(k * 0.14), white(0.9)); }
         KeyFace::Session(f) => paint_session(p, r, f, cx),
         KeyFace::Hub(h) => paint_hub(p, r, h, cx),
+        KeyFace::Controlled(scene, _, _) => paint_controlled(p, r, scene, cx),
     }
 
     // Long-press progress towards the steps view.
@@ -445,6 +446,40 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
 /// State word on a tile.
 fn state_word(a: Activity) -> &'static str {
     if a == Activity::Empty { "Idle" } else { a.label() }
+}
+
+
+fn paint_controlled(p: &Painter, r: Rect, scene: &crate::display::Scene, cx: &KeyCx) {
+    if scene.kind == "native" { paint_session(p, r, &scene.native_face(), cx); return; }
+    let k = r.width();
+    let t = if cx.reduced_motion { 0.0 } else { (cx.t % scene.period_seconds as f64) as f32 };
+    let mut mesh = Mesh::default();
+    const N: usize = 12;
+    for row in 0..=N {
+        let y = row as f32 / N as f32;
+        let rad = 0.2_f32;
+        let dy = if y < rad { rad-y } else if y > 1.0-rad { y-(1.0-rad) } else { 0.0 };
+        let inset = rad - (rad*rad-dy*dy).max(0.0).sqrt();
+        for col in 0..=N { let x = inset + (1.0-2.0*inset)*col as f32/N as f32; mesh.colored_vertex(pos2(r.left()+x*k,r.top()+y*k), c32(scene.sample(x,y,t))); }
+    }
+    for row in 0..N { for col in 0..N { let i=(row*(N+1)+col) as u32; mesh.add_triangle(i,i+1,i+N as u32+1); mesh.add_triangle(i+1,i+N as u32+2,i+N as u32+1); } }
+    p.add(Shape::mesh(mesh));
+    let clip=p.with_clip_rect(r.shrink(k*0.02));
+    let foreground=c32(Rgb::parse(&scene.foreground).unwrap_or(Rgb(255,255,255)));
+    if !scene.title.is_empty() { clip.text(pos2(r.center().x,r.top()+k*0.28),Align2::CENTER_CENTER,&scene.title,FontId::proportional(k*0.13),foreground); }
+    if !scene.text.is_empty() { text_block(&clip,pos2(r.center().x,r.top()+k*0.48),k*0.86,&scene.text,k*0.10,foreground,3,true); }
+    for layer in &scene.layers {
+        let x=r.left()+layer.x*k; let y=r.top()+layer.y*k;
+        let rect=Rect::from_min_size(pos2(x,y),vec2(layer.width*k,layer.height*k));
+        let col=c32(Rgb::parse(&layer.color).unwrap_or(Rgb(255,255,255)));
+        match layer.kind.as_str() {
+            "rect" => { clip.rect_filled(rect, CornerRadius::same(3), col); }
+            "circle" | "ellipse" => { clip.add(egui::epaint::EllipseShape::filled(rect.center(), rect.size()/2.0, col)); }
+            "line" => { clip.line_segment([rect.min,rect.max], Stroke::new((layer.size*k).max(1.0),col)); }
+            "text" => { clip.text(pos2(x,y),Align2::LEFT_TOP,&layer.text,FontId::proportional((layer.size*k).max(1.0)),col); }
+            _ => {}
+        }
+    }
 }
 
 fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {

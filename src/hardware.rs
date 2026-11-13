@@ -236,6 +236,7 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
         KeyFace::Back => { let label = "← Back"; draw_text(&mut pm, font, 16.0, (k - text_width(font, 16.0, label)) / 2.0, 64.0, label, white, 0.9); }
         KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
         KeyFace::Hub(h) => render_hub(&mut pm, h, (t % 1248.0) as f32, font),
+        KeyFace::Controlled(scene, _, reduced) => render_controlled(&mut pm, scene, if *reduced { 0.0 } else if scene.kind == "native" { phase } else { (t % scene.period_seconds as f64) as f32 }, t, font),
     }
     if let KeyFace::Session(f) = face {
         for pixel in pm.data_mut().chunks_exact_mut(4) {
@@ -378,6 +379,40 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
 
 fn waiting_tint(c: Rgb) -> Rgb {
     c.mix(Rgb(255, 255, 255), 0.15)
+}
+
+fn render_controlled(pm: &mut Pixmap, scene: &crate::display::Scene, phase: f32, t: f64, font: &FontVec) {
+    if scene.kind == "native" { render_session(pm, &scene.native_face(), phase, t, font); return; }
+    let k=KEY_SIZE as f32;
+    for y in 0..KEY_SIZE { for x in 0..KEY_SIZE {
+        let nx=(x as f32+0.5)/k; let ny=(y as f32+0.5)/k;
+        let radius=0.2_f32;
+        let dx=(radius-nx.min(1.0-nx)).max(0.0);
+        let dy=(radius-ny.min(1.0-ny)).max(0.0);
+        if dx*dx+dy*dy > radius*radius { continue; }
+        let c=scene.sample(nx,ny,phase); let i=((y*KEY_SIZE+x)*4) as usize;
+        pm.data_mut()[i..i+4].copy_from_slice(&[c.0,c.1,c.2,255]);
+    } }
+    let fg=Rgb::parse(&scene.foreground).unwrap_or(Rgb(255,255,255));
+    if !scene.title.is_empty() {
+        let title=fit(font,15.0,&scene.title,k-16.0);
+        draw_text(pm,font,15.0,(k-text_width(font,15.0,&title))/2.0,k*0.34,&title,fg,1.0);
+    }
+    for (i, line) in wrap(font,12.0,&scene.text,k*0.86,3).iter().enumerate() {
+        draw_text(pm,font,12.0,(k-text_width(font,12.0,line))/2.0,k*0.58+i as f32*13.0,line,fg,1.0);
+    }
+    for layer in &scene.layers {
+        let x=layer.x*k; let y=layer.y*k; let w=layer.width*k; let h=layer.height*k;
+        let col=Rgb::parse(&layer.color).unwrap_or(Rgb(255,255,255));
+        let mut paint=Paint::default(); paint.set_color(color(col,1.0));
+        match layer.kind.as_str() {
+            "rect" => if let Some(rect)=tiny_skia::Rect::from_xywh(x,y,w,h) { pm.fill_path(&PathBuilder::from_rect(rect),&paint,FillRule::Winding,Transform::identity(),None); },
+            "circle" | "ellipse" => if let Some(rect)=tiny_skia::Rect::from_xywh(x,y,w,h) { if let Some(path)=PathBuilder::from_oval(rect) { pm.fill_path(&path,&paint,FillRule::Winding,Transform::identity(),None); } },
+            "line" => stroke_poly(pm,&[(x,y),(x+w,y+h)],(layer.size*k).max(1.0),color(col,1.0)),
+            "text" => { let size=(layer.size*k).max(1.0); let line=fit(font,size,&layer.text,k-x); draw_text(pm,font,size,x,y+size,&line,col,1.0); },
+            _ => {}
+        }
+    }
 }
 
 fn render_hub(pm: &mut Pixmap, h: &HubFace, phase: f32, font: &FontVec) {
@@ -788,6 +823,7 @@ fn face_needs_render(previous: Option<&KeyFace>, current: &KeyFace, refresh: boo
     refresh || previous != Some(current)
         || matches!(current, KeyFace::Session(session) if session.activity.animated())
         || matches!(current, KeyFace::Hub(hub) if !hub.reduced_motion || hub.waiting > 0)
+        || matches!(current, KeyFace::Controlled(scene, _, reduced) if !reduced && scene.animated())
 }
 
 /// The scheduler visits each key in circular order, including empty slots.

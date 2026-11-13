@@ -790,6 +790,7 @@ pub enum KeyFace {
     Released,
     Session(SessionFace),
     Hub(HubFace),
+    Controlled(crate::display::Scene, u64, bool),
     Quota(crate::quota::Quota),
     QuotaHub,
     Step(SessionStep),
@@ -844,14 +845,17 @@ pub enum KeyPressTarget {
     Empty,
     Disabled,
     Back,
+    Controlled(u64),
 }
 
 /// Resolve an action from the face actually shown, independent of later reordering.
 pub fn target_for_face(face: &KeyFace, quota_view: bool) -> KeyPressTarget {
+    if let KeyFace::Controlled(_, generation, _) = face { return KeyPressTarget::Controlled(*generation); }
     if matches!(face, KeyFace::Back) { return KeyPressTarget::Back; }
     if quota_view { return KeyPressTarget::Disabled; }
     match face {
         KeyFace::Session(s) => KeyPressTarget::Session(s.key.clone()),
+        KeyFace::Controlled(_, generation, _) => KeyPressTarget::Controlled(*generation),
         KeyFace::Hub(_) => KeyPressTarget::Hub,
         KeyFace::Empty => KeyPressTarget::Empty,
         KeyFace::Released | KeyFace::Quota(_) | KeyFace::QuotaHub | KeyFace::Step(_) | KeyFace::Back => KeyPressTarget::Disabled,
@@ -867,6 +871,7 @@ pub enum Action {
 
 pub struct Core {
     pub settings: Settings,
+    pub display: crate::display::DisplayController,
     pub agents: Vec<AgentDef>,
     pub sessions: Vec<Session>,
     order: Vec<String>,
@@ -908,6 +913,7 @@ impl Core {
         let in_control = settings.auto_take_over_on_launch;
         Core {
             settings,
+            display: crate::display::DisplayController::default(),
             agents,
             sessions: Vec::new(),
             order: Vec::new(),
@@ -1288,7 +1294,7 @@ impl Core {
     /// old ones are removed; sub-agents are forgotten.
     pub fn tick(&mut self) {
         let t = now();
-        let mut changed = false;
+        let mut changed = self.display.prune(t);
         for s in &mut self.sessions {
             if s.pending_text.is_some() && t - s.text_at >= TEXT_DWELL_S {
                 s.text = s.pending_text.take().unwrap_or_default();
@@ -1526,6 +1532,22 @@ impl Core {
 
     // ---- keypad faces
 
+    pub fn display_command(&mut self, command: crate::display::DisplayCommand) -> Result<Value, crate::display::DisplayError> {
+        let result = self.display.execute(command, now());
+        if result.is_ok() { self.touch(); }
+        result
+    }
+
+    pub fn release_display(&mut self) { self.display.clear(); self.touch(); }
+
+    fn overlay_display(&self, mut faces: [KeyFace; KEY_COUNT]) -> [KeyFace; KEY_COUNT] {
+        let t = now();
+        for (i, face) in faces.iter_mut().enumerate() {
+            if let Some((scene, generation)) = self.display.scene(i, t) { *face = KeyFace::Controlled(scene, generation, self.settings.motion == Motion::Reduced); }
+        }
+        faces
+    }
+
     pub fn quota_faces(&self, page: usize) -> [KeyFace; KEY_COUNT] {
         let mut out = std::array::from_fn(|_| KeyFace::Empty);
         for (row, entries) in self.quota_rows().into_iter().skip(page * 2).take(2).enumerate() {
@@ -1535,7 +1557,7 @@ impl Core {
             }
         }
         out[HUB_KEY] = KeyFace::QuotaHub;
-        out
+        self.overlay_display(out)
     }
 
     pub fn faces(&self) -> [KeyFace; KEY_COUNT] {
@@ -1551,7 +1573,7 @@ impl Core {
                 for (i, step) in session.steps.iter().skip(self.detail_page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).enumerate() { out[i] = KeyFace::Step(step.clone()); }
             }
             out[HUB_KEY] = KeyFace::Back;
-            return out;
+            return self.overlay_display(out);
         }
         if self.quota_view {
             return self.quota_faces(self.quota_page);
@@ -1615,7 +1637,7 @@ impl Core {
                 list
             },
         });
-        out
+        self.overlay_display(out)
     }
 
     // ---- input (on-screen keypad, keyboard, physical keypad)
@@ -1694,6 +1716,7 @@ impl Core {
         if matches!(target, Some(KeyPressTarget::Hub)) && !self.hold_fired[i] { self.hub_hold_keys.clear(); self.hub_hold_page = None; }
         if down.is_none() || self.hold_fired[i] || !self.in_control { return; }
         match target {
+            Some(KeyPressTarget::Controlled(generation)) => { self.display.press(i, generation, now()); self.touch(); }
             Some(KeyPressTarget::Back) => { self.detail_key = None; self.detail_page = 0; self.touch(); }
             Some(KeyPressTarget::Hub) => {
                 let slots = self.keypad_slots();
