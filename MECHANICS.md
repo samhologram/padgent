@@ -24,6 +24,7 @@ Session lights use a core, halo, rings, moving lights, ripple and grain. Their a
 varies by activity and follows the motion and brightness settings. The hub summarizes
 sessions and those waiting for attention over a diffuse gold, lavender and blue gradient.
 Its colours drift on 32- and 39-second cycles; reduced motion freezes the field.
+Look can optionally add the local time, in HH:mm format, to the session-grid hub.
 The experimental HID driver takes exclusive access,
 reads key and page-button events, and sends JPEG images to the keypad.
 

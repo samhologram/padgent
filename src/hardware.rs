@@ -346,25 +346,31 @@ fn render_session(pm: &mut Pixmap, f: &SessionFace, phase: f32, t: f64, font: &F
     // unread count or last turn.
     let white = Rgb(255, 255, 255);
     let ty = k * 0.61;
-    fill_circle(pm, 13.0, ty - 5.0, 7.5, color(f.agent_colour, 0.9));
-    let ink = crate::colour::ink_on(f.agent_colour);
-    draw_text(pm, font, 8.0, 13.0 - text_width(font, 8.0, &f.badge) / 2.0, ty - 2.0, &f.badge, ink, 0.95);
-    let title = fit(font, TITLE_PT, &f.title, k - 32.0);
-    draw_text(pm, font, TITLE_PT, 25.0, ty, &title, white, 0.95);
+    let title_x = if f.badge.is_empty() { 7.0 } else {
+        fill_circle(pm, 13.0, ty - 5.0, 7.5, color(f.agent_colour, 0.9));
+        let ink = crate::colour::ink_on(f.agent_colour);
+        draw_text(pm, font, 8.0, 13.0 - text_width(font, 8.0, &f.badge) / 2.0, ty - 2.0, &f.badge, ink, 0.95);
+        25.0
+    };
+    let title = fit(font, TITLE_PT, &f.title, k - title_x - 7.0);
+    draw_text(pm, font, TITLE_PT, title_x, ty, &title, white, 0.95);
     // Session activity label.
-    let state = if f.activity == Activity::Empty { "Idle" } else { f.activity.label() };
+    let state = f.status_text.as_deref().unwrap_or_else(|| if f.activity == Activity::Empty { "Idle" } else { f.activity.label() });
     let sc = match g {
         Group::Waiting => waiting_tint(f.orb),
         Group::Working => f.orb.mix(white, 0.4),
         _ => Rgb(160, 160, 165),
     };
     let sy = k * 0.745;
-    draw_text(pm, font, STATE_PT, 7.0, sy, state, sc, 0.95);
+    let state = fit(font, STATE_PT, state, k - 14.0);
+    draw_text(pm, font, STATE_PT, 7.0, sy, &state, sc, 0.95);
     let corner = crate::model::age_compact(f.last_turn, t);
-    if !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
+    if f.footer_text.is_none() && !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
         draw_text(pm, font, BODY_PT, k - 7.0 - text_width(font, BODY_PT, &corner), sy, &corner, Rgb(150, 150, 155), 0.9);
     }
-    let live = if matches!(g, Group::Working | Group::Waiting) {
+    let live = if let Some(footer) = &f.footer_text {
+        footer.clone()
+    } else if matches!(g, Group::Working | Group::Waiting) {
         crate::model::key_text(&f.text, f.unread, f.activity)
     } else if f.unread > 0 {
         format!("{} unread", f.unread)
@@ -432,6 +438,9 @@ fn render_hub(pm: &mut Pixmap, h: &HubFace, phase: f32, font: &FontVec) {
                 pm.data_mut()[i..i + 4].copy_from_slice(&[c.0, c.1, c.2, 255]);
             }
         }
+    }
+    if let Some(clock) = &h.clock {
+        draw_text(pm, font, 12.0, (k - text_width(font, 12.0, clock)) / 2.0, k * 0.21, clock, white, 0.76);
     }
     if h.waiting > 0 || h.working > 0 {
         let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };
@@ -928,6 +937,7 @@ fn run_key_actions(core: &Arc<Mutex<Core>>) {
                     }
                 }
                 crate::model::Action::OpenUrl(u) => crate::integrations::open_url(&u),
+                crate::model::Action::OpenApp(bundle_id) => crate::integrations::open_app(&bundle_id),
                 crate::model::Action::ShowWindow => crate::mac::show_app(),
             }
         }

@@ -38,15 +38,17 @@ enum Page {
     Look,
     Keys,
     MenuBar,
+    ApiMcp,
     About,
 }
 
-const PAGES: [(Page, &str, [u8; 3]); 6] = [
+const PAGES: [(Page, &str, [u8; 3]); 7] = [
     (Page::Keypad, "Keypad", [255, 159, 10]),
     (Page::Agents, "Agents", [94, 92, 230]),
     (Page::Look, "Look", [255, 55, 95]),
     (Page::Keys, "Keys and sessions", [48, 209, 88]),
     (Page::MenuBar, "Menu bar and hand-over", [10, 132, 255]),
+    (Page::ApiMcp, "API & MCP", [48, 176, 199]),
     (Page::About, "About", [142, 142, 147]),
 ];
 
@@ -243,6 +245,7 @@ impl App {
         if demo {
             settings.demo_mode = true;
             settings.drive_physical_keypad = false;
+            if std::env::args().any(|arg| arg == "--demo-clock") { settings.show_hub_clock = true; }
         }
         let mut core = Core::new(settings);
         if core.settings.demo_mode {
@@ -422,6 +425,7 @@ impl App {
                     self.open_target(&agents, &agent, &session)
                 }
                 Action::OpenUrl(u) => integrations::open_url(&u),
+                Action::OpenApp(bundle_id) => integrations::open_app(&bundle_id),
                 Action::ShowWindow => {
                     mac::show_app();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1501,6 +1505,7 @@ impl App {
             });
             hint(ui, "Sets the keypad's backlight while Padgent drives it. When Padgent releases the keypad, its previous brightness returns.");
             ui.checkbox(&mut s.key_glyphs, "Show tool glyphs on working keys");
+            ui.checkbox(&mut s.show_hub_clock, "Show time on hub key");
             ui.horizontal(|ui| {
                 ui.label("Live text speed");
                 ui.add(egui::Slider::new(&mut s.text_speed, 6.0..=60.0).suffix(" characters/s"));
@@ -1651,6 +1656,67 @@ impl App {
                 ui.ctx().request_repaint();
             }
         }
+    }
+
+    fn api_mcp_page(&mut self, ui: &mut Ui) {
+        let (port, status) = self.core.lock().map(|c| {
+            let port = std::env::var("AGENTPAD_PORT").ok().and_then(|p| p.parse::<u16>().ok()).unwrap_or(c.settings.hook_port);
+            (port, c.server_status.clone())
+        }).unwrap_or((47800, String::new()));
+        let base = format!("http://127.0.0.1:{port}");
+        let api = format!("{base}/v1/display");
+        let mcp = format!("{base}/mcp");
+        let agent_instructions = format!("Add an MCP server named padgent to your MCP configuration. Transport: Streamable HTTP. URL: {mcp}. Padgent must be running on this Mac. Supports MCP 2025-11-25. Connect and list its tools, then call display_state to verify the connection. Leave display ownership unchanged until I request a tile or takeover.");
+        let claim = format!("curl -sS '{api}/claim' -H 'Content-Type: application/json' -d '{{\"owner\":\"My agent\",\"keys\":[0],\"ttl_seconds\":60}}'");
+        let set = format!("curl -sS '{api}/set' -H 'Content-Type: application/json' -d '{{\"token\":\"TOKEN_FROM_CLAIM\",\"keys\":{{\"0\":{{\"kind\":\"native\",\"title\":\"Build\",\"text\":\"Running checks\",\"activity\":\"thinking\",\"style\":\"dots\",\"hue\":265}}}}}}'");
+        ui.heading("API & MCP");
+        hint(ui, "Let a local app or agent control individual keys or the whole keypad.");
+        card(ui, "Connect", |ui| {
+            hint(ui, "Padgent must be running. Both interfaces use the same display controls.");
+            for (label, url) in [("HTTP API", &api), ("MCP server", &mcp)] {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(label).strong());
+                    ui.add(egui::TextEdit::singleline(&mut url.as_str()).font(egui::TextStyle::Monospace).desired_width(350.0));
+                    if ui.small_button("Copy").clicked() { ui.ctx().copy_text(url.clone()); }
+                });
+            }
+            hint(ui, "MCP: Streamable HTTP · protocol 2025-11-25. Add the MCP server URL to your client's configuration.");
+            if !status.is_empty() { hint(ui, &status); }
+        });
+        card(ui, "Instructions for your agent", |ui| {
+            hint(ui, "Copy these instructions into your agent to connect Padgent.");
+            ui.add(egui::TextEdit::multiline(&mut agent_instructions.as_str()).desired_rows(4).desired_width(f32::INFINITY));
+            if ui.button("Copy agent instructions").clicked() { ui.ctx().copy_text(agent_instructions.clone()); }
+        });
+        card(ui, "Control the display", |ui| {
+            ui.label("1. Claim key 0, or keys 0–8 for the whole keypad. The response contains your token.");
+            ui.label("2. Set a native animation or custom scene using that token. Renew the lease when needed.");
+            ui.label("3. Clear blanks selected keys while keeping the lease. Release or expiry restores Padgent's current display.");
+            hint(ui, "Leases last 60 seconds by default and can be set from 1 to 3600 seconds. Agent tracking continues underneath. Physical page buttons keep their normal behavior.");
+            hint(ui, "Use Release external in the Keypad view to end all external control locally.");
+        });
+        card(ui, "HTTP examples", |ui| {
+            hint(ui, "Claim key 0, then replace TOKEN_FROM_CLAIM in the second command with the returned token.");
+            ui.label(RichText::new("1. Claim a key").strong());
+            ui.add(egui::TextEdit::multiline(&mut claim.as_str()).font(egui::TextStyle::Monospace).desired_rows(3).desired_width(f32::INFINITY));
+            if ui.small_button("Copy claim command").clicked() { ui.ctx().copy_text(claim.clone()); }
+            ui.add_space(8.0);
+            ui.label(RichText::new("2. Set a native scene").strong());
+            ui.add(egui::TextEdit::multiline(&mut set.as_str()).font(egui::TextStyle::Monospace).desired_rows(3).desired_width(f32::INFINITY));
+            if ui.small_button("Copy set command").clicked() { ui.ctx().copy_text(set.clone()); }
+        });
+        card(ui, "Scenes and MCP tools", |ui| {
+            hint(ui, "Native scenes use Padgent's session animations, including thinking, tool, streaming, waiting, done and error. Choose an orb or dots and a hue.");
+            hint(ui, "Custom declarative scenes combine text, colors, gradients, shapes and slow animation. Your app or agent translates its instructions into a scene.");
+            hint(ui, "Optionally set an action such as {\"type\":\"open_url\",\"url\":\"https://example.com\"} or open_app with a macOS bundle ID. It runs only when the key is pressed.");
+            ui.label(RichText::new("MCP tools").strong());
+            ui.monospace("display_state · display_claim · display_set · display_clear");
+            ui.monospace("display_renew · display_release · display_events");
+            ui.add_space(6.0);
+            if ui.link("Open the full API and MCP guide ↗").clicked() {
+                integrations::open_url("https://github.com/samhologram/padgent/blob/main/docs/display-api.md");
+            }
+        });
     }
 
     fn about_page(&mut self, ui: &mut Ui) {
@@ -1808,6 +1874,7 @@ impl eframe::App for App {
                 Page::Look => self.look_page(ui),
                 Page::Keys => self.keys_page(ui),
                 Page::MenuBar => self.menubar_page(ui),
+                Page::ApiMcp => self.api_mcp_page(ui),
                 Page::About => self.about_page(ui),
                 Page::Keypad => {}
             }

@@ -265,6 +265,11 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// Launch an application by its validated macOS bundle identifier.
+pub fn open_app(bundle_id: &str) {
+    let _ = Command::new("open").args(["-b", bundle_id]).spawn();
+}
+
 /// The command an agent's hooks run to report to this app.
 pub fn hook_command(agent_id: &str, port: u16) -> String {
     format!(

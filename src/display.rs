@@ -75,11 +75,60 @@ impl Default for Layer {
     }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SceneAction {
+    OpenUrl { url: String },
+    OpenApp { bundle_id: String },
+}
+impl SceneAction {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::OpenUrl { url } => {
+                let lower = url.to_ascii_lowercase();
+                let rest = lower
+                    .strip_prefix("https://")
+                    .or_else(|| lower.strip_prefix("http://"));
+                let authority = rest
+                    .and_then(|s| s.split(['/', '?', '#']).next())
+                    .unwrap_or("");
+                let host = authority.rsplit('@').next().unwrap_or("");
+                if url.len() > 2048
+                    || url
+                        .chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+                    || host.is_empty()
+                    || host.starts_with(':')
+                {
+                    return Err("open_url requires an http or https URL".into());
+                }
+            }
+            Self::OpenApp { bundle_id } => {
+                let parts: Vec<_> = bundle_id.split('.').collect();
+                if bundle_id.len() > 255
+                    || parts.len() < 2
+                    || parts.iter().any(|part| {
+                        !part.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+                            || !part
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+                    })
+                {
+                    return Err("invalid application bundle identifier".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Scene {
     pub kind: String,
     pub title: String,
     pub text: String,
+    pub badge: String,
+    pub status_text: Option<String>,
+    pub footer_text: Option<String>,
     pub activity: String,
     pub hue: f32,
     pub style: String,
@@ -89,6 +138,7 @@ pub struct Scene {
     pub animation: String,
     pub period_seconds: f32,
     pub layers: Vec<Layer>,
+    pub action: Option<SceneAction>,
 }
 impl Default for Scene {
     fn default() -> Self {
@@ -96,6 +146,9 @@ impl Default for Scene {
             kind: "custom".into(),
             title: String::new(),
             text: String::new(),
+            badge: String::new(),
+            status_text: None,
+            footer_text: None,
             activity: "idle".into(),
             hue: 270.0,
             style: "orb".into(),
@@ -105,6 +158,7 @@ impl Default for Scene {
             animation: "none".into(),
             period_seconds: 4.0,
             layers: Vec::new(),
+            action: None,
         }
     }
 }
@@ -113,7 +167,18 @@ impl Scene {
         if !["native", "custom"].contains(&self.kind.as_str()) {
             return Err("kind must be native or custom".into());
         }
-        if self.title.chars().count() > 64 || self.text.chars().count() > 160 {
+        if self.title.chars().count() > 64
+            || self.text.chars().count() > 160
+            || self.badge.chars().count() > 16
+            || self
+                .status_text
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > 64)
+            || self
+                .footer_text
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > 160)
+        {
             return Err("text is too long".into());
         }
         if Activity::parse(&self.activity).is_none()
@@ -138,6 +203,9 @@ impl Scene {
             || !(1.0..=120.0).contains(&self.period_seconds)
         {
             return Err("invalid animation or period".into());
+        }
+        if let Some(action) = &self.action {
+            action.validate()?;
         }
         if self.layers.len() > 16 {
             return Err("at most 16 layers".into());
@@ -201,7 +269,7 @@ impl DisplayController {
             .find(|l| l.expires_at > now && l.keys.contains(&key))
             .and_then(|l| l.scenes[key].clone().map(|s| (s, l.generations[key])))
     }
-    pub fn press(&mut self, key: usize, generation: u64, now: f64) {
+    pub fn press(&mut self, key: usize, generation: u64, now: f64) -> Option<SceneAction> {
         if let Some(l) = self.leases.iter_mut().find(|l| {
             l.expires_at > now && l.keys.contains(&key) && l.generations[key] == generation
         }) {
@@ -210,7 +278,9 @@ impl DisplayController {
             }
             l.events
                 .push_back(json!({"key":key,"type":"press","at":now}));
+            return l.scenes[key].as_ref().and_then(|s| s.action.clone());
         }
+        None
     }
     pub fn execute(&mut self, command: DisplayCommand, now: f64) -> Result<Value, DisplayError> {
         self.prune(now);
@@ -376,7 +446,13 @@ impl Scene {
         crate::model::SessionFace {
             key: String::new(),
             opacity: 1.0,
-            badge: String::new(),
+            badge: self.badge.clone(),
+            status_text: self.status_text.clone(),
+            footer_text: Some(
+                self.footer_text
+                    .clone()
+                    .unwrap_or_else(|| self.text.clone()),
+            ),
             agent_name: "External".into(),
             title: self.title.clone(),
             text: self.text.clone(),
@@ -884,5 +960,166 @@ mod tests {
             static_scene.sample(0.5, 0.5, 0.0),
             static_scene.sample(0.5, 0.5, 1.0)
         );
+    }
+
+    #[test]
+    fn scene_actions_queue_only_on_valid_current_key_presses() {
+        let mut core = crate::model::Core::new(crate::model::Settings::default());
+        core.in_control = true;
+        let token = claim(&mut core.display, crate::model::now(), vec![0, 1], 60.0);
+        let url_scene = Scene {
+            action: Some(SceneAction::OpenUrl {
+                url: "https://example.com/help".into(),
+            }),
+            ..Scene::default()
+        };
+        let app_scene = Scene {
+            action: Some(SceneAction::OpenApp {
+                bundle_id: "com.example.Agent".into(),
+            }),
+            ..Scene::default()
+        };
+        core.display_command(DisplayCommand::Set {
+            token: token.clone(),
+            keys: [("0".into(), Some(url_scene)), ("1".into(), Some(app_scene))].into(),
+        })
+        .unwrap();
+        assert!(
+            core.actions.is_empty(),
+            "publishing an action-bearing scene must not execute it"
+        );
+
+        core.key_down(0);
+        core.key_up(0);
+        assert!(
+            matches!(core.actions.as_slice(), [crate::model::Action::OpenUrl(url)] if url == "https://example.com/help")
+        );
+        core.actions.clear();
+        core.key_down(1);
+        core.key_up(1);
+        assert!(
+            matches!(core.actions.as_slice(), [crate::model::Action::OpenApp(bundle)] if bundle == "com.example.Agent")
+        );
+        core.actions.clear();
+
+        for action in [
+            SceneAction::OpenUrl {
+                url: "javascript:alert(1)".into(),
+            },
+            SceneAction::OpenUrl {
+                url: "https://bad host".into(),
+            },
+            SceneAction::OpenApp {
+                bundle_id: "com..Agent".into(),
+            },
+            SceneAction::OpenApp {
+                bundle_id: "Agent".into(),
+            },
+        ] {
+            let error = core
+                .display_command(DisplayCommand::Set {
+                    token: token.clone(),
+                    keys: [(
+                        "0".into(),
+                        Some(Scene {
+                            action: Some(action),
+                            ..Scene::default()
+                        }),
+                    )]
+                    .into(),
+                })
+                .unwrap_err();
+            assert_eq!(error.status, 400);
+        }
+        assert!(
+            core.actions.is_empty(),
+            "invalid actions must never enter the launch queue"
+        );
+
+        core.key_down(0);
+        core.display_command(DisplayCommand::Set {
+            token: token.clone(),
+            keys: [(
+                "0".into(),
+                Some(Scene {
+                    action: Some(SceneAction::OpenUrl {
+                        url: "https://example.com/replaced".into(),
+                    }),
+                    ..Scene::default()
+                }),
+            )]
+            .into(),
+        })
+        .unwrap();
+        core.key_up(0);
+        assert!(
+            core.actions.is_empty(),
+            "replacing a scene during a held press must invalidate its captured action"
+        );
+
+        core.key_down(1);
+        core.release_display();
+        core.key_up(1);
+        assert!(
+            core.actions.is_empty(),
+            "releasing a lease during a held press must suppress its action"
+        );
+    }
+
+    #[test]
+    fn optional_scene_face_overrides_support_defaults_blanks_and_regular_faces_stay_native() {
+        let default_scene = Scene::default();
+        let default_face = default_scene.native_face();
+        assert!(default_face.badge.is_empty());
+        assert_eq!(default_face.status_text, None);
+        assert_eq!(default_face.footer_text.as_deref(), Some(""));
+
+        let overridden = Scene {
+            kind: "native".into(),
+            title: "External title".into(),
+            text: "body fallback".into(),
+            badge: "BOT".into(),
+            status_text: Some("Waiting".into()),
+            footer_text: Some("Custom footer".into()),
+            ..Scene::default()
+        }
+        .native_face();
+        assert_eq!(overridden.badge, "BOT");
+        assert_eq!(overridden.status_text.as_deref(), Some("Waiting"));
+        assert_eq!(overridden.footer_text.as_deref(), Some("Custom footer"));
+
+        let explicit_blank = Scene {
+            badge: String::new(),
+            status_text: Some(String::new()),
+            footer_text: Some(String::new()),
+            ..Scene::default()
+        }
+        .native_face();
+        assert!(explicit_blank.badge.is_empty());
+        assert_eq!(explicit_blank.status_text.as_deref(), Some(""));
+        assert_eq!(explicit_blank.footer_text.as_deref(), Some(""));
+        let nil_fallback = Scene {
+            text: "fallback footer".into(),
+            status_text: None,
+            footer_text: None,
+            ..Scene::default()
+        }
+        .native_face();
+        assert_eq!(nil_fallback.status_text, None);
+        assert_eq!(nil_fallback.footer_text.as_deref(), Some("fallback footer"));
+
+        let mut core = crate::model::Core::new(crate::model::Settings::default());
+        core.in_control = true;
+        core.apply(crate::model::Incoming {
+            agent: "codex".into(),
+            event: None,
+            body: json!({"session":"regular","state":"thinking","title":"Regular"}),
+        });
+        let crate::model::KeyFace::Session(regular) = &core.faces()[0] else {
+            panic!("regular provider session remains a normal session face");
+        };
+        assert!(!regular.badge.is_empty());
+        assert_eq!(regular.status_text, None);
+        assert_eq!(regular.footer_text, None);
     }
 }

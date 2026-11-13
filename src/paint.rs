@@ -393,9 +393,11 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
     let w = k * 0.84;
     let title_y = r.top() + k * 0.5;
     let badge_rect = Rect::from_min_size(pos2(x, title_y + k * 0.01), vec2(k * 0.2, k * 0.12));
-    p.rect_filled(badge_rect, CornerRadius::same((k * 0.055) as u8), with_alpha(c32(f.agent_colour), 0.55));
-    p.text(badge_rect.center(), Align2::CENTER_CENTER, &f.badge, FontId::proportional(k * 0.08), white(0.95));
-    let tx = badge_rect.right() + k * 0.035;
+    let tx = if f.badge.is_empty() { x } else {
+        p.rect_filled(badge_rect, CornerRadius::same((k * 0.055) as u8), with_alpha(c32(f.agent_colour), 0.55));
+        p.text(badge_rect.center(), Align2::CENTER_CENTER, &f.badge, FontId::proportional(k * 0.08), white(0.95));
+        badge_rect.right() + k * 0.035
+    };
     let mut job = egui::text::LayoutJob::simple_singleline(f.title.clone(), FontId::proportional(k * 0.125), white(0.96));
     job.wrap.max_width = r.right() - k * 0.08 - tx;
     job.wrap.max_rows = 1;
@@ -411,13 +413,15 @@ fn paint_session(p: &Painter, r: Rect, f: &SessionFace, cx: &KeyCx) {
         Group::Offline => white(0.4),
         _ => white(0.6),
     };
-    p.text(pos2(x, sy), Align2::LEFT_TOP, state_word(f.activity), FontId::proportional(k * 0.095), state_col);
+    text_block(p, pos2(x, sy), w, f.status_text.as_deref().unwrap_or_else(|| state_word(f.activity)), k * 0.095, state_col, 1, false);
     let corner = crate::model::age_compact(f.last_turn, t);
-    if !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
+    if f.footer_text.is_none() && !corner.is_empty() && !matches!(g, Group::Working | Group::Waiting) {
         p.text(pos2(r.right() - k * 0.08, sy), Align2::RIGHT_TOP, corner, FontId::proportional(k * 0.085), white(0.5));
     }
     let ly = sy + k * 0.125;
-    if matches!(g, Group::Working | Group::Waiting) {
+    if let Some(footer) = &f.footer_text {
+        text_block(p, pos2(x, ly), w, footer, k * 0.088, white(0.7), 2, false);
+    } else if matches!(g, Group::Working | Group::Waiting) {
         let live = if f.text.is_empty() {
             if g == Group::Working { "…".to_string() } else { f.activity.label().to_string() }
         } else {
@@ -507,6 +511,9 @@ fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {
     }
     p.add(Shape::mesh(mesh));
     glass(p, r, k * 0.2, white(0.5), 0.5, false);
+    if let Some(clock) = &h.clock {
+        p.text(pos2(r.center().x, r.top() + k * 0.16), Align2::CENTER_CENTER, clock, FontId::proportional(k * 0.10), white(0.76));
+    }
     if h.waiting > 0 || h.working > 0 {
         let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };
         p.text(r.center() - vec2(0.0, k * 0.09), Align2::CENTER_CENTER, count.to_string(), FontId::proportional(k * 0.28), white(0.98));

@@ -573,6 +573,7 @@ pub struct Settings {
     pub reorder_on: ReorderOn,
     pub colour_keys_by: ColourKeysBy,
     pub key_glyphs: bool,
+    pub show_hub_clock: bool,
     pub empty_key_url: String,
     pub agent_hues: BTreeMap<String, f32>,
     pub disabled_agents: Vec<String>,
@@ -609,6 +610,7 @@ impl Default for Settings {
             reorder_on: ReorderOn::Turns,
             colour_keys_by: ColourKeysBy::Agent,
             key_glyphs: true,
+            show_hub_clock: false,
             empty_key_url: String::new(),
             agent_hues: BTreeMap::new(),
             disabled_agents: Vec::new(),
@@ -804,6 +806,8 @@ pub struct SessionFace {
     pub key: String,
     pub opacity: f32,
     pub badge: String,
+    pub status_text: Option<String>,
+    pub footer_text: Option<String>,
     pub agent_name: String,
     pub title: String,
     pub text: String,
@@ -834,6 +838,7 @@ pub struct HubFace {
     pub dots: Vec<Rgb>,
     pub waiting_colour: Rgb,
     pub reduced_motion: bool,
+    pub clock: Option<String>,
     /// Sessions per agent: (name, colour, count).
     pub agents: Vec<(String, Rgb, usize)>,
 }
@@ -866,6 +871,7 @@ pub fn target_for_face(face: &KeyFace, quota_view: bool) -> KeyPressTarget {
 pub enum Action {
     Open { agent: String, session: String },
     OpenUrl(String),
+    OpenApp(String),
     ShowWindow,
 }
 
@@ -1590,6 +1596,8 @@ impl Core {
                 key: s.key(),
                 opacity: if s.acknowledged { ACKNOWLEDGED_OPACITY } else { 1.0 },
                 badge: def.map(|d| d.badge.clone()).unwrap_or_else(|| badge_from_name(&s.agent)),
+                status_text: None,
+                footer_text: None,
                 agent_name: def.map(|d| d.name.clone()).unwrap_or_else(|| s.agent.clone()),
                 title: s.title.clone(),
                 text,
@@ -1622,6 +1630,7 @@ impl Core {
             dots: vis.iter().take(12).map(|s| self.colours(s).0).collect(),
             waiting_colour: self.waiting_colour(),
             reduced_motion: self.settings.motion == Motion::Reduced,
+            clock: self.settings.show_hub_clock.then(|| chrono::Local::now().format("%H:%M").to_string()),
             agents: {
                 let mut list: Vec<(String, Rgb, usize)> = Vec::new();
                 for s in &vis {
@@ -1716,7 +1725,14 @@ impl Core {
         if matches!(target, Some(KeyPressTarget::Hub)) && !self.hold_fired[i] { self.hub_hold_keys.clear(); self.hub_hold_page = None; }
         if down.is_none() || self.hold_fired[i] || !self.in_control { return; }
         match target {
-            Some(KeyPressTarget::Controlled(generation)) => { self.display.press(i, generation, now()); self.touch(); }
+            Some(KeyPressTarget::Controlled(generation)) => {
+                match self.display.press(i, generation, now()) {
+                    Some(crate::display::SceneAction::OpenUrl { url }) => self.actions.push(Action::OpenUrl(url)),
+                    Some(crate::display::SceneAction::OpenApp { bundle_id }) => self.actions.push(Action::OpenApp(bundle_id)),
+                    None => {}
+                }
+                self.touch();
+            }
             Some(KeyPressTarget::Back) => { self.detail_key = None; self.detail_page = 0; self.touch(); }
             Some(KeyPressTarget::Hub) => {
                 let slots = self.keypad_slots();
@@ -1895,6 +1911,57 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn optional_hub_clock_is_formatted_only_on_the_normal_hub_face() {
+        use super::*;
+
+        fn valid_hh_mm(value: &str) -> bool {
+            let bytes = value.as_bytes();
+            if bytes.len() != 5 || bytes[2] != b':' || !bytes[..2].iter().all(u8::is_ascii_digit) || !bytes[3..].iter().all(u8::is_ascii_digit) {
+                return false;
+            }
+            let hour = value[..2].parse::<u32>().ok();
+            let minute = value[3..].parse::<u32>().ok();
+            matches!((hour, minute), (Some(h), Some(m)) if h < 24 && m < 60)
+        }
+
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        assert!(!core.settings.show_hub_clock);
+        assert!(matches!(&core.faces()[HUB_KEY], KeyFace::Hub(hub) if hub.clock.is_none()));
+
+        core.settings.show_hub_clock = true;
+        let KeyFace::Hub(hub) = &core.faces()[HUB_KEY] else { panic!("normal hub face expected") };
+        assert!(hub.clock.as_deref().is_some_and(valid_hh_mm), "hub clock uses a valid local HH:mm string");
+
+        core.settings.motion = Motion::Reduced;
+        let KeyFace::Hub(hub) = &core.faces()[HUB_KEY] else { panic!("normal hub face expected with reduced motion") };
+        assert!(hub.reduced_motion);
+        assert!(hub.clock.as_deref().is_some_and(valid_hh_mm), "reduced motion must not hide the clock");
+
+        core.detail_key = Some("missing-session".into());
+        assert!(matches!(core.faces()[HUB_KEY], KeyFace::Back), "detail navigation keeps the Back face without a clock");
+        core.detail_key = None;
+        core.quota_view = true;
+        assert!(matches!(core.faces()[HUB_KEY], KeyFace::QuotaHub), "quota navigation keeps the quota hub without a clock");
+        core.quota_view = false;
+
+        let token = core.display_command(crate::display::DisplayCommand::Claim {
+            owner: "clock-test".into(),
+            keys: vec![HUB_KEY],
+            ttl_seconds: Some(60.0),
+        }).unwrap()["token"].as_str().unwrap().to_owned();
+        core.display_command(crate::display::DisplayCommand::Set {
+            token,
+            keys: [(HUB_KEY.to_string(), Some(crate::display::Scene {
+                kind: "native".into(),
+                title: "Controlled hub".into(),
+                ..crate::display::Scene::default()
+            }))].into(),
+        }).unwrap();
+        assert!(matches!(&core.faces()[HUB_KEY], KeyFace::Controlled(scene, _, true) if scene.kind == "native"), "full controlled display overrides the normal hub and its clock");
+    }
+
     #[test]
     fn desktop_code_watch_and_identity_reconciliation() {
         use super::*;

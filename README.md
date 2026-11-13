@@ -29,6 +29,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   changing pages during the hold cancels it.
 - **Animated hub:** soft gold, lavender and blue gradients drift slowly behind the status
   count, with the same glass finish as the other keys. Reduced motion keeps the gradient still.
+  Enable **Show time on hub key** in Look to also display the local time.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
   session runs in (Terminal, iTerm2). Opening an inactive conversation keeps its tile in
   place at 45% intensity. New sessions use free slots, then replace dim tiles when needed;
@@ -98,6 +99,24 @@ States: `starting`, `idle`, `thinking`, `tool`, `streaming`, `waitingPermission`
 For direct display control, use `http://127.0.0.1:47800/v1/display` or connect an MCP
 client to `http://127.0.0.1:47800/mcp` with Streamable HTTP. A display lease returns the
 keys to their current native content when released or expired; it does not stop agent tracking.
+
+### Instructions to give your agent
+
+Copy this prompt to the agent you want to connect:
+
+```text
+Add an MCP server named padgent to your MCP configuration.
+Transport: Streamable HTTP.
+URL: http://127.0.0.1:47800/mcp
+Padgent must be running on this Mac. It supports MCP protocol 2025-11-25.
+Connect and list its tools, then call display_state to verify the connection.
+Leave display ownership unchanged until I request a tile or takeover.
+```
+
+The app's **API & MCP** tab has the same instructions, a copy button, HTTP examples
+and the address for the port currently in use.
+
+![Padgent API and MCP setup instructions](docs/images/padgent-api-mcp.png)
 
 ## Agent files
 

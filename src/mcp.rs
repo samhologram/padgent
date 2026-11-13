@@ -44,7 +44,7 @@ pub fn handle(body: &[u8], core: &Arc<Mutex<Core>>) -> Option<Value> {
             {
                 return Some(error(id, -32602, "Invalid params"));
             }
-            json!({"protocolVersion":VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"padgent","version":env!("CARGO_PKG_VERSION")},"instructions":"Claim keys to obtain a lease token, then set native or custom scenes. Clear blanks selected or all leased keys while retaining the lease; release restores the normal display."})
+            json!({"protocolVersion":VERSION,"capabilities":{"tools":{}},"serverInfo":{"name":"padgent","version":env!("CARGO_PKG_VERSION")},"instructions":"Claim keys to obtain a lease token, then set native or custom scenes with optional actions that run only when a user releases the key. Clear blanks selected or all leased keys while retaining the lease; release restores the normal display."})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools":tools()}),
@@ -145,9 +145,10 @@ fn tools() -> Vec<Value> {
 
 fn scene_schema() -> Value {
     json!({"type":"object","additionalProperties":false,"properties":{
-        "kind":{"enum":["native","custom"]},"title":{"type":"string","maxLength":64},"text":{"type":"string","maxLength":160},
+        "kind":{"enum":["native","custom"],"description":"Native scenes use activity for animation independently of custom labels."},"badge":{"type":"string","maxLength":16,"description":"Native badge; empty hides it."},"status_text":{"type":["string","null"],"maxLength":64,"description":"Native status override; null uses the default and empty hides it."},"footer_text":{"type":["string","null"],"maxLength":160,"description":"Native footer override; null uses the scene text and empty hides it."},"title":{"type":"string","maxLength":64},"text":{"type":"string","maxLength":160},
         "activity":{"enum":["empty","starting","idle","thinking","tool","streaming","waiting_permission","waiting_question","done","error","compacting","offline"]},"hue":{"type":"number","minimum":0,"maximum":360},"style":{"enum":["orb","dots"]},
         "background":{"type":"string","pattern":"^#?[0-9a-fA-F]{6}$","description":"Hex RGB color"},"foreground":{"type":"string","pattern":"^#?[0-9a-fA-F]{6}$","description":"Hex RGB color"},"accent":{"type":"string","pattern":"^#?[0-9a-fA-F]{6}$","description":"Hex RGB color"},
+        "action":{"anyOf":[{"type":"null"},{"type":"object","additionalProperties":false,"required":["type","url"],"properties":{"type":{"const":"open_url"},"url":{"type":"string","maxLength":2048,"pattern":"^https?://[^/\\s?#\\\\]+[^\\s\\\\]*$"}}},{"type":"object","additionalProperties":false,"required":["type","bundle_id"],"properties":{"type":{"const":"open_app"},"bundle_id":{"type":"string","maxLength":255,"pattern":"^[A-Za-z][A-Za-z0-9_-]*(\\.[A-Za-z][A-Za-z0-9_-]*)+$"}}}]},
         "animation":{"enum":["none","pulse","drift","gradient"]},"period_seconds":{"type":"number","minimum":1,"maximum":120},
         "layers":{"type":"array","maxItems":16,"items":{"type":"object","additionalProperties":false,"properties":{
             "kind":{"enum":["rect","circle","ellipse","line","text"]},"x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},"width":{"type":"number","minimum":0,"maximum":1},"height":{"type":"number","minimum":0,"maximum":1},"size":{"type":"number","minimum":0,"maximum":1},"color":{"type":"string","pattern":"^#?[0-9a-fA-F]{6}$"},"text":{"type":"string","maxLength":100}

@@ -106,6 +106,9 @@ Examples rendered through the display API:
 Native scenes use the app's session animations: `starting`, `idle`, `thinking`, `tool`,
 `streaming`, `waitingPermission`, `waitingQuestion`, `done`, `error`, `compacting` or
 `offline`. Choose `style: "orb"` or `"dots"` and a `hue` from 0 to 360.
+The existing status names stay the same. `title` and `text` hold your content. Optional
+`badge`, `status_text` and `footer_text` overrides can customize or hide individual labels;
+an empty string hides a label, while omitted status/footer overrides use their defaults.
 
 Custom scenes combine a background/accent gradient, foreground text and ordered layers.
 The client or agent translates its design instructions into this scene description;
@@ -131,7 +134,24 @@ Reduced motion and brightness follow Padgent's settings. Scene changes replace a
 press identity: a press started before a replacement cannot trigger an action on the new
 scene. Updating another key leaves the original press valid.
 
-## Press events and previews
+## Actions, press events and previews
+
+A scene can also define a simple action:
+
+```json
+{
+  "kind": "native",
+  "activity": "idle",
+  "title": "Documentation",
+  "text": "Open the guide",
+  "action": {"type":"open_url","url":"https://example.com"}
+}
+```
+
+Supported actions are `open_url` with an HTTP(S) `url`, and `open_app` with a macOS
+`bundle_id`, such as `com.apple.Safari`. The action runs only when the user presses and
+releases that controlled key. Publishing or previewing a scene does not run it. A replaced
+or expired key cannot execute an old action.
 
 Controlled keys send events to their owner instead of opening native conversations:
 
@@ -141,7 +161,8 @@ Controlled keys send events to their owner instead of opening native conversatio
 
 Poll `POST /v1/display/events` with the token. Polling drains the queue. Each lease keeps
 at most 128 events; new events replace the oldest when full. The client decides how to
-respond; Padgent does not run commands supplied by display clients.
+respond. A press event remains available even when the scene has an action. Display
+clients cannot supply shell commands or executable scripts.
 
 The PNG preview uses the same renderer as the physical LCD. For a reproducible animation
 sample, add `?time=2`; accepted times are finite seconds from 0 through 86400. Previews are
@@ -154,6 +175,9 @@ Connect a client using **Streamable HTTP** at:
 ```text
 http://127.0.0.1:47800/mcp
 ```
+
+The app's **API & MCP** tab includes a copyable setup prompt for your agent. You can
+also use the [README setup instructions](../README.md#instructions-to-give-your-agent).
 
 The embedded server supports MCP protocol **2025-11-25**, with JSON responses and no
 server-to-client SSE stream. It does not implement the newer draft protocol. Clients
