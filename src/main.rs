@@ -79,7 +79,7 @@ struct IslandAgent {
 struct IslandQuota { provider: String, session: Option<f64>, weekly: Option<f64>, colour: colour::Rgb }
 
 fn island_wings(active: &[IslandAgent], quotas: &[IslandQuota], notch: f32) -> (f32, f32) {
-    let count = active.len().min(2);
+    let count = active.len().min(8);
     let values: usize = quotas.iter().take(2).map(|q| usize::from(q.session.is_some()) + usize::from(q.weekly.is_some())).sum();
     if count == 0 && values == 0 {
         let wing = if notch > 0.0 { 16.0 } else { 44.0 };
@@ -109,8 +109,9 @@ fn island_agents(c: &Core) -> Vec<IslandAgent> {
     let mut sessions: Vec<_> = c.visible().into_iter()
         .filter(|s| s.acknowledged || matches!(s.activity.group(), Group::Working | Group::Waiting | Group::Done) || s.pending_attention || s.unread > 0).collect();
     sessions.sort_by_key(|s| if s.acknowledged { 3 } else if s.activity.group() == Group::Waiting { 0 } else if s.pending_attention || s.unread > 0 || s.activity.group() == Group::Done { 1 } else { 2 });
-    let sessions = c.island_layout.borrow_mut().project(&sessions);
-    sessions.into_iter().map(|s| {
+    let limit = c.settings.island_agent_limit.clamp(1, 8);
+    let sessions = c.island_layout.borrow_mut().project(&sessions, limit);
+    sessions.into_iter().take(limit).map(|s| {
         let name = c.agents.iter().find(|a| a.id == s.agent).map(|a| a.name.clone()).unwrap_or_else(|| s.agent.clone());
         let (orb, glow) = c.colours(s);
         IslandAgent { agent: s.agent.clone(), session: s.id.clone(), name, title: s.title.clone(),
@@ -128,6 +129,7 @@ struct App {
     popup_open: bool,
     popup_from_island: bool,
     island_geometry: Option<(f32, f32, f32, f32)>,
+    island_size: Option<(f32, f32)>,
     island_progress: f32,
     popup_position: egui::Pos2,
     popup_focused: bool,
@@ -388,6 +390,7 @@ impl App {
             popup_open: screenshot_menu_bar || screenshot_island_expanded,
             popup_from_island: screenshot_island_expanded,
             island_geometry: None,
+            island_size: None,
             island_progress: 0.0,
             popup_position: pos2(0.0, 24.0),
             popup_focused: false,
@@ -481,7 +484,7 @@ impl App {
     }
 
     fn island(&mut self, ctx: &egui::Context) {
-        let (enabled, quotas_only, active, quotas, brightness, reduced) = match self.core.lock() {
+        let (enabled, quotas_only, mut active, quotas, brightness, reduced) = match self.core.lock() {
             Ok(c) => (c.island_visible(), c.island_quotas_only(),
                 island_agents(&c), island_quotas(&c),
                 c.settings.brightness, c.settings.motion == Motion::Reduced),
@@ -490,23 +493,29 @@ impl App {
         if !enabled && self.popup_from_island { self.popup_open = false; }
         if !enabled {
             self.island_geometry = None;
+            self.island_size = None;
             return;
         }
         let geometry = mac::island_geometry();
         let (x, y, notch, height) = geometry;
         let h = height.clamp(28.0, 40.0);
+        let (screen_w, screen_h) = mac::island_screen_size();
+        let max_agents = (((screen_w - notch) * 0.5 - 18.0) / 76.0).floor().clamp(1.0, 8.0) as usize;
+        active.truncate(max_agents);
         let (left_width, right_width) = island_wings(&active, &quotas, notch);
         let width = (notch + 2.0 * (left_width.max(right_width) + 6.0)).max(400.0);
         let expanded = self.popup_open && self.popup_from_island;
         let body_width = notch + left_width + right_width + 12.0;
-        let window_h = h + if expanded || self.island_progress > 0.0 { body_width * 1.2 + 4.0 } else { 4.0 };
+        let body_height = (body_width * 1.2).min((screen_h - h - 12.0).max(200.0));
+        let window_h = h + if expanded || self.island_progress > 0.0 { body_height + 4.0 } else { 4.0 };
         let island_x = x - (width - 400.0) / 2.0;
         let builder = egui::ViewportBuilder::default().with_title("Padgent Island")
             .with_inner_size([width, window_h]).with_position(pos2(island_x, y))
             .with_transparent(true).with_decorations(false).with_resizable(false)
             .with_active(false).with_always_on_top();
-        let changed = self.island_geometry != Some(geometry);
+        let changed = self.island_geometry != Some(geometry) || self.island_size != Some((width, window_h));
         self.island_geometry = Some(geometry);
+        self.island_size = Some((width, window_h));
         let mut action = IslandAction::None;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("agent-island"), builder, |ui, _| {
             if changed {
@@ -523,8 +532,8 @@ impl App {
         });
         mac::configure_island_window();
         if let IslandAction::Open(agent, session) = &action {
-            let agents = self.core.lock().map(|c| c.agents.clone()).unwrap_or_default();
-            self.open_exact(&agents, agent, session);
+            let agents = self.core.lock().ok().and_then(|c| c.settings.key_actions_enabled.then(|| c.agents.clone()));
+            if let Some(agents) = agents { self.open_exact(&agents, agent, session); }
         }
         if let IslandAction::Steps(agent, session) = &action {
             let opened = self.core.lock().map(|mut c| {
@@ -560,7 +569,9 @@ impl App {
 
     fn island_body(&mut self, ui: &mut Ui, root: &egui::Context, pill: Rect, h: f32, progress: f32) {
         if progress <= 0.0 { return; }
-        let body = Rect::from_min_size(pos2(pill.left(), pill.top() + h), vec2(pill.width(), pill.width() * 1.2));
+        let body_top = pill.top() + h;
+        let body_height = (pill.width() * 1.2).min((ui.max_rect().bottom() - body_top - 4.0).max(0.0));
+        let body = Rect::from_min_size(pos2(pill.left(), body_top), vec2(pill.width(), body_height));
         let reveal = Rect::from_min_size(body.min, vec2(body.width(), body.height() * progress));
         ui.painter().rect_filled(reveal, CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }, Color32::BLACK);
         if self.popup_open && self.popup_from_island {
@@ -585,7 +596,7 @@ impl App {
         let background = ui.interact(pill, egui::Id::unique("island-expand"), Sense::click()).on_hover_text("Open keypad");
         let mut action = if background.clicked() { IslandAction::Expand } else { IslandAction::None };
         let now = model::now();
-        for (i, agent) in active.iter().take(2).enumerate() {
+        for (i, agent) in active.iter().enumerate() {
             let left = rect.center().x - gap / 2.0 - 76.0 - i as f32 * 76.0;
             let tile = Rect::from_min_size(pos2(left, rect.top() + 3.0 + expansion * 0.5), vec2(72.0, h - 6.0));
             let id = egui::Id::unique(("island-session", &agent.agent, &agent.session));
@@ -655,7 +666,15 @@ impl App {
                 let response = ui.interact(card, egui::Id::unique(("island-quota", &quota.provider, window)), Sense::click())
                     .on_hover_text(format!("{} · {} · {:.0}% remaining", quota.provider, window, value));
                 if response.hovered() { p.rect_filled(card, CornerRadius::same(8), white(0.10)); }
-                p.text(card.center(), Align2::CENTER_CENTER, format!("{value:.0}%"), FontId::proportional(11.0), c32(quota.colour));
+                p.text(card.center() - vec2(0.0, 2.0), Align2::CENTER_CENTER, format!("{value:.0}%"), FontId::proportional(11.0), c32(quota.colour));
+                let track = Rect::from_min_size(pos2(card.left() + 6.0, card.bottom() - 4.0), vec2(card.width() - 12.0, 2.0));
+                p.rect_filled(track, CornerRadius::same(1), white(0.18));
+                if value > 0.0 {
+                    if let Some(colour) = quota::remaining_colour(value) {
+                        let fill = Rect::from_min_size(track.min, vec2(track.width() * (value as f32 / 100.0), track.height()));
+                        p.rect_filled(fill, CornerRadius::same(1), c32(colour));
+                    }
+                }
                 if response.clicked() { action = IslandAction::Quotas; }
             }
         }
@@ -702,8 +721,9 @@ impl App {
                     c.settings.key_glyphs, c.dimmed(), [c.page_held(false), c.page_held(true)], pages)
             };
             let t = model::now();
-            let factor = full.width() / 400.0;
-            let dev = Rect::from_min_size(full.min + vec2(12.0, 12.0) * factor, vec2(376.0, 414.0) * factor);
+            let factor = (full.width() / 400.0).min(full.height() / 480.0);
+            let content_min = pos2(full.center().x - 200.0 * factor, full.top());
+            let dev = Rect::from_min_size(content_min + vec2(12.0, 12.0) * factor, vec2(376.0, 414.0) * factor);
             let grid_min = dev.min + vec2(16.0, 16.0) * factor;
             let scale = (344.0 / 434.0) * factor;
             let size = model::KEY_SIZE as f32 * scale;
@@ -745,7 +765,7 @@ impl App {
             self.island_quota_buttons = if quotas_only { page_down } else { [false; 2] };
             self.popup_keys = if quotas_only { [false; KEY_COUNT] } else { down };
             self.popup_pages = if quotas_only { [false; 2] } else { page_down };
-            let r = Rect::from_min_size(full.min + vec2(12.0, 436.0) * factor, vec2(376.0, 30.0) * factor);
+            let r = Rect::from_min_size(content_min + vec2(12.0, 436.0) * factor, vec2(376.0, 30.0) * factor);
             if ui.put(r, egui::Button::new(RichText::new("Open Padgent & Settings…").size(14.0 * factor))).clicked() {
                 self.popup_open = false;
                 mac::log("tray keypad dismissed for full app");
@@ -1601,6 +1621,7 @@ impl App {
                     ui.selectable_value(&mut s.island_visibility, IslandVisibility::QuotasAlways, "Quotas always, agents when disconnected");
                 });
                 hint(ui, "Quotas always keeps quotas visible; agents appear when the keypad is disconnected. While connection is unknown, only quotas appear.");
+                ui.horizontal(|ui| { ui.label("Agents shown"); ui.add(egui::Slider::new(&mut s.island_agent_limit, 1..=8)); });
                 hint(ui, "Click a conversation to open it, or hold it for 0.6 s to view its steps. Click a quota to see usage, or the island background to unfold the keypad.");
                 let mut login = s.launch_at_login;
                 if ui.checkbox(&mut login, "Launch Padgent at login").changed() {
@@ -1942,7 +1963,7 @@ fn main() -> eframe::Result {
         .with_titlebar_shown(false);
     if screenshot_island {
         viewport = egui::ViewportBuilder::default().with_title("Padgent Island preview")
-            .with_inner_size([500.0, if screenshot_island_expanded { 600.0 } else { 36.0 }]).with_resizable(false).with_decorations(false).with_transparent(true);
+            .with_inner_size([1000.0, if screenshot_island_expanded { 600.0 } else { 36.0 }]).with_resizable(false).with_decorations(false).with_transparent(true);
     } else if screenshot_menu_bar {
         viewport = egui::ViewportBuilder::default().with_title("Padgent keypad")
             .with_inner_size([400.0, 480.0]).with_resizable(false).with_decorations(false);
@@ -2039,7 +2060,9 @@ mod island_tests {
 
     #[test]
     fn compact_island_keeps_the_same_two_session_order_when_one_is_acknowledged() {
-        let mut core = Core::new(Settings::default());
+        let mut settings = Settings::default();
+        settings.island_agent_limit = 2;
+        let mut core = Core::new(settings);
         add_session(&mut core, "codex", "working", "thinking");
         add_session(&mut core, "codex", "finished", "done");
         let before = island_agents(&core);
@@ -2055,7 +2078,9 @@ mod island_tests {
 
     #[test]
     fn compact_island_keeps_acknowledged_slot_with_three_candidates_until_new_work_arrives() {
-        let mut core = Core::new(Settings::default());
+        let mut settings = Settings::default();
+        settings.island_agent_limit = 2;
+        let mut core = Core::new(settings);
         add_session(&mut core, "codex", "waiting", "waiting_question");
         add_session(&mut core, "codex", "finished", "done");
         add_session(&mut core, "codex", "unseen-working", "thinking");
@@ -2077,7 +2102,9 @@ mod island_tests {
         assert_eq!(after_transition[0].0, "waiting", "the normal compact tile stays fixed when an unseen candidate gains attention");
         assert_eq!(after_transition[1].0, "unseen-working", "an existing unseen candidate with new attention can reuse the dim slot");
 
-        let mut arrival = Core::new(Settings::default());
+        let mut arrival_settings = Settings::default();
+        arrival_settings.island_agent_limit = 2;
+        let mut arrival = Core::new(arrival_settings);
         add_session(&mut arrival, "codex", "waiting", "waiting_question");
         add_session(&mut arrival, "codex", "finished", "done");
         add_session(&mut arrival, "codex", "working", "thinking");
@@ -2090,6 +2117,41 @@ mod island_tests {
         assert_eq!(before_arrival[0].0, after_new[0].0, "the normal compact neighbor stays in its position");
         assert_eq!(after_new[0].0, "waiting", "the normal tile never shifts when the dim slot is reused");
         assert_eq!(after_new[1].0, "new-waiting", "new waiting work can replace a dim compact tile");
+    }
+
+    #[test]
+    fn island_agent_limit_defaults_migrates_clamps_and_shrinks_expands_without_duplicates() {
+        let migrated: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(migrated.island_agent_limit, 4, "older settings without the new key use four agents");
+
+        for requested in [1, 8] {
+            let mut settings = Settings::default();
+            settings.island_agent_limit = requested;
+            let encoded = serde_json::to_value(&settings).unwrap();
+            let decoded: Settings = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.island_agent_limit, requested, "valid endpoint limits persist");
+        }
+
+        for (requested, expected) in [(0, 1), (9, 8)] {
+            let mut settings = Settings::default();
+            settings.island_agent_limit = requested;
+            let mut core = Core::new(settings);
+            for index in 0..9 { add_session(&mut core, "codex", &format!("bound-{index}"), "thinking"); }
+            assert_eq!(island_agents(&core).len(), expected, "effective display bound for requested={requested}");
+        }
+
+        let mut core = Core::new(Settings::default());
+        for index in 0..4 { add_session(&mut core, "codex", &format!("capacity-{index}"), "thinking"); }
+        let original: Vec<_> = island_agents(&core).into_iter().map(|item| item.session).collect();
+        assert_eq!(original.len(), 4);
+        core.settings.island_agent_limit = 2;
+        let shrunk: Vec<_> = island_agents(&core).into_iter().map(|item| item.session).collect();
+        assert_eq!(shrunk, original[..2], "shrinking preserves the surviving slot order");
+        core.settings.island_agent_limit = 4;
+        let expanded: Vec<_> = island_agents(&core).into_iter().map(|item| item.session).collect();
+        assert_eq!(expanded, original, "expanding restores the prior candidate order");
+        let unique: std::collections::HashSet<_> = expanded.iter().collect();
+        assert_eq!(unique.len(), expanded.len(), "resize must not duplicate a candidate");
     }
 
     fn quota(provider: &str, window: &str, remaining: Option<f64>, updated: Option<String>, reset: Option<i64>) -> quota::Quota {

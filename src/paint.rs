@@ -203,8 +203,6 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
             let label = format!("{} · {}", q.provider, q.window);
             text_block(p, pos2(r.center().x, r.top() + k * 0.08), k * 0.84, &label, k * 0.105, white(0.75), 1, true);
             let remaining = crate::quota::displayed_remaining(q, crate::model::now() as i64);
-            let hue = if q.provider.eq_ignore_ascii_case("Claude") { 95.0 } else { 270.0 };
-            let accent = c32(crate::colour::oklch(0.76, 0.15, hue));
             let bar = Rect::from_min_max(r.min + vec2(k * 0.13, k * 0.55), r.min + vec2(k * 0.87, k * 0.62));
             p.rect_filled(bar, CornerRadius::same((k * 0.035).max(1.0) as u8), white(0.16));
             if let Some(value) = remaining {
@@ -213,7 +211,9 @@ pub fn paint_key(p: &Painter, r: Rect, face: &KeyFace, cx: &KeyCx) {
                 if value > 0.0 {
                     let end = bar.left() + bar.width() * (value.clamp(0.0, 100.0) as f32 / 100.0);
                     let filled = Rect::from_min_max(bar.min, pos2(end, bar.bottom()));
-                    p.rect_filled(filled, CornerRadius::same((k * 0.035).max(1.0) as u8), accent);
+                    if let Some(accent) = crate::quota::remaining_colour(value) {
+                        p.rect_filled(filled, CornerRadius::same((k * 0.035).max(1.0) as u8), c32(accent));
+                    }
                 }
                 p.text(r.min + vec2(k * 0.5, k * 0.72), Align2::CENTER_CENTER, format!("{}% Used", 100 - percent), FontId::proportional(k * 0.105), white(0.7));
             } else {
@@ -512,7 +512,7 @@ fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {
     p.add(Shape::mesh(mesh));
     glass(p, r, k * 0.2, white(0.5), 0.5, false);
     if let Some(clock) = &h.clock {
-        p.text(pos2(r.center().x, r.top() + k * 0.16), Align2::CENTER_CENTER, clock, FontId::proportional(k * 0.10), white(0.76));
+        p.text(pos2(r.center().x, r.top() + k * 0.16), Align2::CENTER_CENTER, clock, FontId::proportional(k * 0.14), white(0.76));
     }
     if h.waiting > 0 || h.working > 0 {
         let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };

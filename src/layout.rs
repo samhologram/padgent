@@ -93,7 +93,7 @@ impl KeypadLayout {
 /// tile when it is acknowledged; newly arriving or resumed work can reuse it.
 #[derive(Default)]
 pub struct IslandLayout {
-    slots: [Option<String>; 2],
+    slots: Vec<Option<String>>,
     known: std::collections::HashMap<String, (bool, bool)>,
 }
 impl IslandLayout {
@@ -105,7 +105,8 @@ impl IslandLayout {
         if let Some(ack) = self.known.remove(old) { self.known.entry(new.to_owned()).or_insert(ack); }
     }
 
-    pub fn project<'a>(&mut self, candidates: &[&'a Session]) -> Vec<&'a Session> {
+    pub fn project<'a>(&mut self, candidates: &[&'a Session], limit: usize) -> Vec<&'a Session> {
+        self.slots.resize(limit.clamp(1, 8), None);
         for slot in &mut self.slots {
             if slot.as_ref().is_some_and(|key| !candidates.iter().any(|s| s.key() == *key)) { *slot = None; }
         }

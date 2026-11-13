@@ -201,8 +201,6 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
             let label = fit(font, 12.0, &format!("{} · {}", q.provider, q.window), k - 16.0);
             draw_text(&mut pm, font, 12.0, (k - text_width(font, 12.0, &label)) / 2.0, k * 0.18, &label, white, 0.75);
             let remaining = crate::quota::displayed_remaining(q, crate::model::now() as i64);
-            let hue = if q.provider.eq_ignore_ascii_case("Claude") { 95.0 } else { 270.0 };
-            let accent = crate::colour::oklch(0.76, 0.15, hue);
             let (left, right, y) = (k * 0.16, k * 0.84, k * 0.585);
             stroke_poly(&mut pm, &[(left, y), (right, y)], k * 0.07, color(white, 0.16));
             if let Some(value) = remaining {
@@ -211,7 +209,9 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
                 draw_text(&mut pm, font, 20.0, (k - text_width(font, 20.0, &title)) / 2.0, k * 0.43, &title, white, 0.96);
                 if value > 0.0 {
                     let end = left + (right - left) * (value.clamp(0.0, 100.0) as f32 / 100.0);
-                    stroke_poly(&mut pm, &[(left, y), (end, y)], k * 0.07, color(accent, 1.0));
+                    if let Some(accent) = crate::quota::remaining_colour(value) {
+                        stroke_poly(&mut pm, &[(left, y), (end, y)], k * 0.07, color(accent, 1.0));
+                    }
                 }
                 let used = format!("{}% Used", 100 - percent);
                 draw_text(&mut pm, font, 12.0, (k - text_width(font, 12.0, &used)) / 2.0, k * 0.76, &used, white, 0.7);
@@ -440,7 +440,7 @@ fn render_hub(pm: &mut Pixmap, h: &HubFace, phase: f32, font: &FontVec) {
         }
     }
     if let Some(clock) = &h.clock {
-        draw_text(pm, font, 12.0, (k - text_width(font, 12.0, clock)) / 2.0, k * 0.21, clock, white, 0.76);
+        draw_text(pm, font, 17.0, (k - text_width(font, 17.0, clock)) / 2.0, k * 0.23, clock, white, 0.76);
     }
     if h.waiting > 0 || h.working > 0 {
         let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };

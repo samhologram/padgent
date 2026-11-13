@@ -49,6 +49,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   Both interfaces use the same display controller and renderers as the app.
   See the [display API guide](docs/display-api.md) for examples and MCP setup.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
+  Choose 1–8 visible agents with **Agents shown** in Menu bar and hand-over; the default is four.
   Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
   Completed or unread conversations stay bright until opened, then remain dimmed until work resumes.
   Choose Never, Always, When keypad disconnected, or Quotas always, agents when disconnected in Menu bar and hand-over settings. The last option keeps quotas visible and shows agents when the keypad is physically disconnected.
@@ -61,6 +62,8 @@ and on screen as a Liquid Glass keypad. Written in Rust.
 
 Active conversations stay on the left; remaining session and weekly quotas stay on the right.
 Click a conversation to open it, a percentage to view usage, or the black background to unfold the keypad from the notch.
+Quota bars use green for 75–100% remaining, yellow for 50–74%, orange for 25–49%,
+and red below 25%, on both the keypad and notch. The provider's text colour stays distinct.
 
 ![Padgent notch in compact mode](docs/images/padgent-notch-compact.png)
 

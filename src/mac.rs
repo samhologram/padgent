@@ -99,6 +99,17 @@ mod imp {
         (x as f32, y as f32, notch as f32, if inset > 0.0 { inset as f32 } else { 28.0 })
     }
 
+    /// Logical size of the notched display, or the primary display if none has a notch.
+    pub fn island_screen_size() -> (f32, f32) {
+        use objc2_app_kit::NSScreen;
+        let Some(mtm) = MainThreadMarker::new() else { return (1440.0, 900.0) };
+        let screens = NSScreen::screens(mtm);
+        let Some(primary) = screens.firstObject() else { return (1440.0, 900.0) };
+        let screen = screens.iter().find(|s| s.safeAreaInsets().top > 0.0).unwrap_or(primary);
+        let frame = screen.frame();
+        (frame.size.width as f32, frame.size.height as f32)
+    }
+
     /// Promote the overlay above the menu bar and allow it in full-screen spaces.
     pub fn configure_island_window() {
         use objc2_app_kit::{NSStatusWindowLevel, NSWindowCollectionBehavior};
@@ -276,6 +287,7 @@ mod imp {
     }
     pub fn show_app() {}
     pub fn island_geometry() -> (f32, f32, f32, f32) { (0.0, 0.0, 0.0, 28.0) }
+    pub fn island_screen_size() -> (f32, f32) { (1440.0, 900.0) }
     pub fn configure_island_window() {}
     pub fn configure_keypad_window() {}
     pub fn tray_popup_position(rect: tray_icon::Rect, width: f32, _height: f32) -> (f32, f32) {

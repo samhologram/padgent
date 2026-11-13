@@ -186,7 +186,7 @@ pub fn observe(core: &mut Core, observation: Quota) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Quota, displayed_remaining, is_fresh, observe, parse_cache, parse_claude_usage, parse_claude_window, parse_codex_event};
+    use super::{Quota, displayed_remaining, is_fresh, observe, parse_cache, parse_claude_usage, parse_claude_window, parse_codex_event, remaining_colour};
     use crate::model::{Core, Settings};
 
     #[test]
@@ -247,19 +247,44 @@ mod tests {
 
     #[test]
     fn freshness_bounds_reading_age_future_skew_and_reset() {
-        let make = |updated: &str, reset| Quota {
-            provider: "Codex".into(), window: "Session".into(), remaining: Some(75.0), reset,
+        let make = |updated: &str, reset, remaining| Quota {
+            provider: "Codex".into(), window: "Session".into(), remaining, reset,
             reset_text: None, updated: Some(updated.into()), source: "test".into(),
         };
         let now = 1_800_000_000i64;
-        assert!(is_fresh(&make("2027-01-15T07:45:00Z", None), now)); // age exactly 900 s
-        assert!(!is_fresh(&make("2027-01-15T07:44:59Z", None), now));
-        assert!(is_fresh(&make("2027-01-15T08:01:00Z", None), now)); // 60 s future skew
-        assert!(!is_fresh(&make("2027-01-15T08:01:01Z", None), now));
-        assert!(!is_fresh(&make("2027-01-15T08:00:00Z", Some(now)), now)); // reset passed
-        assert_eq!(displayed_remaining(&make("2027-01-15T07:44:59Z", None), now), None);
-        assert_eq!(displayed_remaining(&make("2027-01-15T07:45:00Z", None), now), Some(75.0));
-        assert!(!is_fresh(&make("not a timestamp", None), now));
+        assert!(is_fresh(&make("2027-01-15T07:45:00Z", None, Some(75.0)), now)); // age exactly 900 s
+        assert!(!is_fresh(&make("2027-01-15T07:44:59Z", None, Some(75.0)), now));
+        assert!(is_fresh(&make("2027-01-15T08:01:00Z", None, Some(75.0)), now)); // 60 s future skew
+        assert!(!is_fresh(&make("2027-01-15T08:01:01Z", None, Some(75.0)), now));
+        assert!(!is_fresh(&make("2027-01-15T08:00:00Z", Some(now), Some(75.0)), now)); // reset passed
+        assert_eq!(displayed_remaining(&make("2027-01-15T07:44:59Z", None, Some(75.0)), now), None);
+        assert_eq!(displayed_remaining(&make("2027-01-15T07:45:00Z", None, Some(75.0)), now), Some(75.0));
+        assert_eq!(displayed_remaining(&make("2027-01-15T07:45:00Z", None, Some(0.0)), now), Some(0.0));
+        assert_eq!(displayed_remaining(&make("2027-01-15T07:45:00Z", None, Some(100.0)), now), Some(100.0));
+        for invalid in [None, Some(-0.01), Some(100.01), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(displayed_remaining(&make("2027-01-15T07:45:00Z", None, invalid), now), None);
+        }
+        assert!(!is_fresh(&make("not a timestamp", None, Some(50.0)), now));
+    }
+
+    #[test]
+    fn remaining_colour_uses_inclusive_thresholds_and_rejects_out_of_range_values() {
+        use crate::colour::Rgb;
+        for (value, expected) in [
+            (100.0, Rgb(48, 209, 88)),
+            (75.0, Rgb(48, 209, 88)),
+            (74.99, Rgb(255, 214, 10)),
+            (50.0, Rgb(255, 214, 10)),
+            (49.99, Rgb(255, 159, 10)),
+            (25.0, Rgb(255, 159, 10)),
+            (24.99, Rgb(255, 69, 58)),
+            (0.0, Rgb(255, 69, 58)),
+        ] {
+            assert_eq!(remaining_colour(value), Some(expected), "remaining={value}");
+        }
+        for invalid in [-0.01, 100.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(remaining_colour(invalid), None, "invalid remaining={invalid}");
+        }
     }
 
     #[test]
@@ -347,5 +372,15 @@ pub fn is_fresh(q: &Quota, now_epoch: i64) -> bool {
 }
 
 pub fn displayed_remaining(q: &Quota, now_epoch: i64) -> Option<f64> {
-    if is_fresh(q, now_epoch) { q.remaining } else { None }
+    if is_fresh(q, now_epoch) { q.remaining.filter(|v| v.is_finite() && (0.0..=100.0).contains(v)) } else { None }
+}
+
+/// Semantic color of the remaining allowance; invalid readings have no color.
+pub fn remaining_colour(value: f64) -> Option<crate::colour::Rgb> {
+    use crate::colour::Rgb;
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) { return None; }
+    Some(if value >= 75.0 { Rgb(48, 209, 88) }
+        else if value >= 50.0 { Rgb(255, 214, 10) }
+        else if value >= 25.0 { Rgb(255, 159, 10) }
+        else { Rgb(255, 69, 58) })
 }

@@ -591,6 +591,7 @@ pub struct Settings {
     pub menu_indicator: MenuIndicator,
     #[serde(alias = "islandEnabled", deserialize_with = "deserialize_island_visibility")]
     pub island_visibility: IslandVisibility,
+    pub island_agent_limit: usize,
     pub motion: Motion,
     pub demo_mode: bool,
     pub drive_physical_keypad: bool,
@@ -636,6 +637,7 @@ impl Default for Settings {
             waiting_colour: None,
             menu_indicator: MenuIndicator::DotAndCount,
             island_visibility: IslandVisibility::Always,
+            island_agent_limit: 4,
             motion: Motion::Full,
             demo_mode: false,
             // Take the keypad from Logi Options+ when the app opens, as the original does.
