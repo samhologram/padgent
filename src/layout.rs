@@ -8,6 +8,11 @@ pub struct KeypadLayout {
     displaced: HashSet<String>,
 }
 impl KeypadLayout {
+    /// Freeze current bright neighbours while retaining displaced dim tiles for later resumption.
+    pub fn keep_positions(&mut self, acknowledged: &HashSet<String>) {
+        self.displaced.retain(|key| acknowledged.contains(key));
+    }
+
     pub fn remap(&mut self, old: &str, new: &str) {
         let exists = self
             .positions

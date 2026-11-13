@@ -21,7 +21,7 @@ flowchart LR
 | --- | --- |
 | Claude Code | Hook events, live process/session records, transcript steps, desktop observations |
 | Claude desktop chats | Accessible conversation URL, messages and generation controls |
-| ChatGPT desktop chats | Accessible windows and messages |
+| Configured desktop apps | Accessible windows and messages; availability depends on what the app exposes |
 | Codex | Read-only thread/turn/item databases and read receipts |
 | Codex Cloud tasks | Official `codex cloud list --json`, first page of up to 20 tasks |
 | Scheduled runs | Explicit local Claude task/session links and Codex automation/thread links |
@@ -29,6 +29,9 @@ flowchart LR
 Reading a local database with `sqlite3` is an acquisition mechanism. It does not make
 that database an official provider API. Native file formats and accessibility labels
 belong inside their adapters.
+
+ChatGPT Dots unread messages and Claude cloud-only scheduled runs do not currently have
+a tracking source.
 
 ## Boundaries
 
@@ -46,6 +49,9 @@ belong inside their adapters.
 - `model.rs` composes observations, resolves identity aliases, and applies lifecycle and
   attention transitions. Claude host and CLI identifiers can describe the same session;
   resolving them also preserves held-key and detail-view targets.
+  A hub hold dismisses the inactive identities captured on the current page. Lightweight
+  timestamp records suppress stale rediscovery after session expiry; new activity restores
+  visibility. Dismissal does not archive or delete a provider conversation.
 - `layout.rs` owns stable positions. Acknowledgement leaves a dim tile in place. New or
   resumed work fills free first-page slots, then replaces dim tiles if needed. Replaced
   tiles remain accessible on later pages without shifting bright neighbours.

@@ -4,6 +4,8 @@ A light, native macOS menu-bar app that shows your AI coding agents and chats on
 **Logitech MX Creative Keypad** — one key per conversation, lit by what each one is doing —
 and on screen as a Liquid Glass keypad. Written in Rust.
 
+[Download Padgent](https://github.com/samhologram/padgent/releases/latest)
+
 ![Sample Padgent app showing demonstration sessions](docs/images/padgent-app.png)
 
 *Sample app with demonstration sessions.*
@@ -12,14 +14,21 @@ and on screen as a Liquid Glass keypad. Written in Rust.
 
 *Sample menu-bar keypad with demonstration sessions.*
 
-- **Agents:** Claude Code, Codex, Antigravity, ZCode, Kimi Code, plus the ChatGPT and Claude
-  desktop apps. Add any other agent by importing an `.orbagent.json` file, or follow any desktop
+- **Agents:** Claude Code, Codex, Antigravity, ZCode, Kimi Code, plus Claude desktop.
+  Add any other agent by importing an `.orbagent.json` file, or follow a desktop
   app's conversations through macOS Accessibility (no logins in Padgent).
 - **Keypad:** eight session keys and a hub key that counts what's waiting; previous/next page
-  buttons; hold a key 0.6 s to show observed steps, one per key; use the page buttons and Back to return; hold both page buttons 1.5 s to hand the keypad
+  buttons; hold a session key 0.6 s to show observed steps, one per key; use the page buttons
+  and Back to return; hold both page buttons 1.5 s to hand the keypad
   back to Logi Options+. Each key's light follows the session's state (thinking, tool, writing,
   waiting for approval or an answer, done, error, compacting). Sessions idle for more than
   30 minutes move to page 2 or later, except acknowledged tiles kept as dim placeholders.
+- **Clear a page:** hold the bottom-right hub for 0.6 s to remove inactive keys from the
+  current page without shifting the other keys. Working agents and those waiting for an
+  answer or approval stay in place. Cleared conversations return when new activity is observed;
+  changing pages during the hold cancels it.
+- **Animated hub:** soft gold, lavender and blue gradients drift slowly behind the status
+  count, with the same glass finish as the other keys. Reduced motion keeps the gradient still.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
   session runs in (Terminal, iTerm2). Opening an inactive conversation keeps its tile in
   place at 45% intensity. New sessions use free slots, then replace dim tiles when needed;
@@ -30,6 +39,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   from local app records, with a small clock marker on their tiles and in the notch.
 - **Codex Cloud tasks:** follows the first page of up to 20 tasks through the installed
   Codex CLI and opens each task at its exact web URL.
+  Claude cloud-only scheduled runs and ChatGPT Dots unread messages are not tracked yet.
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
@@ -58,6 +68,8 @@ cargo build --release          # the program
 ./dmg.sh                       # builds an Apple Silicon disk image in target/
 cargo run -- --screenshot shot.png   # renders the window to a PNG and exits
 cargo run -- --screenshot-menu-bar menu.png  # renders the menu-bar keypad and exits
+cargo run -- --screenshot-island compact.png # renders the compact notch and exits
+cargo run -- --screenshot-island-expanded expanded.png # renders the expanded notch and exits
 ```
 
 On first use macOS asks you to allow Padgent in **Accessibility** (to follow desktop apps),

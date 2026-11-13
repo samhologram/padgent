@@ -236,8 +236,8 @@ fn hint(ui: &mut Ui, text: &str) {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<String>, screenshot_menu_bar: bool, screenshot_island: bool, screenshot_island_expanded: bool, shot_failed: Arc<AtomicBool>) -> App {
         setup_style(&cc.egui_ctx);
-        let mut settings = Settings::load();
         let demo = screenshot.is_some();
+        let mut settings = if demo { Settings::default() } else { Settings::load() };
         if demo {
             settings.demo_mode = true;
             settings.drive_physical_keypad = false;
@@ -1541,7 +1541,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut s.empty_key_url).hint_text("https://… or app link").desired_width(300.0));
             });
             hint(ui, "Optional. Pressing a key with no session opens this link on this computer. Leave blank to do nothing.");
-            hint(ui, "Hold a session key for 0.6 s to view observed steps. Use the page buttons to browse and Back to return. Opening an inactive conversation moves it to later pages until work resumes.");
+            hint(ui, "Hold a session key for 0.6 s to view observed steps. Hold the bottom-right hub for 0.6 s to clear inactive keys on this page. Use the page buttons to browse and Back to return. Opening an inactive conversation dims its key until work resumes.");
         });
         if format!("{:?}", c.settings) != before {
             c.revision += 1;

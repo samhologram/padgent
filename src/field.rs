@@ -247,3 +247,18 @@ pub fn hash(i: u32, j: u32) -> f32 {
     h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
     (h ^ (h >> 16)) as f32 / u32::MAX as f32
 }
+
+/// Restrained, slowly drifting colour field for the hub, in normalized tile coordinates.
+pub fn hub_colour(x: f32, y: f32, t: f32) -> crate::colour::Rgb {
+    let a = t * TAU / 32.0;
+    let b = t * TAU / 39.0;
+    let band = |center: f32, width: f32| {
+        let d = (y - center) / width;
+        (-d * d).exp()
+    };
+    let violet = band(0.38 + 0.29 * x + 0.06 * a.sin(), 0.31);
+    let gold = band(0.85 - 0.36 * x + 0.055 * b.sin(), 0.27);
+    let blue = band(0.12 + 0.22 * x + 0.045 * b.cos(), 0.36);
+    let channel = |base: f32, v: f32, g: f32, c: f32| (base + violet * v + gold * g + blue * c).clamp(0.0, 255.0) as u8;
+    crate::colour::Rgb(channel(15.0, 34.0, 48.0, 12.0), channel(15.0, 25.0, 31.0, 20.0), channel(23.0, 54.0, 19.0, 37.0))
+}

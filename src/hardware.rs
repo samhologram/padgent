@@ -235,7 +235,7 @@ pub fn render_key(face: &KeyFace, t: f64, font: &FontVec) -> Pixmap {
         }
         KeyFace::Back => { let label = "← Back"; draw_text(&mut pm, font, 16.0, (k - text_width(font, 16.0, label)) / 2.0, 64.0, label, white, 0.9); }
         KeyFace::Session(f) => render_session(&mut pm, f, phase, t, font),
-        KeyFace::Hub(h) => render_hub(&mut pm, h, phase, font),
+        KeyFace::Hub(h) => render_hub(&mut pm, h, (t % 1248.0) as f32, font),
     }
     if let KeyFace::Session(f) = face {
         for pixel in pm.data_mut().chunks_exact_mut(4) {
@@ -383,29 +383,34 @@ fn waiting_tint(c: Rgb) -> Rgb {
 fn render_hub(pm: &mut Pixmap, h: &HubFace, phase: f32, font: &FontVec) {
     let k = KEY_SIZE as f32;
     let white = Rgb(255, 255, 255);
-    let (cx, cy) = (k / 2.0, k * 0.4);
-    if h.waiting > 0 {
-        let b = 0.45 + 0.35 * (0.5 + 0.5 * (phase * std::f32::consts::TAU / 1.6).sin());
-        glow(pm, cx, cy, k * 0.4, h.waiting_colour, b);
-        let n = h.waiting.to_string();
-        draw_text(pm, font, 34.0, cx - text_width(font, 34.0, &n) / 2.0, cy + 12.0, &n, white, 0.97);
-        draw_text(pm, font, 10.0, cx - text_width(font, 10.0, "waiting") / 2.0, cy + 28.0, "waiting", h.waiting_colour, 0.9);
-    } else {
-        stroke_poly(pm, &arc_pts(cx, cy, 11.0, 0.0, std::f32::consts::TAU), 2.0, Color::from_rgba8(255, 255, 255, 170));
-        let s = if h.working > 0 { "working" } else { "all clear" };
-        draw_text(pm, font, 10.0, cx - text_width(font, 10.0, s) / 2.0, cy + 28.0, s, white, 0.6);
+    // The LCD is square; preserve a dark rounded margin matching the on-screen shell.
+    for y in 0..KEY_SIZE {
+        for x in 0..KEY_SIZE {
+            let nx = (x as f32 + 0.5) / k;
+            let ny = (y as f32 + 0.5) / k;
+            let radius = 0.20_f32;
+            let dx = (radius - nx.min(1.0 - nx)).max(0.0);
+            let dy = (radius - ny.min(1.0 - ny)).max(0.0);
+            if dx * dx + dy * dy <= radius * radius {
+                let c = crate::field::hub_colour(nx, ny, if h.reduced_motion { 0.0 } else { (phase * 2.0).floor() / 2.0 });
+                let i = ((y * KEY_SIZE + x) * 4) as usize;
+                pm.data_mut()[i..i + 4].copy_from_slice(&[c.0, c.1, c.2, 255]);
+            }
+        }
     }
-    let n = h.dots.len().min(6);
-    for (i, d) in h.dots.iter().take(6).enumerate() {
-        let x = cx + (i as f32 - (n as f32 - 1.0) / 2.0) * 12.0;
-        fill_circle(pm, x, k * 0.8, 3.0, color(*d, 1.0));
+    if h.waiting > 0 || h.working > 0 {
+        let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };
+        let count = count.to_string();
+        draw_text(pm, font, 33.0, (k - text_width(font, 33.0, &count)) / 2.0, k * 0.51, &count, white, 0.98);
+        draw_text(pm, font, 11.0, (k - text_width(font, 11.0, label)) / 2.0, k * 0.67, label, white, 0.72);
+    } else {
+        for (label, size, y, opacity) in [("Padgent", 16.0, 0.51, 0.93), ("all clear", 10.0, 0.67, 0.62)] {
+            draw_text(pm, font, size, (k - text_width(font, size, label)) / 2.0, k * y, label, white, opacity);
+        }
     }
     if h.pages > 1 {
-        for i in 0..h.pages {
-            let x = cx + (i as f32 - (h.pages as f32 - 1.0) / 2.0) * 8.0;
-            let a = if i == h.page { 0.9 } else { 0.3 };
-            fill_circle(pm, x, k - 8.0, 2.2, Color::from_rgba8(255, 255, 255, (a * 255.0) as u8));
-        }
+        let page = format!("{} / {}", h.page + 1, h.pages);
+        draw_text(pm, font, 9.0, (k - text_width(font, 9.0, &page)) / 2.0, k * 0.93, &page, white, 0.58);
     }
 }
 
@@ -782,7 +787,7 @@ fn prepare_device_display_view(
 fn face_needs_render(previous: Option<&KeyFace>, current: &KeyFace, refresh: bool) -> bool {
     refresh || previous != Some(current)
         || matches!(current, KeyFace::Session(session) if session.activity.animated())
-        || matches!(current, KeyFace::Hub(hub) if hub.waiting > 0)
+        || matches!(current, KeyFace::Hub(hub) if !hub.reduced_motion || hub.waiting > 0)
 }
 
 /// The scheduler visits each key in circular order, including empty slots.

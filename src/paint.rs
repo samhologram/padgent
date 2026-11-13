@@ -449,44 +449,40 @@ fn state_word(a: Activity) -> &'static str {
 
 fn paint_hub(p: &Painter, r: Rect, h: &HubFace, cx: &KeyCx) {
     let k = r.width();
-    let wc = c32(h.waiting_colour);
-    let c = r.center() - vec2(0.0, k * 0.1);
-    if h.waiting > 0 {
-        let b = if cx.reduced_motion { 0.6 } else { 0.45 + 0.35 * (0.5 + 0.5 * ((cx.t % 1000.0) as f32 * TAU / 1.6).sin()) };
-        glow(p, c, k * 0.4, wc, b);
-        p.text(c, Align2::CENTER_CENTER, h.waiting.to_string(), FontId::proportional(k * 0.3), white(0.97));
-        p.text(c + vec2(0.0, k * 0.2), Align2::CENTER_CENTER, "waiting", FontId::proportional(k * 0.085), lerp_color(wc, white(1.0), 0.4));
-    } else {
-        glow(p, c, k * 0.32, white(0.8), if h.dimmed { 0.08 } else { 0.18 });
-        if h.working == 0 {
-            p.circle_stroke(c, k * 0.1, Stroke::new(2.0, white(0.7)));
+    let time = if cx.reduced_motion { 0.0 } else { (cx.t % 1248.0) as f32 };
+    let mut mesh = Mesh::default();
+    const STEPS: usize = 20;
+    for row in 0..=STEPS {
+        let y = row as f32 / STEPS as f32;
+        // Follow the same rounded key silhouette as the surrounding glass shell.
+        let radius = 0.20_f32;
+        let dy = if y < radius { radius - y } else if y > 1.0 - radius { y - (1.0 - radius) } else { 0.0 };
+        let inset = radius - (radius * radius - dy * dy).max(0.0).sqrt();
+        for col in 0..=STEPS {
+            let x = inset + (1.0 - 2.0 * inset) * col as f32 / STEPS as f32;
+            mesh.colored_vertex(pos2(r.left() + x * k, r.top() + y * k), c32(crate::field::hub_colour(x, y, time)));
         }
-        if h.working > 0 {
-            p.text(c, Align2::CENTER_CENTER, h.working.to_string(), FontId::proportional(k * 0.2), white(0.9));
-        }
-        let label = if h.working > 0 { "working" } else { "none waiting" }; // "{n} working" (0x100b95e40)
-        p.text(c + vec2(0.0, k * 0.2), Align2::CENTER_CENTER, label, FontId::proportional(k * 0.075), white(0.6));
     }
-    // One small orb per session.
-    let n = h.dots.len().min(12);
-    if n > 0 {
-        let per_row = n.min(6);
-        let gap = k * 0.105;
-        for (i, d) in h.dots.iter().take(12).enumerate() {
-            let row = i / per_row;
-            let col = i % per_row;
-            let row_n = if row == 0 { per_row } else { n - per_row };
-            let x = r.center().x + (col as f32 - (row_n as f32 - 1.0) / 2.0) * gap;
-            let y = r.top() + k * 0.74 + row as f32 * gap * 0.8;
-            p.circle_filled(pos2(x, y), k * 0.025, c32(*d));
+    for row in 0..STEPS {
+        for col in 0..STEPS {
+            let i = (row * (STEPS + 1) + col) as u32;
+            mesh.add_triangle(i, i + 1, i + STEPS as u32 + 1);
+            mesh.add_triangle(i + 1, i + STEPS as u32 + 2, i + STEPS as u32 + 1);
         }
+    }
+    p.add(Shape::mesh(mesh));
+    glass(p, r, k * 0.2, white(0.5), 0.5, false);
+    if h.waiting > 0 || h.working > 0 {
+        let (count, label) = if h.waiting > 0 { (h.waiting, "waiting") } else { (h.working, "working") };
+        p.text(r.center() - vec2(0.0, k * 0.09), Align2::CENTER_CENTER, count.to_string(), FontId::proportional(k * 0.28), white(0.98));
+        p.text(r.center() + vec2(0.0, k * 0.14), Align2::CENTER_CENTER, label, FontId::proportional(k * 0.09), white(0.72));
+    } else {
+        p.text(r.center() - vec2(0.0, k * 0.025), Align2::CENTER_CENTER, "Padgent", FontId::proportional(k * 0.135), white(0.93));
+        p.text(r.center() + vec2(0.0, k * 0.14), Align2::CENTER_CENTER, "all clear", FontId::proportional(k * 0.085), white(0.62));
     }
     if h.pages > 1 {
-        for i in 0..h.pages {
-            let x = r.center().x + (i as f32 - (h.pages as f32 - 1.0) / 2.0) * k * 0.07;
-            let on = i == h.page;
-            p.circle_filled(pos2(x, r.bottom() - k * 0.07), k * if on { 0.022 } else { 0.016 }, white(if on { 0.9 } else { 0.3 }));
-        }
+        p.text(pos2(r.center().x, r.bottom() - k * 0.11), Align2::CENTER_CENTER,
+            format!("{} / {}", h.page + 1, h.pages), FontId::proportional(k * 0.075), white(0.58));
     }
 }
 

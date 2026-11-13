@@ -832,7 +832,7 @@ pub struct HubFace {
     pub pages: usize,
     pub dots: Vec<Rgb>,
     pub waiting_colour: Rgb,
-    pub dimmed: bool,
+    pub reduced_motion: bool,
     /// Sessions per agent: (name, colour, count).
     pub agents: Vec<(String, Rgb, usize)>,
 }
@@ -876,6 +876,9 @@ pub struct Core {
     source_policy: SourcePolicy,
     aliases: std::collections::HashMap<(String, String), String>,
     suppressed_local: std::collections::HashMap<(String, String), Observation>,
+    dismissed: std::collections::HashMap<String, f64>,
+    hub_hold_keys: Vec<String>,
+    hub_hold_page: Option<usize>,
     pub page: usize,
     pub quota_view: bool,
     pub quota_page: usize,
@@ -913,6 +916,9 @@ impl Core {
             source_policy: SourcePolicy::default(),
             aliases: std::collections::HashMap::new(),
             suppressed_local: std::collections::HashMap::new(),
+            dismissed: std::collections::HashMap::new(),
+            hub_hold_keys: Vec::new(),
+            hub_hold_page: None,
             page: 0,
             quota_view: false,
             quota_page: 0,
@@ -954,6 +960,15 @@ impl Core {
             pending.session = session.to_string();
             self.suppressed_local.insert((agent.to_string(), session.to_string()), pending);
         }
+        let old_key = format!("{agent}:{host}");
+        let new_key = format!("{agent}:{session}");
+        if let Some(at) = self.dismissed.remove(&old_key) {
+            let canonical_active = self.sessions.iter().any(|s| s.agent == agent && s.id == session && matches!(s.activity.group(), Group::Working | Group::Waiting));
+            if !canonical_active {
+                self.dismissed.entry(new_key.clone()).and_modify(|v| *v = v.max(at)).or_insert(at);
+            }
+        }
+        for key in &mut self.hub_hold_keys { if *key == old_key { *key = new_key.clone(); } }
         let Some(source) = self.sessions.iter().position(|s| s.agent == agent && s.id == host) else { return };
         let target = self.sessions.iter().position(|s| s.agent == agent && s.id == session);
         if let Some(target) = target {
@@ -1071,7 +1086,19 @@ impl Core {
             pending.observed_at = t;
             obs = pending;
         }
-        if obs.kind == ObservationKind::Discovery {
+        let key = format!("{agent_id}:{sid}");
+        let mut revived = false;
+        if let Some(&dismissed_at) = self.dismissed.get(&key) {
+            let dated_fresh = [obs.recorded_at, obs.text_at].into_iter().flatten().any(|at| at.is_finite() && at > dismissed_at && at <= t);
+            let live_fresh = obs.recorded_at.is_none() && obs.text_at.is_none()
+                && t > dismissed_at && (obs.event.is_some() || matches!(obs.source, crate::observation::Source::DesktopLive | crate::observation::Source::LocalSnapshot));
+            revived = (dated_fresh || live_fresh) && obs.activity.is_some_and(|activity|
+                matches!(activity.group(), Group::Working | Group::Waiting)
+                || (activity == Activity::Done && dated_fresh));
+            if !revived { return; }
+            self.dismissed.remove(&key);
+        }
+        if obs.kind == ObservationKind::Discovery && !revived {
             if let Some(existing) = self.sessions.iter_mut().find(|s| s.agent == agent_id && s.id == sid) {
                 if obs.scheduled && !existing.scheduled { existing.scheduled = true; self.revision += 1; }
                 return;
@@ -1133,6 +1160,7 @@ impl Core {
             }
         };
         let s = &mut self.sessions[idx];
+        if revived { s.acknowledged = false; s.acknowledged_at = None; }
         s.scheduled |= obs.scheduled;
         let old = s.activity;
         let incoming_activity = activity;
@@ -1300,10 +1328,13 @@ impl Core {
             self.touch();
         }
         for i in 0..KEY_COUNT {
-            if let (Some(d), Some(KeyPressTarget::Session(key))) = (self.key_down[i], self.key_target[i].clone()) {
-                if !self.hold_fired[i] && t - d >= DETAIL_HOLD_S {
-                    self.hold_fired[i] = true;
-                    self.open_session_steps(&key);
+            if let (Some(d), Some(target)) = (self.key_down[i], self.key_target[i].clone()) {
+                if !self.hold_fired[i] && self.in_control && t - d >= DETAIL_HOLD_S {
+                    match target {
+                        KeyPressTarget::Session(key) => { self.hold_fired[i] = true; self.open_session_steps(&key); }
+                        KeyPressTarget::Hub => { self.hold_fired[i] = true; self.clear_hub_hold(); }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1342,11 +1373,11 @@ impl Core {
             .order
             .iter()
             .filter_map(|k| self.sessions.iter().find(|s| &s.key() == k))
-            .filter(|s| self.agent_enabled(&s.agent))
+            .filter(|s| self.agent_enabled(&s.agent) && !self.dismissed.contains_key(&s.key()))
             .filter(recent)
             .collect();
         for s in &self.sessions {
-            if !self.order.contains(&s.key()) && self.agent_enabled(&s.agent) && recent(&s) {
+            if !self.order.contains(&s.key()) && self.agent_enabled(&s.agent) && !self.dismissed.contains_key(&s.key()) && recent(&s) {
                 v.push(s);
             }
         }
@@ -1568,7 +1599,7 @@ impl Core {
             pages: self.pages(),
             dots: vis.iter().take(12).map(|s| self.colours(s).0).collect(),
             waiting_colour: self.waiting_colour(),
-            dimmed: self.dimmed(),
+            reduced_motion: self.settings.motion == Motion::Reduced,
             agents: {
                 let mut list: Vec<(String, Rgb, usize)> = Vec::new();
                 for s in &vis {
@@ -1602,8 +1633,32 @@ impl Core {
         self.key_down_with_target(i, target);
     }
 
+    fn clear_hub_hold(&mut self) {
+        let keys = std::mem::take(&mut self.hub_hold_keys);
+        let page = self.hub_hold_page.take();
+        if self.quota_view || self.detail_key.is_some() || page != Some(self.page.min(self.pages() - 1)) { return; }
+        let at = now();
+        for s in &mut self.sessions {
+            if keys.contains(&s.key()) && !matches!(s.activity.group(), Group::Working | Group::Waiting) {
+                s.acknowledged = true;
+                s.acknowledged_at = Some(at);
+                s.pending_attention = false;
+                s.unread = 0;
+                self.dismissed.insert(s.key(), at);
+            }
+        }
+        let acknowledged = self.sessions.iter().filter(|s| s.acknowledged).map(Session::key).collect();
+        self.layout.borrow_mut().keep_positions(&acknowledged);
+        self.touch();
+    }
+
     pub fn key_down_with_target(&mut self, i: usize, target: KeyPressTarget) {
         if i < KEY_COUNT && self.key_down[i].is_none() && target != KeyPressTarget::Disabled {
+            if target == KeyPressTarget::Hub && !self.quota_view && self.detail_key.is_none() {
+                let page = self.page.min(self.pages() - 1);
+                self.hub_hold_page = Some(page);
+                self.hub_hold_keys = self.keypad_slots().iter().skip(page * SESSION_KEYS_PER_PAGE).take(SESSION_KEYS_PER_PAGE).filter_map(|s| s.map(|s| s.key())).collect();
+            }
             self.key_down[i] = Some(now());
             self.key_target[i] = Some(target);
             self.hold_fired[i] = false;
@@ -1616,6 +1671,7 @@ impl Core {
             self.key_down[i] = None;
             self.key_target[i] = None;
             self.hold_fired[i] = false;
+            if i == HUB_KEY { self.hub_hold_keys.clear(); self.hub_hold_page = None; }
         }
     }
 
@@ -1629,6 +1685,13 @@ impl Core {
                 self.open_session_steps(key);
             }
         }
+        if let (Some(d), Some(KeyPressTarget::Hub)) = (down, target.as_ref()) {
+            if !self.hold_fired[i] && self.in_control && now() - d >= DETAIL_HOLD_S {
+                self.hold_fired[i] = true;
+                self.clear_hub_hold();
+            }
+        }
+        if matches!(target, Some(KeyPressTarget::Hub)) && !self.hold_fired[i] { self.hub_hold_keys.clear(); self.hub_hold_page = None; }
         if down.is_none() || self.hold_fired[i] || !self.in_control { return; }
         match target {
             Some(KeyPressTarget::Back) => { self.detail_key = None; self.detail_page = 0; self.touch(); }
@@ -1691,12 +1754,16 @@ impl Core {
             if let Some(key) = &self.detail_key {
                 let pages = self.sessions.iter().find(|s| s.key() == *key).map(|s| s.steps.len().div_ceil(SESSION_KEYS_PER_PAGE).max(1)).unwrap_or(1);
                 self.detail_page = if next { (self.detail_page + 1).min(pages - 1) } else { self.detail_page.saturating_sub(1) };
+                self.hub_hold_keys.clear();
+                self.hub_hold_page = None;
                 self.key_down = [None; KEY_COUNT];
                 self.key_target = std::array::from_fn(|_| None);
                 self.hold_fired = [false; KEY_COUNT];
                 self.touch(); return;
             }
             let pages = self.pages();
+            self.hub_hold_keys.clear();
+            self.hub_hold_page = None;
             // A press started on another page must not act on the new page.
             self.key_down = [None; KEY_COUNT];
             self.key_target = std::array::from_fn(|_| None);
@@ -1921,6 +1988,13 @@ mod tests {
             event: None,
             body: serde_json::json!({"session": id, "state": state, "title": id}),
         });
+    }
+
+    fn finish_hub_hold(core: &mut Core) {
+        assert_eq!(core.key_target[HUB_KEY], Some(KeyPressTarget::Hub));
+        core.key_down[HUB_KEY] = Some(now() - DETAIL_HOLD_S - 0.01);
+        core.tick();
+        core.key_up(HUB_KEY);
     }
 
     fn test_quota(provider: &str, window: &str, remaining: f64) -> crate::quota::Quota {
@@ -2283,6 +2357,223 @@ mod tests {
         core.key_up(HUB_KEY);
         assert_eq!(core.page, 0, "the archived waiting tile must not redirect to its later page");
         assert!(matches!(core.actions.as_slice(), [Action::ShowWindow]));
+    }
+
+    #[test]
+    fn hub_hold_clears_only_inactive_sessions_on_the_captured_page_without_moving_live_keys() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for i in 0..10 { add_test_session(&mut core, &format!("session-{i}"), "idle"); }
+        let before: Vec<_> = core.keypad_slots().iter().map(|s| s.map(|s| s.key())).collect();
+        assert_eq!(before.len(), 10);
+
+        let status = [
+            (0, Activity::Thinking), (1, Activity::WaitingQuestion), (2, Activity::Done),
+            (3, Activity::Error), (4, Activity::Idle), (5, Activity::Offline),
+            (6, Activity::Done), (7, Activity::Idle), (8, Activity::Error), (9, Activity::Thinking),
+        ];
+        for (slot, activity) in status {
+            let key = before[slot].as_ref().unwrap();
+            let session = core.sessions.iter_mut().find(|s| s.key() == *key).unwrap();
+            session.activity = activity;
+            session.pending_attention = activity == Activity::Done;
+            session.unread = u32::from(activity == Activity::Done) * 2;
+        }
+        let ids_before: Vec<_> = core.sessions.iter().map(|s| s.key()).collect();
+        let title_before = core.sessions.iter().find(|s| s.id == "session-4").unwrap().title.clone();
+        let updated_before = core.sessions.iter().find(|s| s.id == "session-4").unwrap().updated;
+
+        core.key_down(HUB_KEY);
+        assert_eq!(core.hub_hold_keys.len(), SESSION_KEYS_PER_PAGE);
+        finish_hub_hold(&mut core);
+
+        assert_eq!(core.sessions.iter().map(|s| s.key()).collect::<Vec<_>>(), ids_before, "clearing does not delete tracked sessions");
+        assert_eq!(core.page, 0);
+        assert!(core.actions.is_empty());
+        assert_eq!(core.waiting_count(), 1);
+        for (slot, key) in before.iter().enumerate() {
+            let Some(key) = key else { continue };
+            let session = core.sessions.iter().find(|s| s.key() == *key).unwrap();
+            if matches!(session.activity.group(), Group::Working | Group::Waiting) {
+                assert_eq!(core.keypad_slots()[slot].unwrap().key(), *key, "live slot {slot} moves");
+                assert!(!session.acknowledged);
+            } else if slot < SESSION_KEYS_PER_PAGE {
+                assert!(matches!(&core.faces()[slot], KeyFace::Empty), "inactive current-page slot {slot} should be empty");
+                assert!(session.acknowledged);
+            } else {
+                assert_eq!(core.keypad_slots()[slot].unwrap().key(), *key, "a session on another page must not be cleared");
+                assert!(!session.acknowledged);
+            }
+        }
+        let retained = core.sessions.iter().find(|s| s.id == "session-4").unwrap();
+        assert_eq!(retained.title, title_before);
+        assert_eq!(retained.updated, updated_before, "hub clear must not rewrite provider freshness");
+
+        core.page = 1;
+        let page_two = core.faces();
+        assert!(matches!(&page_two[0], KeyFace::Session(face) if face.key == *before[8].as_ref().unwrap()));
+        assert!(matches!(&page_two[1], KeyFace::Session(face) if face.key == *before[9].as_ref().unwrap()));
+        core.key_down(HUB_KEY);
+        finish_hub_hold(&mut core);
+        assert!(matches!(&core.faces()[0], KeyFace::Empty), "inactive key on the selected later page clears");
+        assert!(matches!(&core.faces()[1], KeyFace::Session(face) if face.key == *before[9].as_ref().unwrap()), "working key on the selected later page stays put");
+        assert!(matches!(&core.keypad_slots()[0], Some(s) if s.key() == *before[0].as_ref().unwrap()), "clearing page two leaves page one intact");
+    }
+
+    #[test]
+    fn hub_hold_uses_captured_id_not_replacement_slot_and_rechecks_activity() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for i in 0..SESSION_KEYS_PER_PAGE { add_test_session(&mut core, &format!("session-{i}"), "idle"); }
+        let before: Vec<_> = core.keypad_slots().iter().map(|s| s.map(|s| s.key())).collect();
+        let replaced = before[0].as_ref().unwrap().clone();
+        let displaced = core.sessions.iter_mut().find(|s| s.key() == replaced).unwrap();
+        displaced.acknowledged = true;
+        displaced.acknowledged_at = Some(now());
+        core.key_down(HUB_KEY);
+
+        add_test_session(&mut core, "new-live", "thinking");
+        let after_insert = core.keypad_slots();
+        assert_eq!(after_insert[0].unwrap().id, "new-live", "the captured old key is replaced while the press is held");
+        assert!(after_insert.iter().enumerate().any(|(i, s)| i >= SESSION_KEYS_PER_PAGE && s.is_some_and(|s| s.key() == replaced)));
+        finish_hub_hold(&mut core);
+        assert!(core.visible().iter().any(|s| s.id == "new-live"), "a newly inserted replacement was not captured for clear");
+        assert!(core.sessions.iter().any(|s| s.key() == replaced), "the captured inactive identity remains tracked");
+        assert!(!core.visible().iter().any(|s| s.key() == replaced), "the captured inactive identity itself was cleared");
+
+        let mut resumed = Core::new(Settings::default());
+        resumed.in_control = true;
+        add_test_session(&mut resumed, "becomes-live", "idle");
+        add_test_session(&mut resumed, "other-live", "thinking");
+        resumed.key_down(HUB_KEY);
+        resumed.apply(Incoming { agent: "codex".into(), event: Some("UserPromptSubmit".into()), body: serde_json::json!({"session":"becomes-live", "state":"thinking"}) });
+        finish_hub_hold(&mut resumed);
+        assert!(resumed.visible().iter().any(|s| s.id == "becomes-live" && s.activity.group() == Group::Working));
+        assert!(!resumed.sessions.iter().find(|s| s.id == "becomes-live").unwrap().acknowledged, "work that becomes active during the hold is not dismissed");
+    }
+
+    #[test]
+    fn hub_hold_aborts_on_page_change_and_short_back_quota_or_cancel_never_clear() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for i in 0..10 { add_test_session(&mut core, &format!("session-{i}"), "idle"); }
+        core.keypad_slots();
+        let before = core.visible().len();
+        core.key_down(HUB_KEY);
+        core.page_button(true, true);
+        assert_eq!(core.page, 1);
+        core.tick();
+        core.key_up(HUB_KEY);
+        core.page_button(true, false);
+        assert_eq!(core.visible().len(), before, "navigation cancels a pending clear");
+        assert!(core.actions.is_empty());
+
+        core.key_down(HUB_KEY);
+        core.key_up(HUB_KEY);
+        assert_eq!(core.visible().len(), before, "a short hub press only follows its existing click action");
+        assert!(matches!(core.actions.as_slice(), [Action::ShowWindow]));
+
+        core.detail_key = Some(core.sessions[0].key());
+        core.actions.clear();
+        core.key_down(HUB_KEY);
+        assert_eq!(core.key_target[HUB_KEY], Some(KeyPressTarget::Back));
+        core.key_down[HUB_KEY] = Some(now() - DETAIL_HOLD_S - 0.01);
+        core.tick();
+        core.key_up(HUB_KEY);
+        assert_eq!(core.visible().len(), before, "a Back target cannot clear the grid");
+
+        core.quota_view = true;
+        core.key_down(HUB_KEY);
+        assert_eq!(core.key_target[HUB_KEY], None, "the quota hub is not a clear target");
+        core.key_up(HUB_KEY);
+        core.quota_view = false;
+        core.detail_key = None;
+        core.key_down(HUB_KEY);
+        core.cancel_key(HUB_KEY);
+        core.tick();
+        assert_eq!(core.visible().len(), before, "a cancelled pointer hold cannot clear the grid");
+    }
+
+    #[test]
+    fn dismissed_sessions_expire_but_stale_discovery_is_suppressed_and_fresh_work_returns() {
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for id in ["stale", "active-again", "done-again"] { add_test_session(&mut core, id, "idle"); }
+        core.key_down(HUB_KEY);
+        finish_hub_hold(&mut core);
+        let cleared_at = now();
+
+        for session in &mut core.sessions {
+            session.updated = cleared_at - REMOVE_AFTER_S - 1.0;
+            session.acknowledged_at = Some(cleared_at - REMOVE_AFTER_S - 1.0);
+        }
+        core.tick();
+        assert!(core.sessions.is_empty(), "full session state follows the normal retention horizon");
+
+        let mut stale = Observation::new("codex", "stale", Source::LocalSnapshot, cleared_at + 1.0);
+        stale.kind = ObservationKind::Discovery;
+        stale.activity = Some(Activity::Idle);
+        stale.recorded_at = Some(cleared_at - 1.0);
+        stale.text_at = Some(cleared_at - 1.0);
+        stale.unread = Some(4);
+        core.observe(stale);
+        assert!(core.sessions.is_empty(), "a stale snapshot/receipt does not recreate a cleared session after pruning");
+
+        let mut active = Observation::new("codex", "active-again", Source::Hook, cleared_at + 2.0);
+        active.activity = Some(Activity::Thinking);
+        active.event = Some(ObservationEvent::TurnStarted);
+        core.observe(active);
+        assert!(core.visible().iter().any(|s| s.id == "active-again" && s.activity.group() == Group::Working));
+
+        let mut completed = Observation::new("codex", "done-again", Source::LocalSnapshot, cleared_at + 3.0);
+        completed.activity = Some(Activity::Done);
+        completed.recorded_at = Some(cleared_at + 1.0);
+        completed.text_at = Some(cleared_at + 1.0);
+        core.observe(completed);
+        let done = core.visible().into_iter().find(|s| s.id == "done-again").unwrap();
+        assert_eq!(done.activity, Activity::Done, "a newly dated completion revives after clear and expiry");
+        assert!(done.pending_attention);
+        assert!(core.visible().iter().all(|s| !s.acknowledged));
+    }
+
+    #[test]
+    fn hub_hold_tracks_alias_reconciliation_and_displaced_ack_resumes_after_an_unrelated_clear() {
+        let mut alias = Core::new(Settings::default());
+        alias.in_control = true;
+        add_test_session(&mut alias, "host-id", "idle");
+        alias.key_down(HUB_KEY);
+        let mut observation = Observation::new("codex", "cli-id", Source::Other, now());
+        observation.activity = Some(Activity::Idle);
+        observation.aliases.push("host-id".into());
+        alias.observe(observation);
+        assert_eq!(alias.sessions.len(), 1);
+        assert_eq!(alias.sessions[0].id, "cli-id");
+        finish_hub_hold(&mut alias);
+        assert!(alias.sessions.iter().any(|s| s.id == "cli-id"), "canonical tracked identity survives clear");
+        assert!(alias.visible().is_empty(), "the remapped captured identity is cleared");
+
+        let mut core = Core::new(Settings::default());
+        core.in_control = true;
+        for i in 0..SESSION_KEYS_PER_PAGE { add_test_session(&mut core, &format!("slot-{i}"), "idle"); }
+        let original = core.keypad_slots();
+        let target_key = original[0].unwrap().key();
+        let target_id = original[0].unwrap().id.clone();
+        let target_slot = 0;
+        let target = core.sessions.iter_mut().find(|s| s.key() == target_key).unwrap();
+        target.acknowledged = true;
+        target.acknowledged_at = Some(now());
+        core.keypad_slots();
+        add_test_session(&mut core, "replacement", "thinking");
+        assert_eq!(core.keypad_slots()[target_slot].unwrap().id, "replacement");
+        assert!(core.keypad_slots().iter().enumerate().any(|(i, s)| i >= SESSION_KEYS_PER_PAGE && s.is_some_and(|s| s.id == target_id)));
+
+        core.key_down(HUB_KEY);
+        finish_hub_hold(&mut core);
+        assert!(core.sessions.iter().any(|s| s.id == target_id), "the displaced acknowledged record stays tracked on a later page");
+        core.apply(Incoming { agent: "codex".into(), event: Some("UserPromptSubmit".into()), body: serde_json::json!({"session":target_id, "state":"thinking"}) });
+        let slots = core.keypad_slots();
+        assert!(slots.iter().take(SESSION_KEYS_PER_PAGE).any(|s| s.is_some_and(|s| s.id == target_id)), "resumed work returns to page one after unrelated clear");
+        assert_eq!(slots[target_slot].unwrap().id, "replacement", "resuming does not move the surviving bright neighbor");
     }
 
     #[test]

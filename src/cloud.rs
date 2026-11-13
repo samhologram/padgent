@@ -78,9 +78,9 @@ impl Tracker {
                 continue;
             }
             let mut obs = Observation::new("codex", &task.id, Source::CloudSnapshot, now);
+            obs.recorded_at = Some(updated.min(now));
             if previous.is_none() {
                 obs.kind = ObservationKind::Discovery;
-                obs.recorded_at = Some(updated.min(now));
             }
             obs.activity = Some(state);
             obs.title = Some(task.title);

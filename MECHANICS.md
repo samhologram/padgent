@@ -14,7 +14,7 @@ first-page slots, then replace acknowledged tiles if needed, leaving bright neig
 fixed. Replaced tiles remain accessible on later pages. Resumed activity restores full
 intensity.
 Holding a key for 0.6 seconds opens its observed steps, one per key. Back occupies the
-bottom-right key. The two page buttons navigate conversation or step pages.
+bottom-right key. On the session grid, holding the hub for 0.6 seconds clears inactive keys on the current page; working sessions and those waiting for attention remain. New activity restores a cleared session. The two page buttons navigate conversation or step pages.
 The local ordering resets when Padgent restarts. Holding both page buttons for 1.5 seconds
 releases the keypad to Logi Options+.
 
@@ -22,7 +22,9 @@ releases the keypad to Logi Options+.
 
 Session lights use a core, halo, rings, moving lights, ripple and grain. Their animation
 varies by activity and follows the motion and brightness settings. The hub summarizes
-sessions and those waiting for attention. The experimental HID driver takes exclusive access,
+sessions and those waiting for attention over a diffuse gold, lavender and blue gradient.
+Its colours drift on 32- and 39-second cycles; reduced motion freezes the field.
+The experimental HID driver takes exclusive access,
 reads key and page-button events, and sends JPEG images to the keypad.
 
 See `src/model.rs`, `src/field.rs` and `src/hardware.rs` for the current implementation and
