@@ -202,7 +202,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         require(status == 200 and isinstance(claimed, dict) and isinstance(claimed.get("token"), str), "HTTP claim failed")
         http_token = claimed["token"]
         status, _ = http_call(base, "set", {"token": http_token, "keys": {
-            "0": {"kind": "native", "title": "HTTP native", "text": "Thinking", "activity": "thinking", "hue": 140, "style": "dots"},
+            "0": {"kind": "native", "title": "HTTP native", "text": "Thinking", "activity": "thinking", "color": "#17191b", "style": "dots"},
             "1": {"kind": "custom", "title": "HTTP custom", "text": "Gradient", "background": "#15111f", "foreground": "#ffffff", "accent": "#d77a42", "animation": "gradient", "period_seconds": 3,
                   "layers": [{"kind": "text", "x": 0.1, "y": 0.7, "width": 0.8, "height": 0.2, "size": 0.1, "color": "#ffffff", "text": "HTTP"}]},
         }})

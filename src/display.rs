@@ -131,6 +131,7 @@ pub struct Scene {
     pub footer_text: Option<String>,
     pub activity: String,
     pub hue: f32,
+    pub color: Option<String>,
     pub style: String,
     pub background: String,
     pub foreground: String,
@@ -151,6 +152,7 @@ impl Default for Scene {
             footer_text: None,
             activity: "idle".into(),
             hue: 270.0,
+            color: None,
             style: "orb".into(),
             background: "#10131e".into(),
             foreground: "#ffffff".into(),
@@ -181,6 +183,7 @@ impl Scene {
         {
             return Err("text is too long".into());
         }
+        if self.color.as_deref().is_some_and(|value| Rgb::parse(value).is_none()) { return Err("color must be hex RGB".into()); }
         if Activity::parse(&self.activity).is_none()
             || !self.hue.is_finite()
             || !(0.0..=360.0).contains(&self.hue)
@@ -442,7 +445,7 @@ fn ttl(value: Option<f64>) -> Result<f64, DisplayError> {
 
 impl Scene {
     pub fn native_face(&self) -> crate::model::SessionFace {
-        let colour = crate::colour::oklch(0.75, 0.16, self.hue);
+        let colour = self.color.as_deref().and_then(Rgb::parse).unwrap_or_else(|| crate::colour::oklch(0.75, 0.16, self.hue));
         crate::model::SessionFace {
             key: String::new(),
             opacity: 1.0,
@@ -1121,5 +1124,48 @@ mod tests {
         assert!(!regular.badge.is_empty());
         assert_eq!(regular.status_text, None);
         assert_eq!(regular.footer_text, None);
+    }
+
+    #[test]
+    fn native_scene_rgb_overrides_hue_and_invalid_rgb_batches_are_atomic() {
+        let exact = crate::colour::Rgb(16, 17, 18);
+        let colored = Scene {
+            kind: "native".into(),
+            hue: 220.0,
+            color: Some("#101112".into()),
+            ..Scene::default()
+        };
+        let face = colored.native_face();
+        assert_eq!(face.orb, exact);
+        assert_eq!(face.glow, exact);
+        assert_eq!(face.agent_colour, exact);
+
+        let legacy = Scene {
+            kind: "native".into(),
+            hue: 220.0,
+            color: None,
+            ..Scene::default()
+        }.native_face();
+        let expected = crate::colour::oklch(0.75, 0.16, 220.0);
+        assert_eq!(legacy.orb, expected, "absent exact RGB retains the legacy hue-based orb");
+        assert_eq!(legacy.glow, expected);
+        assert!(Scene { color: Some("not-a-color".into()), ..Scene::default() }.validate().is_err());
+
+        let mut controller = DisplayController::default();
+        let token = claim(&mut controller, 10.0, vec![0, 1], 60.0);
+        let original = Scene { title: "kept".into(), color: Some("#202122".into()), ..Scene::default() };
+        controller.execute(DisplayCommand::Set {
+            token: token.clone(),
+            keys: [("0".into(), Some(original.clone()))].into(),
+        }, 11.0).unwrap();
+        let error = controller.execute(DisplayCommand::Set {
+            token,
+            keys: [
+                ("0".into(), Some(Scene { title: "must not apply".into(), color: Some("#333435".into()), ..Scene::default() })),
+                ("1".into(), Some(Scene { color: Some("invalid".into()), ..Scene::default() })),
+            ].into(),
+        }, 12.0).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert_eq!(controller.scene(0, 12.0).unwrap().0, original, "a valid prefix must not apply when a later RGB is invalid");
     }
 }

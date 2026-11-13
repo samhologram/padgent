@@ -269,6 +269,8 @@ pub struct AgentDef {
     pub badge: String,
     /// OKLCH hue in degrees.
     pub hue: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colour: Option<String>,
     #[serde(default)]
     pub description: String,
     /// Optional own colours per state group: working, waiting, done, idle (#rrggbb).
@@ -337,6 +339,7 @@ pub fn builtin_agents() -> Vec<AgentDef> {
         name: name.into(),
         badge: badge.into(),
         hue,
+        colour: None,
         description: desc.into(),
         state_colours: BTreeMap::new(),
         app_name: app.into(),
@@ -412,11 +415,14 @@ pub fn validate_agent(mut a: AgentDef) -> Result<(AgentDef, Vec<String>), String
     if !a.hue.is_finite() {
         a.hue = colour::calm_default();
     }
-    let (h, moved) = colour::keep_out_of_attention_band(a.hue);
-    if moved {
-        notes.push("Colour adjusted to keep states distinct: that hue is kept for sessions waiting for you.".into());
+    if a.colour.as_deref().is_some_and(|value| Rgb::parse(value).is_none()) {
+        return Err("Agent colour must be a hex RGB value.".into());
     }
-    a.hue = h;
+    if a.colour.is_none() {
+        let (h, moved) = colour::keep_out_of_attention_band(a.hue);
+        if moved { notes.push("Colour adjusted to keep states distinct: that hue is kept for sessions waiting for you.".into()); }
+        a.hue = h;
+    }
     a.state_colours.retain(|k, v| {
         let keep = ["working", "waiting", "done", "idle"].contains(&k.as_str()) && Rgb::parse(v).is_some();
         if !keep {
@@ -459,6 +465,7 @@ pub fn agent_for_app(name: &str, bundle: &str) -> AgentDef {
         name: name.chars().take(40).collect(),
         badge: badge_from_name(name),
         hue,
+        colour: None,
         description: format!("Conversations followed from the {name} app."),
         state_colours: BTreeMap::new(),
         app_name: name.to_string(),
@@ -576,9 +583,11 @@ pub struct Settings {
     pub show_hub_clock: bool,
     pub empty_key_url: String,
     pub agent_hues: BTreeMap<String, f32>,
+    pub agent_colours: BTreeMap<String, String>,
     pub disabled_agents: Vec<String>,
     pub state_colours: BTreeMap<String, String>,
     pub waiting_hue: f32,
+    pub waiting_colour: Option<String>,
     pub menu_indicator: MenuIndicator,
     #[serde(alias = "islandEnabled", deserialize_with = "deserialize_island_visibility")]
     pub island_visibility: IslandVisibility,
@@ -613,6 +622,7 @@ impl Default for Settings {
             show_hub_clock: false,
             empty_key_url: String::new(),
             agent_hues: BTreeMap::new(),
+            agent_colours: BTreeMap::new(),
             disabled_agents: Vec::new(),
             state_colours: [
                 ("working", "#4aa3ff"),
@@ -623,6 +633,7 @@ impl Default for Settings {
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect(),
             waiting_hue: colour::REFERENCE_WAITING_HUE,
+            waiting_colour: None,
             menu_indicator: MenuIndicator::DotAndCount,
             island_visibility: IslandVisibility::Always,
             motion: Motion::Full,
@@ -1449,6 +1460,7 @@ impl Core {
     // ---- colours
 
     pub fn waiting_colour(&self) -> Rgb {
+        if let Some(c) = self.settings.waiting_colour.as_deref().and_then(Rgb::parse) { return c; }
         let orb = colour::hex_u32(colour::reference_ramp("waitingPermission")[2]);
         colour::rotate(orb, self.settings.waiting_hue - colour::REFERENCE_WAITING_HUE)
     }
@@ -1460,6 +1472,12 @@ impl Core {
             .copied()
             .or_else(|| self.agent(agent).map(|a| a.hue))
             .unwrap_or(250.0)
+    }
+
+    pub fn agent_colour(&self, agent: &str) -> Rgb {
+        self.settings.agent_colours.get(agent).and_then(|s| Rgb::parse(s))
+            .or_else(|| self.agent(agent).and_then(|a| a.colour.as_deref()).and_then(Rgb::parse))
+            .unwrap_or_else(|| colour::rotate(colour::hex_u32(0xd9a441), self.hue_of(agent) - colour::REFERENCE_HUE))
     }
 
     /// Orb and glow colours from the original's reference ramps: calm states turn to the
@@ -1485,6 +1503,7 @@ impl Core {
         let (orb, glow) = (colour::hex_u32(ramp[2]), colour::hex_u32(ramp[3]));
         match g {
             Group::Waiting => {
+                if let Some(c) = self.settings.waiting_colour.as_deref().and_then(Rgb::parse) { return (c, c); }
                 let d = self.settings.waiting_hue - colour::REFERENCE_WAITING_HUE;
                 return (colour::rotate(orb, d), colour::rotate(glow, d));
             }
@@ -1502,6 +1521,10 @@ impl Core {
         }
         if self.settings.colour_keys_by == ColourKeysBy::State {
             let c = self.settings.state_colours.get(state_key).and_then(|h| Rgb::parse(h)).unwrap_or(orb);
+            return (c, c);
+        }
+        if self.settings.agent_colours.get(&s.agent).and_then(|s| Rgb::parse(s)).is_some() || self.agent(&s.agent).and_then(|a| a.colour.as_deref()).and_then(Rgb::parse).is_some() {
+            let c = self.agent_colour(&s.agent);
             return (c, c);
         }
         let d = self.hue_of(&s.agent) - colour::REFERENCE_HUE;
@@ -1612,7 +1635,7 @@ impl Core {
                 scheduled: s.scheduled,
                 last_message: s.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string(),
                 last_turn: s.updated,
-                agent_colour: colour::rotate(colour::hex_u32(0xd9a441), self.hue_of(&s.agent) - colour::REFERENCE_HUE),
+                agent_colour: self.agent_colour(&s.agent),
             }
         };
         let vis = self.visible();
@@ -1638,8 +1661,7 @@ impl Core {
                     match list.iter_mut().find(|(n, _, _)| *n == name) {
                         Some(e) => e.2 += 1,
                         None => {
-                            let hue = self.hue_of(&s.agent);
-                            list.push((name, colour::rotate(colour::hex_u32(0xd9a441), hue - colour::REFERENCE_HUE), 1));
+                            list.push((name, self.agent_colour(&s.agent), 1));
                         }
                     }
                 }
@@ -2153,6 +2175,8 @@ mod tests {
         agent.description = "An imported editor integration".into();
         agent.open_url = "example://session/{session}".into();
         agent.style = "dots".into();
+        agent.colour = Some("#121314".into());
+        agent.hue = 38.0;
         agent.events.insert("PromptStart".into(), "thinking".into());
         agent.models.insert("code".into(), "example-model".into());
 
@@ -2160,6 +2184,20 @@ mod tests {
         let imported = parse_agent_file(&exported).unwrap();
         assert_eq!(imported, vec![agent]);
         assert_eq!(imported[0].format, "agentpad.agent");
+
+        let mut legacy = imported[0].clone();
+        legacy.colour = None;
+        legacy.hue = 38.0;
+        let (legacy, notes) = validate_agent(legacy).unwrap();
+        assert!(legacy.hue <= colour::ATTENTION_BAND.0 || legacy.hue >= colour::ATTENTION_BAND.1);
+        assert!(notes.iter().any(|note| note.contains("Colour adjusted")), "agents without exact RGB keep the legacy hue adjustment");
+        let mut legacy_core = Core::new(Settings::default());
+        legacy_core.agents = vec![legacy.clone()];
+        assert_eq!(legacy_core.agent_colour(&legacy.id), colour::rotate(colour::hex_u32(0xd9a441), legacy.hue - colour::REFERENCE_HUE));
+
+        let mut invalid = imported[0].clone();
+        invalid.colour = Some("darkred".into());
+        assert!(validate_agent(invalid).is_err(), "agent import validation rejects invalid RGB");
     }
 
     #[test]
@@ -2225,6 +2263,32 @@ mod tests {
         assert_eq!(imported.brightness, 0.42);
         assert_eq!(imported.menu_indicator, MenuIndicator::Dot);
         assert_eq!(imported.disabled_agents, vec!["com.example.editor"]);
+    }
+
+    #[test]
+    fn exact_rgb_settings_round_trip_preserves_priority_for_agent_waiting_state_and_error() {
+        let mut settings = Settings::default();
+        settings.agent_colours.insert("codex".into(), "#101112".into());
+        settings.waiting_colour = Some("#272829".into());
+        settings.colour_keys_by = ColourKeysBy::State;
+        settings.state_colours.insert("working".into(), "#aabbcc".into());
+
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let imported: Settings = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(imported.agent_colours.get("codex").map(String::as_str), Some("#101112"));
+        assert_eq!(imported.waiting_colour.as_deref(), Some("#272829"));
+
+        let mut core = Core::new(imported);
+        assert_eq!(core.agent_colour("codex"), colour::Rgb(16, 17, 18), "dark low-chroma agent RGB remains exact");
+        assert_eq!(core.waiting_colour(), colour::Rgb(39, 40, 41), "dark low-chroma waiting RGB remains exact");
+        for (id, state) in [("working", "thinking"), ("waiting", "waitingPermission"), ("error", "error")] {
+            core.apply(Incoming { agent: "codex".into(), event: None, body: serde_json::json!({"session":id,"state":state}) });
+        }
+        let session = |id: &str| core.sessions.iter().find(|session| session.id == id).unwrap();
+        assert_eq!(core.colours(session("working")), (colour::Rgb(170, 187, 204), colour::Rgb(170, 187, 204)), "State mode retains its canonical working colour priority");
+        assert_eq!(core.colours(session("waiting")), (colour::Rgb(39, 40, 41), colour::Rgb(39, 40, 41)), "the shared waiting override remains above agent colour");
+        let error_ramp = colour::reference_ramp("error");
+        assert_eq!(core.colours(session("error")), (colour::hex_u32(error_ramp[2]), colour::hex_u32(error_ramp[3])), "errors retain their canonical red ramp");
     }
 
     #[test]

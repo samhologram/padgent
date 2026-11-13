@@ -54,6 +54,8 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   Choose Never, Always, When keypad disconnected, or Quotas always, agents when disconnected in Menu bar and hand-over settings. The last option keeps quotas visible and shows agents when the keypad is physically disconnected.
 - **Settings:** colours, motion, key order, recent sessions, hand-over, launch at login, model
   roles for Claude Code (Haiku for the swarm, Sonnet for code, Opus for orchestration).
+  Agent and waiting colours use [full RGB colour pickers](docs/images/padgent-colours.png);
+  existing hue settings remain compatible.
 
 ## Notch
 
@@ -124,7 +126,7 @@ and the address for the port currently in use.
 {
   "format": "agentpad.agent", "version": 1,
   "id": "com.example.myagent", "name": "My Agent", "badge": "MA",
-  "hue": 200, "style": "orb",
+  "hue": 200, "colour": "#4aa3ff", "style": "orb",
   "app_name": "My Agent", "watch_app": "com.example.myagent.desktop",
   "state_colours": { "working": "#4aa3ff" }
 }

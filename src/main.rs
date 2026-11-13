@@ -99,7 +99,7 @@ fn island_quotas(c: &Core) -> Vec<IslandQuota> {
             .filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
         let (session, weekly) = (value("Session"), value("Weekly"));
         let agent = if provider.eq_ignore_ascii_case("Claude") { "claude-code" } else if provider.eq_ignore_ascii_case("Codex") { "codex" } else { provider.as_str() };
-        let colour = colour::rotate(colour::hex_u32(0xd9a441), c.hue_of(agent) - colour::REFERENCE_HUE);
+        let colour = c.agent_colour(agent);
         (session.is_some() || weekly.is_some()).then_some(IslandQuota { provider, session, weekly, colour })
     }).collect()
 }
@@ -1070,8 +1070,8 @@ impl App {
         ui.heading("Agents");
         hint(ui, "Padgent shows your agents' sessions side by side, each in its own colour. Choose the agents you use. Add other kinds of agents by importing their file, and share yours by exporting it.");
         ui.add_space(6.0);
-        let (agents, port, server_status, disabled, hues) = match self.core.lock() {
-            Ok(c) => (c.agents.clone(), c.settings.hook_port, c.server_status.clone(), c.settings.disabled_agents.clone(), c.settings.agent_hues.clone()),
+        let (agents, port, server_status, disabled, hues, colours, agent_colours) = match self.core.lock() {
+            Ok(c) => (c.agents.clone(), c.settings.hook_port, c.server_status.clone(), c.settings.disabled_agents.clone(), c.settings.agent_hues.clone(), c.settings.agent_colours.clone(), c.agents.iter().map(|a| (a.id.clone(), c.agent_colour(&a.id))).collect::<std::collections::BTreeMap<_, _>>()),
             Err(_) => return,
         };
         let mut changed = false;
@@ -1105,9 +1105,8 @@ impl App {
                 if let Some(a) = agents.iter().find(|a| a.id == self.selected_agent) {
                     if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{}.orbagent.json", a.id)).save_file() {
                         let mut out = a.clone();
-                        if let Some(h) = hues.get(&a.id) {
-                            out.hue = *h;
-                        }
+                        if let Some(h) = hues.get(&a.id) { out.hue = *h; }
+                        if let Some(colour) = colours.get(&a.id) { out.colour = Some(colour.clone()); }
                         self.agent_notes = vec![match std::fs::write(&path, serde_json::to_string_pretty(&out).unwrap_or_default()) {
                             Ok(_) => format!("Exported {}.", a.name),
                             Err(e) => format!("Export failed. Nothing was saved. ({e})"),
@@ -1117,7 +1116,12 @@ impl App {
             }
             if ui.button("Export all…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().set_file_name("agents.orbagent.json").save_file() {
-                    let bundle = serde_json::json!({ "format": model::AGENTS_FORMAT, "version": 1, "agents": agents });
+                    let exported: Vec<_> = agents.iter().cloned().map(|mut agent| {
+                        if let Some(hue) = hues.get(&agent.id) { agent.hue = *hue; }
+                        if let Some(colour) = colours.get(&agent.id) { agent.colour = Some(colour.clone()); }
+                        agent
+                    }).collect();
+                    let bundle = serde_json::json!({ "format": model::AGENTS_FORMAT, "version": 1, "agents": exported });
                     self.agent_notes = vec![match std::fs::write(&path, serde_json::to_string_pretty(&bundle).unwrap_or_default()) {
                         Ok(_) => format!("Exported {} agents.", agents.len()),
                         Err(e) => format!("Export failed. Nothing was saved. ({e})"),
@@ -1132,6 +1136,7 @@ impl App {
                     name: "My Agent".into(),
                     badge: String::new(),
                     hue: colour::calm_default(),
+                    colour: None,
                     description: String::new(),
                     state_colours: Default::default(),
                     app_name: String::new(),
@@ -1165,7 +1170,9 @@ impl App {
                     ui.text_edit_singleline(&mut a.watch_app);
                     ui.end_row();
                     ui.label("Colour");
-                    ui.add(egui::Slider::new(&mut a.hue, 0.0..=359.0).suffix("°"));
+                    let current = a.colour.as_deref().and_then(colour::Rgb::parse).unwrap_or_else(|| colour::rotate(colour::hex_u32(0xd9a441), a.hue - colour::REFERENCE_HUE));
+                    let mut rgb = [current.0, current.1, current.2];
+                    if ui.color_edit_button_srgb(&mut rgb).changed() { a.colour = Some(colour::Rgb(rgb[0], rgb[1], rgb[2]).hex()); }
                     ui.end_row();
                     ui.label("Key look");
                     ui.horizontal(|ui| {
@@ -1202,10 +1209,10 @@ impl App {
             card(&mut cols[0], "Your agents", |ui| {
                 for a in &agents {
                     let on = !disabled.contains(&a.id);
-                    let hue = hues.get(&a.id).copied().unwrap_or(a.hue);
+                    let colour = agent_colours.get(&a.id).copied().unwrap_or(colour::Rgb(140, 140, 150));
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                        ui.painter().circle_filled(r.center(), 6.0, c32(colour::oklch(0.78, 0.15, hue)));
+                        ui.painter().circle_filled(r.center(), 6.0, c32(colour));
                         let sel = self.selected_agent == a.id;
                         if ui.selectable_label(sel, RichText::new(&a.name).size(14.0)).clicked() {
                             self.selected_agent = a.id.clone();
@@ -1235,23 +1242,22 @@ impl App {
                     if !a.description.is_empty() {
                         hint(ui, &a.description);
                     }
-                    let mut hue = hues.get(&a.id).copied().unwrap_or(a.hue);
+                    let current = agent_colours.get(&a.id).copied().unwrap_or(colour::Rgb(140, 140, 150));
+                    let mut rgb = [current.0, current.1, current.2];
                     ui.horizontal(|ui| {
                         ui.label("Colour");
-                        if ui.add(egui::Slider::new(&mut hue, 0.0..=359.0).suffix("°")).changed() {
-                            let (h, moved) = colour::keep_out_of_attention_band(hue);
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
                             if let Ok(mut c) = self.core.lock() {
-                                c.settings.agent_hues.insert(a.id.clone(), h);
+                                c.settings.agent_colours.insert(a.id.clone(), colour::Rgb(rgb[0], rgb[1], rgb[2]).hex());
                                 c.revision += 1;
-                                if moved {
-                                    c.notify("Colour adjusted to keep states distinct: that hue is kept for sessions waiting for you.");
-                                }
                             }
                             self.settings_rev += 1;
                         }
-                        if hues.contains_key(&a.id) && ui.small_button("Reset").clicked() {
+                        if (colours.contains_key(&a.id) || hues.contains_key(&a.id)) && ui.small_button("Reset").clicked() {
                             if let Ok(mut c) = self.core.lock() {
-                                c.settings.agent_hues.remove(&a.id);
+                                if colours.contains_key(&a.id) { c.settings.agent_colours.remove(&a.id); }
+                                else { c.settings.agent_hues.remove(&a.id); }
+                                c.revision += 1;
                             }
                             self.settings_rev += 1;
                         }
@@ -1471,6 +1477,7 @@ impl App {
         hint(ui, "Theme, colours, brightness and motion.");
         let Ok(mut c) = self.core.lock() else { return };
         let before = format!("{:?}", c.settings);
+        let waiting_colour = c.waiting_colour();
         let s = &mut c.settings;
         card(ui, "Key colours", |ui| {
             ui.horizontal(|ui| {
@@ -1494,7 +1501,9 @@ impl App {
             }
             ui.horizontal(|ui| {
                 ui.label("Waiting for you");
-                ui.add(egui::Slider::new(&mut s.waiting_hue, colour::ATTENTION_BAND.0..=colour::ATTENTION_BAND.1).suffix("°"));
+                let mut rgb = [waiting_colour.0, waiting_colour.1, waiting_colour.2];
+                if ui.color_edit_button_srgb(&mut rgb).changed() { s.waiting_colour = Some(colour::Rgb(rgb[0], rgb[1], rgb[2]).hex()); }
+                if s.waiting_colour.is_some() && ui.small_button("Reset").clicked() { s.waiting_colour = None; }
             });
             hint(ui, "A session that waits for you glows the same colour, whichever agent runs it. Error always stays red.");
         });
@@ -1668,7 +1677,7 @@ impl App {
         let mcp = format!("{base}/mcp");
         let agent_instructions = format!("Add an MCP server named padgent to your MCP configuration. Transport: Streamable HTTP. URL: {mcp}. Padgent must be running on this Mac. Supports MCP 2025-11-25. Connect and list its tools, then call display_state to verify the connection. Leave display ownership unchanged until I request a tile or takeover.");
         let claim = format!("curl -sS '{api}/claim' -H 'Content-Type: application/json' -d '{{\"owner\":\"My agent\",\"keys\":[0],\"ttl_seconds\":60}}'");
-        let set = format!("curl -sS '{api}/set' -H 'Content-Type: application/json' -d '{{\"token\":\"TOKEN_FROM_CLAIM\",\"keys\":{{\"0\":{{\"kind\":\"native\",\"title\":\"Build\",\"text\":\"Running checks\",\"activity\":\"thinking\",\"style\":\"dots\",\"hue\":265}}}}}}'");
+        let set = format!("curl -sS '{api}/set' -H 'Content-Type: application/json' -d '{{\"token\":\"TOKEN_FROM_CLAIM\",\"keys\":{{\"0\":{{\"kind\":\"native\",\"title\":\"Build\",\"text\":\"Running checks\",\"activity\":\"thinking\",\"style\":\"dots\",\"color\":\"#b8a4ff\"}}}}}}'");
         ui.heading("API & MCP");
         hint(ui, "Let a local app or agent control individual keys or the whole keypad.");
         card(ui, "Connect", |ui| {
@@ -1706,7 +1715,7 @@ impl App {
             if ui.small_button("Copy set command").clicked() { ui.ctx().copy_text(set.clone()); }
         });
         card(ui, "Scenes and MCP tools", |ui| {
-            hint(ui, "Native scenes use Padgent's session animations, including thinking, tool, streaming, waiting, done and error. Choose an orb or dots and a hue.");
+            hint(ui, "Native scenes use Padgent's session animations, including thinking, tool, streaming, waiting, done and error. Choose an orb or dots and a color.");
             hint(ui, "Custom declarative scenes combine text, colors, gradients, shapes and slow animation. Your app or agent translates its instructions into a scene.");
             hint(ui, "Optionally set an action such as {\"type\":\"open_url\",\"url\":\"https://example.com\"} or open_app with a macOS bundle ID. It runs only when the key is pressed.");
             ui.label(RichText::new("MCP tools").strong());

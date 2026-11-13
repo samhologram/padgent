@@ -68,7 +68,7 @@ Use the returned token in subsequent requests:
       "text": "Running checks",
       "activity": "thinking",
       "style": "dots",
-      "hue": 265
+      "color": "#b8a4ff"
     },
     "1": {
       "kind": "custom",
@@ -105,7 +105,8 @@ Examples rendered through the display API:
 
 Native scenes use the app's session animations: `starting`, `idle`, `thinking`, `tool`,
 `streaming`, `waitingPermission`, `waitingQuestion`, `done`, `error`, `compacting` or
-`offline`. Choose `style: "orb"` or `"dots"` and a `hue` from 0 to 360.
+`offline`. Choose `style: "orb"` or `"dots"` and a full RGB `color`, such as `#b8a4ff`.
+The older `hue` field remains a fallback when `color` is omitted.
 The existing status names stay the same. `title` and `text` hold your content. Optional
 `badge`, `status_text` and `footer_text` overrides can customize or hide individual labels;
 an empty string hides a label, while omitted status/footer overrides use their defaults.
@@ -117,6 +118,7 @@ Padgent does not execute scripts or interpret natural language as code.
 | Field | Values |
 | --- | --- |
 | `kind` | `native` or `custom` |
+| `color` | Native scene RGB color; preserves saturation and brightness |
 | `title`, `text` | Up to 64 and 160 characters respectively |
 | `background`, `foreground`, `accent` | Hex RGB colors, such as `#856be0` |
 | `animation` | `none`, `pulse`, `drift` or `gradient` |
