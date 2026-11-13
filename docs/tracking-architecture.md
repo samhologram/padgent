@@ -12,7 +12,11 @@ flowchart LR
     O --> T[Identity and source arbitration]
     T --> S[Session lifecycle and attention]
     S --> L[Stable keypad projection]
-    L --> V[App, menu bar, notch and keypad]
+    L --> P[Display overlay]
+    H[HTTP and MCP] --> C2[Typed display commands]
+    C2 --> E[Key leases and scenes]
+    E --> P
+    P --> V[App, menu bar, notch and keypad]
 ```
 
 ## Sources
@@ -55,6 +59,12 @@ a tracking source.
 - `layout.rs` owns stable positions. Acknowledgement leaves a dim tile in place. New or
   resumed work fills free first-page slots, then replaces dim tiles if needed. Replaced
   tiles remain accessible on later pages without shifting bright neighbours.
+- `display.rs` owns temporary per-key display leases, scene validation and press-event
+  queues. `Core::display_command` is the common entry point for HTTP and MCP. An overlay
+  changes projected faces while native session intake and layout continue underneath;
+  release or expiry reveals that native state. Scene sampling is shared between renderers.
+- `server.rs` owns local HTTP parsing and routes; `mcp.rs` translates MCP tools to the
+  same typed display commands. Neither transport owns lease, layout or rendering rules.
 - `integrations.rs` opens the resolved conversation or terminal target. Acquisition and
   navigation remain separate operations.
 

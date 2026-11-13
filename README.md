@@ -29,6 +29,7 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   changing pages during the hold cancels it.
 - **Animated hub:** soft gold, lavender and blue gradients drift slowly behind the status
   count, with the same glass finish as the other keys. Reduced motion keeps the gradient still.
+  Enable **Show time on hub key** in Look to also display the local time.
 - **Tap to open:** opens the exact conversation in its app, or the terminal tab a Claude Code
   session runs in (Terminal, iTerm2). Opening an inactive conversation keeps its tile in
   place at 45% intensity. New sessions use free slots, then replace dim tiles when needed;
@@ -42,6 +43,11 @@ and on screen as a Liquid Glass keypad. Written in Rust.
   Claude cloud-only scheduled runs and ChatGPT Dots unread messages are not tracked yet.
 - **Menu bar:** left-click the icon to open the live 3×3 keypad; right-click for session
   previews, settings, hand-over and quit. The icon shows a waiting dot and count.
+- **Display API and MCP:** apps and agents can reserve individual keys or the whole 3×3
+  keypad, use Padgent's native animations, or compose custom gradients, text and shapes.
+  Clear individual keys or the entire leased keypad, then release to restore native content.
+  Both interfaces use the same display controller and renderers as the app.
+  See the [display API guide](docs/display-api.md) for examples and MCP setup.
 - **Notch island:** active agents appear to the left of the camera notch and observed remaining session and weekly quotas appear on the right, with a subtle response on hover.
   Click a session to open its conversation, a percentage to open usage, or the island background to unfold the interactive keypad.
   Completed or unread conversations stay bright until opened, then remain dimmed until work resumes.
@@ -89,6 +95,28 @@ On first use macOS asks you to allow Padgent in **Accessibility** (to follow des
 
 States: `starting`, `idle`, `thinking`, `tool`, `streaming`, `waitingPermission`,
 `waitingQuestion`, `done`, `error`, `compacting`, `offline`.
+
+For direct display control, use `http://127.0.0.1:47800/v1/display` or connect an MCP
+client to `http://127.0.0.1:47800/mcp` with Streamable HTTP. A display lease returns the
+keys to their current native content when released or expired; it does not stop agent tracking.
+
+### Instructions to give your agent
+
+Copy this prompt to the agent you want to connect:
+
+```text
+Add an MCP server named padgent to your MCP configuration.
+Transport: Streamable HTTP.
+URL: http://127.0.0.1:47800/mcp
+Padgent must be running on this Mac. It supports MCP protocol 2025-11-25.
+Connect and list its tools, then call display_state to verify the connection.
+Leave display ownership unchanged until I request a tile or takeover.
+```
+
+The app's **API & MCP** tab has the same instructions, a copy button, HTTP examples
+and the address for the port currently in use.
+
+![Padgent API and MCP setup instructions](docs/images/padgent-api-mcp.png)
 
 ## Agent files
 
